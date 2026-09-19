@@ -1,0 +1,36 @@
+# hbposv7 stock mapping
+#
+# t_im_branch_stock 是 (item_no, branch_no) 复合主键,
+# 表示每个分店每个商品的当前库存(已含采购/销售/调整的累计结果)。
+version: 1
+model: stock
+
+mappings:
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: stock_qty           # 当前库存数量 numeric(已含所有库存变更的累计)
+    target: quantity
+    type: decimal
+
+  - source: avg_cost            # 加权平均成本 numeric
+    target: avg_cost
+    type: decimal
+    unit: yuan
+
+  - source: min_qty             # 安全库存下限 numeric
+    target: min_qty
+    type: decimal
+
+  - source: max_qty             # 安全库存上限 numeric
+    target: max_qty
+    type: decimal
+
+  - source: oper_date           # 最后操作时间 datetime
+    target: updated_at
+    type: datetime

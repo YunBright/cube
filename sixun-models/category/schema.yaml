@@ -1,0 +1,33 @@
+# category model - 思迅家族商品分类
+name: category
+sql_table: category
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 分类 ID
+
+  - name: name
+    sql: name
+    type: string
+    title: 分类名称
+
+  - name: parent_id
+    sql: parent_id
+    type: string
+    title: 父分类 ID
+    description: 支持多级分类,NULL = 顶级
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 分类数
+
+joins:
+  # 自连接,支持层级查询
+  - name: parent
+    sql: category
+    on: "{CUBE}.parent_id = parent.id"
+    relationship: many_to_one

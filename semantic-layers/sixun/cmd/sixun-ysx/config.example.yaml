@@ -1,0 +1,25 @@
+# sixun-ysx 实例配置
+server:
+  http_addr: ":8083"
+
+source:
+  version: ysx
+  # mssql server 2008 r2
+  dsn: ""
+
+  # 思迅云商x 真实表名(同思迅7pro 命名)
+  table_supplier: t_bd_supcust_info
+  table_product:  t_bd_item_info
+  table_category: t_bd_item_cls
+  table_sale:     t_mp_saleflow    # ysx 是 t_mp_saleflow(主表),hbposv7 是 t_rm_order_saleflow,可能不同
+  table_stock:    t_im_branch_stock
+
+storage:
+  duckdb_path: ./data/sixun-ysx.duckdb
+
+gateway:
+  app_id: cube-gateway
+  register_method: /register
+
+dapr:
+  secret_store: cube-secrets

@@ -1,0 +1,16 @@
+# hbposv7 category mapping
+version: 1
+model: category
+
+mappings:
+  - source: item_clsno          # 分类编码 char
+    target: id
+    type: string
+
+  - source: item_clsname        # 分类名称 varchar
+    target: name
+    type: string
+
+  - source: cls_parent          # 父分类 varchar(支持多级分类)
+    target: parent_id
+    type: string

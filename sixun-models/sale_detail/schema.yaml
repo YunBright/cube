@@ -1,0 +1,73 @@
+# sale_detail model - 思迅家族销售明细(含销售退货)
+#
+# 关键差异处理:
+#   - ysx (t_mp_saleflow) 有 order_status 字段,直接映射
+#   - hbposv7 (t_rm_order_saleflow) 没有,用 SQL: CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END
+name: sale_detail
+sql_table: sale_detail
+
+dimensions:
+  - name: id
+    sql: id
+    type: number
+    title: 流水 ID
+
+  - name: flow_no
+    sql: flow_no
+    type: string
+    title: 流水号
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品 ID
+
+  - name: sold_at
+    sql: sold_at
+    type: time
+    title: 销售时间
+
+  - name: order_status
+    sql: >
+      COALESCE(order_status,
+               CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END)
+    type: string
+    title: 单据类型
+    enum_values:
+      - { value: "S",  label: 销售 }
+      - { value: "R",  label: 退货 }
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 流水数
+
+  - name: total_qty
+    sql: "SUM(quantity)"
+    type: number
+    title: 总数量(含退货为负)
+    format: "0.00"
+
+  - name: total_amount_yuan
+    sql: "SUM(unit_price * quantity)"
+    type: number
+    title: 总金额(元)
+    format: "0.00"
+
+  - name: net_amount_yuan
+    sql: "SUM(CASE WHEN order_status IN ('R', 'r') THEN -unit_price * quantity ELSE unit_price * quantity END)"
+    type: number
+    title: 净额(销售-退货)
+    format: "0.00"
+
+joins:
+  - name: product
+    sql: product
+    on: "{CUBE}.product_id = product.id"
+    relationship: many_to_one

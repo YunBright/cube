@@ -1,0 +1,15 @@
+# Dapr Component: cube-pubsub
+# cube-compiler → cube-gateway:cube reload 通知(触发注册表刷新)
+
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: cube-pubsub
+spec:
+  type: pubsub.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: 172.12.1.1:6379
+    - name: redisPassword
+      value: password

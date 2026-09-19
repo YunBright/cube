@@ -1,0 +1,34 @@
+# sixun-hbposv7 实例配置
+# 启动: dapr run --app-id sixun-hbposv7 -- go run ./cmd/sixun-hbposv7
+
+server:
+  http_addr: ":8082"
+
+source:
+  version: hbposv7
+  # mssql server 2008
+  dsn: ""
+
+  # ====== 思迅7pro 真实表名(从 inspect 输出确认)======
+  # 5 个 model:
+  #   supplier       供应商
+  #   product        商品
+  #   category       商品分类
+  #   sale_detail    销售明细(含销售退货)
+  #   stock          商品库存(库存调整后的当前数量)
+  table_supplier: t_bd_supcust_info
+  table_product:  t_bd_item_info
+  table_category: t_bd_item_cls
+  table_sale:     t_rm_order_saleflow
+  table_stock:    t_im_branch_stock
+
+storage:
+  duckdb_path: ./data/sixun-hbposv7.duckdb
+
+gateway:
+  app_id: cube-gateway
+  # 注册地址(dev:sidecar 自动解析 app_id → host:port)
+  register_method: /register
+
+dapr:
+  secret_store: cube-secrets

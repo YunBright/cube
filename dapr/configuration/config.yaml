@@ -1,0 +1,34 @@
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: appconfig
+  namespace: default
+spec:
+  appHttpPipeline:
+    handlers:
+    - name: auth-validator
+      type: middleware.http.bearer
+  nameResolution:
+    component: "consul"
+    configuration:
+      client:
+        address: "172.12.1.1:8500"   # 如果 Dapr 和 Consul 在同一 Docker 网络，可用 consul-server:8500
+        scheme: "http"
+      selfRegister: false            # Dapr 启动时自动把 app-id 注册进 Consul
+      queryOptions:
+        useCache: true              # 启用本地缓存，减少 Consul 查询压力
+      advancedRegistration:
+        name: "${APP_ID}"
+        port: ${APP_PORT}
+        address: "172.12.1.5"
+        check:
+          name: "Dapr Health Status"
+          checkID: "daprHealth:${APP_ID}"
+          interval: "15s"
+          http: "http://172.12.1.5:${APP_PORT}/healthz"
+          # 这要求所有的 Dapr 应用都必须实现 /healthz 接口，返回 200 OK
+        meta:
+          DAPR_METRICS_PORT: "${DAPR_METRICS_PORT}"
+          DAPR_PROFILE_PORT: "${DAPR_PROFILE_PORT}"
+        tags:
+          - "dapr"

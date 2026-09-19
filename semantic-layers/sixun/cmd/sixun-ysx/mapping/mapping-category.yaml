@@ -1,0 +1,16 @@
+# ysx category mapping
+version: 1
+model: category
+
+mappings:
+  - source: item_clsno
+    target: id
+    type: string
+
+  - source: item_clsname
+    target: name
+    type: string
+
+  - source: cls_parent
+    target: parent_id
+    type: string

@@ -1,0 +1,34 @@
+# Go
+/bin/
+/pkg/bin/
+/gateway/bin/
+/compiler/bin/
+/sixun-models/bin/
+/semantic-layers/sixun/bin/
+/semantic-layers/sixun/cmd/**/data/
+*.exe
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Dapr
+.dapr/
+
+# DuckDB 数据(每个 app 独立)
+/data/*.duckdb
+/data/*.duckdb.wal
+
+# 配置 & 密钥
+config.yaml
+!config.example.yaml
+!/dapr/configuration/config.yaml
+.env
+.env.local
+
+# 构建产物
+/dist/
+/tmp/

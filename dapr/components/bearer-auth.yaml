@@ -1,0 +1,32 @@
+# bearer-auth: JWT Bearer 验证中间件
+#
+# 由 userd 的 sidecar 加载。所有到 userd 的请求都过这个中间件再转发到 app。
+# 配置 jwksURL 让 sidecar 自动拉公钥、验签、校验 exp/nbf/iss/aud。
+#
+# ⚠️ 重要：Dapr middleware.http.bearer 只支持非对称算法 (RS256/ES256/...)。
+#    HS256 不能用。
+#
+# 拆分模式注意（推荐）：userd 进程 + daprd sidecar 必须能在启动时拉到 jwksURL。
+#   - dev（本文件默认）：http://localhost:8081/.well-known/jwks.json
+#       —— 配合 `make login`（终端 A）+ `make dapr-userd`（终端 B）
+#   - prod k8s：用 kustomize/envsubst 把下面 value 替换成 authd-login Service DNS
+#       http://authd-login.default.svc.cluster.local:8081/.well-known/jwks.json
+#     部署清单见 deployments/deployment-example.yaml。
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: auth-validator
+  namespace: default
+spec:
+  type: middleware.http.bearer
+  version: v1
+  metadata:
+    # JWKS 端点（login 服务暴露；拆分模式下走 authd-login Service）
+    - name: jwksURL
+      value: "http://172.12.1.1:8081/.well-known/jwks.json"
+    # token 的 iss 必须等于这个值
+    - name: issuer
+      value: "https://yb.baiyuan.com"
+    # token 的 aud 必须包含这个值
+    - name: audience
+      value: "userd"

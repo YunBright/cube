@@ -1,0 +1,167 @@
+# .goreleaser configuration for cube
+#
+# 生产部署由 F:\go\src\github.com\YunBright\deployer\deploy-cube.ps1 驱动。
+# 该脚本的契约(必须严格满足):
+#   - 必须在 $CubeDir/dist/ 下产出 3 个 .tar.gz 归档
+#   - 归档文件名 = <project>_<version>_<OS>_<arch>.tar.gz(被脚本当 leaf 传到 ssh tar -xzf)
+#   - 解压必须能在 <RemoteDir>/ 及其子目录下完成,extract 步骤是
+#     `cd <归档所在父目录> && tar -xzf <leaf>`,所以归档内部结构 = 生产 cwd 的内容
+#   - chmod 步骤用正则 `^\s*binary:\s*"?([^"\s#]+)"?` 从本文件提取 binary 名,然后
+#     `find <RemoteDir> -type f \( -name '<binary>' ... \)` 递归 chmod +x
+#   - 因此 `binary: <name>` 必须保留,且二进制在归档顶层就叫 <name>(不能带目录前缀)
+#
+# 生产远端目录布局(由 deploy-cube.ps1 拼出来):
+#   <RemoteDir>/                                          ← gateway 的 cwd
+#     gateway                                             ← 二进制
+#     config.yaml                                         ← gateway 配置
+#     components/                                         ← dapr 组件
+#     sixun-models/                                       ← ★ 共享 cube schemas
+#       category/schema.yaml
+#       product/schema.yaml
+#       sale_detail/schema.yaml
+#       stock/schema.yaml
+#       supplier/schema.yaml
+#   <RemoteDir>/semantic-layers/sixun-hbposv7/           ← hbposv7 app 的 cwd
+#     sixun-hbposv7                                       ← 二进制
+#     config.yaml                                         ← 数据源 DSN + 表名
+#     mapping/                                            ← mapping-*.yaml
+#   <RemoteDir>/semantic-layers/sixun-ysx/               ← ysx app 的 cwd
+#     sixun-ysx                                           ← 二进制
+#     config.yaml
+#     mapping/
+#
+# 注意 sixun-models 是 family 级共享(只一份),与 gateway 一起打包。
+# 不单独成归档的原因:goreleaser v1 没有 builds 段的 archive 会对每个 build 各生
+# 成一份,会出现 N 份同名 sixun-models.tar.gz。直接塞进 gateway 归档,
+# deployer 一次性解压到 <RemoteDir>/,得到 <RemoteDir>/sixun-models/。
+# 应用 cwd 在 semantic-layers/<x>/ 下,默认 os.Stat("./sixun-models") 和
+# "..(4)/../sixun-models" 都对不上 <RemoteDir>/sixun-models;
+# 必须在生产 systemd / dapr 启动单元里 export CUBE_MODELS_DIR=<RemoteDir>/sixun-models,
+# 或者在 main.go 里补一条 `../../sixun-models` 的兜底。
+#
+# https://goreleaser.com
+
+project_name: cube
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./gateway/cmd/gateway
+    id: "gateway"
+    binary: "gateway"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./semantic-layers/sixun/cmd/sixun-hbposv7
+    id: "sixun-hbposv7"
+    binary: "sixun-hbposv7"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+  - main: ./semantic-layers/sixun/cmd/sixun-ysx
+    id: "sixun-ysx"
+    binary: "sixun-ysx"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    ignore:
+      - goos: linux
+        goarch: arm64
+      - goos: linux
+        goarch: 386
+
+archives:
+  # gateway: 顶层组件，与配置同目录发布
+  # wrap_in_directory: false  —— 避免 tarball 内多套一层同名目录,确保
+  #   deploy-cube.ps1 在 <RemoteDir>/ 下解压后, gateway/config.yaml/components/
+  #   直接出现在 <RemoteDir>/ 下,而不是 <RemoteDir>/cube_<ver>_Linux_x86_64/...
+  # 同时承担 sixun-models 共享 schema 的部署(family 级,与 gateway 同级)。
+  # 只 glob 5 个 */schema.yaml,不会把 supplier/preagg.go、go.mod 这种源码塞进来。
+  - id: "gateway"
+    format: tar.gz
+    builds:
+      - gateway
+    wrap_in_directory: false
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - src: gateway/config.yaml
+        dst: config.yaml
+      - src: dapr/components
+        dst: components
+      - src: sixun-models/*/schema.yaml
+        dst: sixun-models
+
+  # sixun-hbposv7: 语义层归档，文件名按目录层级命名（每个 dapr app 一个子目录，
+  # 避免 hbposv7 / ysx 的同名 config.yaml / mapping*.yaml 在解压时互相覆盖）
+  # wrap_in_directory: false —— 否则解压后多一层 sixun-hbposv7_<ver>_Linux_x86_64/,
+  #   app 启动 cwd = .../sixun-hbposv7/ 时找不到 ./config.yaml 和 ./mapping/。
+  - id: "sixun-hbposv7"
+    format: tar.gz
+    builds:
+      - sixun-hbposv7
+    wrap_in_directory: false
+    name_template: 'semantic-layers/sixun-hbposv7/sixun-hbposv7_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    files:
+      - src: semantic-layers/sixun/cmd/sixun-hbposv7/config.yaml
+        dst: config.yaml
+      # mapping files live under cmd/.../mapping/ subdir; the whole subdir
+      # is archived as ./mapping/ inside the tarball. To add a new mapping
+      # file just drop it into that subdir; no .goreleaser.yaml edit needed.
+      - src: semantic-layers/sixun/cmd/sixun-hbposv7/mapping
+        dst: mapping
+
+  # sixun-ysx: 语义层归档，文件名按目录层级命名（每个 dapr app 一个子目录，
+  # 避免 hbposv7 / ysx 的同名 config.yaml / mapping*.yaml 在解压时互相覆盖）
+  # wrap_in_directory: false —— 同上。
+  - id: "sixun-ysx"
+    format: tar.gz
+    builds:
+      - sixun-ysx
+    wrap_in_directory: false
+    name_template: 'semantic-layers/sixun-ysx/sixun-ysx_{{ .Version }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}'
+    files:
+      - src: semantic-layers/sixun/cmd/sixun-ysx/config.yaml
+        dst: config.yaml
+      # mapping files live under cmd/.../mapping/ subdir; the whole subdir
+      # is archived as ./mapping/ inside the tarball. To add a new mapping
+      # file just drop it into that subdir; no .goreleaser.yaml edit needed.
+      - src: semantic-layers/sixun/cmd/sixun-ysx/mapping
+        dst: mapping
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json

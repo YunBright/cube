@@ -1,0 +1,71 @@
+# product model - 思迅家族共享 schema
+name: product
+sql_table: product
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 商品 ID
+
+  - name: name
+    sql: name
+    type: string
+    title: 商品名称
+
+  - name: category_id
+    sql: category_id
+    type: string
+    title: 分类 ID
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 主供应商 ID
+
+  - name: status
+    sql: status
+    type: string
+    title: 状态
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 建档时间
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 商品数
+
+  - name: avg_price_yuan
+    sql: "AVG(price_yuan)"
+    type: number
+    title: 平均售价(元)
+    format: "0.00"
+
+  - name: max_price_yuan
+    sql: "MAX(price_yuan)"
+    type: number
+    title: 最高售价(元)
+    format: "0.00"
+
+  - name: min_price_yuan
+    sql: "MIN(price_yuan)"
+    type: number
+    title: 最低售价(元)
+    format: "0.00"
+
+  - name: total_cost_yuan
+    sql: "SUM(cost_yuan)"
+    type: number
+    title: 总进价(元)
+    format: "0.00"
+
+joins:
+  # 跨 model  JOIN(同 app 内 OK;跨 app 由 gateway 协调)
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one

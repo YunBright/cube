@@ -1,0 +1,10 @@
+go 1.26.8
+
+use (
+	.
+	./compiler
+	./gateway
+	./pkg
+	./semantic-layers/sixun
+	./sixun-models
+)

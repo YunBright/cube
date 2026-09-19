@@ -1,0 +1,47 @@
+# hbposv7 supplier mapping:思迅7pro t_bd_supcust_info → 统一 supplier 字段
+# target 与 sixun-models/supplier/schema.yaml 的 dimension name 对齐
+version: 1
+model: supplier
+
+mappings:
+  - source: supcust_no          # 主键 char
+    target: id
+    type: string
+    unit: ""
+
+  - source: sup_name            # 供应商名称 varchar
+    target: name
+    type: string
+
+  - source: sup_type            # 供应商类型 char(0=供应商,1=客户,2=两者)
+    target: type
+    type: string
+
+  - source: sup_man             # 联系人 varchar
+    target: contact
+    type: string
+
+  - source: sup_tel             # 固定电话 varchar(优先)
+    target: phone
+    type: string
+
+  - source: sup_email           # 邮箱 varchar
+    target: email
+    type: string
+
+  - source: sup_addr            # 地址 varchar
+    target: address
+    type: string
+
+  - source: credit_amt          # 信用额 numeric(思迅 char(numeric))
+    target: credit_amount
+    type: decimal
+    unit: yuan
+
+  - source: status              # 状态 char
+    target: status
+    type: string
+
+  - source: modify_date         # 修改时间 datetime(用作 registered_at proxy)
+    target: modified_at
+    type: datetime

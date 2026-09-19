@@ -1,0 +1,44 @@
+# ysx sale_detail mapping
+#
+# ysx 的 t_mp_saleflow 有 order_status 字段(区分销售/退货):
+#   S = 销售
+#   R = 退货
+#   (具体值以你环境为准,schema.yaml 会通过 enum_values 列出常见值)
+#
+# 注意:ysx 没有 sale_money,所以 amount 必须用 SQL 算 SUM(unit_price * quantity)。
+version: 1
+model: sale_detail
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: flow_no
+    target: flow_no
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: sale_price
+    target: unit_price
+    type: decimal
+    unit: yuan
+
+  - source: sale_qnty
+    target: quantity
+    type: decimal
+
+  - source: oper_date
+    target: sold_at
+    type: datetime
+
+  - source: order_status        # ysx 独有,直接映射
+    target: order_status
+    type: string

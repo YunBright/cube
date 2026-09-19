@@ -1,0 +1,17 @@
+# Dapr Component: cube-statestore(Redis)
+# 注册表元信息 + L1 缓存后端(多 gateway 实例时用)
+
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: cube-statestore
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: 172.12.1.1:6379
+    - name: redisPassword
+      value: password
+    - name: actorStateStore
+      value: "true"

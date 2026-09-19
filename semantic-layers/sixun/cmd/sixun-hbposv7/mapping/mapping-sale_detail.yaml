@@ -1,0 +1,40 @@
+# hbposv7 sale_detail mapping
+#
+# 注意:思迅7pro 的 t_rm_order_saleflow 没有 order_status 字段,
+#       schema.yaml 里 order_status dimension 用 SQL:
+#         CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END
+#
+# amount 是 measure,用 SQL 算 SUM(unit_price * quantity),
+# 不在这里映射。
+version: 1
+model: sale_detail
+
+mappings:
+  - source: flow_id             # 流水 ID numeric(主键)
+    target: id
+    type: int
+
+  - source: flow_no             # 流水号 char(单据号)
+    target: flow_no
+    type: string
+
+  - source: branch_no           # 分店编号 char
+    target: branch_id
+    type: string
+
+  - source: item_no             # 商品编号 char → 指向 product.id
+    target: product_id
+    type: string
+
+  - source: sale_price          # 售价 numeric
+    target: unit_price
+    type: decimal
+    unit: yuan
+
+  - source: sale_qnty           # 销售数量 numeric(负数=退货)
+    target: quantity
+    type: decimal
+
+  - source: oper_date           # 销售时间 datetime
+    target: sold_at
+    type: datetime

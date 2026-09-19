@@ -1,0 +1,38 @@
+# hbposv7 product mapping
+version: 1
+model: product
+
+mappings:
+  - source: item_no
+    target: id
+    type: string
+
+  - source: item_name
+    target: name
+    type: string
+
+  - source: item_clsno          # 商品分类 char → 指向 category.id
+    target: category_id
+    type: string
+
+  - source: main_supcust        # 主供应商 char → 指向 supplier.id
+    target: supplier_id
+    type: string
+
+  - source: sale_price          # 售价 numeric(优先用 sale_price,而非 price)
+    target: price_yuan
+    type: decimal
+    unit: yuan
+
+  - source: base_price          # 进价 numeric
+    target: cost_yuan
+    type: decimal
+    unit: yuan
+
+  - source: status              # 状态 char
+    target: status
+    type: string
+
+  - source: build_date          # 建档时间 datetime
+    target: created_at
+    type: datetime

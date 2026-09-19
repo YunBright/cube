@@ -1,0 +1,33 @@
+# ysx stock mapping(与 hbposv7 一致)
+version: 1
+model: stock
+
+mappings:
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: stock_qty
+    target: quantity
+    type: decimal
+
+  - source: avg_cost
+    target: avg_cost
+    type: decimal
+    unit: yuan
+
+  - source: min_qty
+    target: min_qty
+    type: decimal
+
+  - source: max_qty
+    target: max_qty
+    type: decimal
+
+  - source: oper_date
+    target: updated_at
+    type: datetime

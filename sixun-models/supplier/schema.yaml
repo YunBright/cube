@@ -1,0 +1,67 @@
+# supplier model - 思迅家族共享 schema
+#
+# dimension/measure name 与 mapping.yaml target 对齐
+# 两边实例(hbposv7/ysx)的 mapping.yaml target 列表相同 → schema 一致 → BI 工具无感知
+name: supplier
+sql_table: supplier
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 供应商 ID
+
+  - name: name
+    sql: name
+    type: string
+    title: 供应商名称
+
+  - name: type
+    sql: type
+    type: string
+    title: 类型
+    enum_values:
+      - { value: "0", label: 供应商 }
+      - { value: "1", label: 客户 }
+
+  - name: contact
+    sql: contact
+    type: string
+    title: 联系人
+
+  - name: phone
+    sql: phone
+    type: string
+    title: 电话
+
+  - name: email
+    sql: email
+    type: string
+    title: 邮箱
+
+  - name: address
+    sql: address
+    type: string
+    title: 地址
+
+  - name: status
+    sql: status
+    type: string
+    title: 状态
+
+  - name: modified_at
+    sql: modified_at
+    type: time
+    title: 最后修改时间
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 供应商数
+
+  - name: total_credit_yuan
+    sql: "SUM(credit_amount)"
+    type: number
+    title: 信用总额(元)
+    format: "0.00"

@@ -1,0 +1,38 @@
+# ysx product mapping
+version: 1
+model: product
+
+mappings:
+  - source: item_no
+    target: id
+    type: string
+
+  - source: item_name
+    target: name
+    type: string
+
+  - source: item_clsno
+    target: category_id
+    type: string
+
+  - source: main_supcust
+    target: supplier_id
+    type: string
+
+  - source: sale_price
+    target: price_yuan
+    type: decimal
+    unit: yuan
+
+  - source: base_price
+    target: cost_yuan
+    type: decimal
+    unit: yuan
+
+  - source: status
+    target: status
+    type: string
+
+  - source: build_date
+    target: created_at
+    type: datetime

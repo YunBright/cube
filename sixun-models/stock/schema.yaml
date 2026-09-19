@@ -1,0 +1,52 @@
+# stock model - 思迅家族商品库存
+#
+# t_im_branch_stock 是 (item_no, branch_no) 复合主键:
+#   - 每行 = 某分店某商品的当前库存
+#   - stock_qty 已含所有采购/销售/调整/退货的累计结果
+name: stock
+sql_table: stock
+
+dimensions:
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品 ID
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+
+  - name: updated_at
+    sql: updated_at
+    type: time
+    title: 最后变动时间
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 库存记录数(商品×分店)
+
+  - name: total_quantity
+    sql: "SUM(quantity)"
+    type: number
+    title: 总库存量
+    format: "0.00"
+
+  - name: total_value_yuan
+    sql: "SUM(quantity * avg_cost)"
+    type: number
+    title: 库存总值(元)
+    format: "0.00"
+
+  - name: low_stock_count
+    sql: "SUM(CASE WHEN quantity < min_qty THEN 1 ELSE 0 END)"
+    type: number
+    title: 低于安全库存的 SKU 数
+
+joins:
+  - name: product
+    sql: product
+    on: "{CUBE}.product_id = product.id"
+    relationship: many_to_one
