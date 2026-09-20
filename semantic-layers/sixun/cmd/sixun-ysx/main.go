@@ -255,33 +255,85 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 			c.JSON(http.StatusBadRequest, gin.H{"error": "at least one measure required"})
 			return
 		}
-		measureRef := strings.TrimPrefix(q.Measures[0], modelName+".")
-		ms, ok := meta.Schema.FindMeasure(measureRef)
-		if !ok {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "measure not found: " + measureRef})
-			return
-		}
-		var dimSQL string
-		if len(q.Dimensions) > 0 {
-			dimRef := strings.TrimPrefix(q.Dimensions[0], modelName+".")
+
+		// 解析所有 dimensions → 拿 SQL 表达式 + cube.js 字段名 "<model>.<name>"
+		//
+		// SELECT 输出做 RTRIM(SQL AS "<alias>") 包一层(简单列名时):
+		// SQL Server CHAR(N) 灌进 DuckDB 仍是右补空格,cube 客户端拿到
+		// "00006               " 还要再 Trim 才能用。
+		var dimCols []string       // SELECT 列表(带引号别名)
+		var dimGroup []string      // GROUP BY 列表(裸表达式)
+		var dimRefs []string       // 用于 log
+		for _, rawDim := range q.Dimensions {
+			dimRef := strings.TrimPrefix(rawDim, modelName+".")
 			d, ok := meta.Schema.FindDimension(dimRef)
 			if !ok {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "dimension not found: " + dimRef})
 				return
 			}
-			dimSQL = d.SQL
+			alias := modelName + "." + dimRef
+			expr := d.SQL
+			if isSimpleColumn(expr) {
+				expr = "RTRIM(" + expr + ")"
+			}
+			dimCols = append(dimCols, fmt.Sprintf("%s AS %q", expr, alias))
+			dimGroup = append(dimGroup, d.SQL)
+			dimRefs = append(dimRefs, dimRef)
 		}
 
-		var sql string
-		if dimSQL != "" {
-			sql = fmt.Sprintf(
-				"SELECT %s AS dimension, %s AS measure FROM %s GROUP BY %s LIMIT 1000",
-				dimSQL, ms.SQL, meta.Schema.SQLTable, dimSQL)
-		} else {
-			sql = fmt.Sprintf("SELECT %s AS measure FROM %s LIMIT 1000", ms.SQL, meta.Schema.SQLTable)
+		// 解析所有 measures → cube.js 字段名 "<model>.<name>"
+		var measCols []string
+		var measRefs []string
+		for _, rawMs := range q.Measures {
+			measRef := strings.TrimPrefix(rawMs, modelName+".")
+			ms, ok := meta.Schema.FindMeasure(measRef)
+			if !ok {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "measure not found: " + measRef})
+				return
+			}
+			alias := modelName + "." + measRef
+			measCols = append(measCols, fmt.Sprintf("%s AS %q", ms.SQL, alias))
+			measRefs = append(measRefs, measRef)
 		}
 
-		rows, err := db.QueryMap(sql)
+		// 构造 WHERE 子句(filters)
+		var whereParts []string
+		var whereArgs []any
+		for _, f := range q.Filters {
+			memberRef := strings.TrimPrefix(f.Member, modelName+".")
+			dim, ok := meta.Schema.FindDimension(memberRef)
+			if !ok {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "filter dimension not found: " + memberRef})
+				return
+			}
+			expr, args, err := buildFilterExpr(dim.SQL, f.Operator, f.Values)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "filter: " + err.Error()})
+				return
+			}
+			whereParts = append(whereParts, expr)
+			whereArgs = append(whereArgs, args...)
+		}
+
+		// 组装 SQL
+		var selectList []string
+		selectList = append(selectList, dimCols...)
+		selectList = append(selectList, measCols...)
+		sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectList, ", "), meta.Schema.SQLTable)
+		if len(whereParts) > 0 {
+			sql += " WHERE " + strings.Join(whereParts, " AND ")
+		}
+		if len(dimGroup) > 0 {
+			sql += " GROUP BY " + strings.Join(dimGroup, ", ")
+		}
+		// LIMIT 来自 q.Limit(*int)
+		limit := 1000
+		if q.Limit != nil && *q.Limit > 0 {
+			limit = *q.Limit
+		}
+		sql += fmt.Sprintf(" LIMIT %d", limit)
+
+		rows, err := db.QueryMap(sql, whereArgs...)
 		if err != nil {
 			lg.Info("duckdb query failed", "sql", sql, "err", err.Error())
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "duckdb: " + err.Error()})
@@ -290,14 +342,111 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 
 		lg.Info("query ok", "model", modelName, "sql", sql, "rows", len(rows))
 		c.JSON(http.StatusOK, gin.H{
-			"app_id":  appID,
-			"model":   modelName,
-			"sql":     sql,
-			"data":    rows,
-			"measure": measureRef,
-			"dim":     dimSQL,
+			"app_id":    appID,
+			"model":     modelName,
+			"sql":       sql,
+			"data":      rows,
+			"measures":  measRefs,
+			"dimensions": dimRefs,
 		})
 	}
+}
+
+// buildFilterExpr 把 cube.js filter operator 翻译成 SQL WHERE 片段。
+//
+// 支持: equals / notEquals / contains / notContains / in / notIn / gt / gte / lt / lte / startsWith。
+// 占位符 ? 由调用方提供 args,DuckDB prepared statement 风格。
+//
+// 字符串列自动 RTRIM:SQL Server 源 CHAR(N) 列灌进 DuckDB 后保留右补空格,
+// 等值匹配 '00006' 会因尾随空格失败。这里用 RTRIM(col) 处理,只对 dim.SQL 是
+// 简单列名时启用(不破坏复合表达式 / 函数调用)。
+func buildFilterExpr(columnSQL, op string, values []any) (string, []any, error) {
+	trimmed := isSimpleColumn(columnSQL)
+	col := columnSQL
+	if trimmed {
+		col = "RTRIM(" + col + ")"
+	}
+	switch op {
+	case "equals":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("equals needs 1 value, got %d", len(values))
+		}
+		return col + " = ?", values, nil
+	case "notEquals":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("notEquals needs 1 value, got %d", len(values))
+		}
+		return col + " != ?", values, nil
+	case "contains":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("contains needs 1 value, got %d", len(values))
+		}
+		return col + " LIKE ?", []any{"%" + fmt.Sprint(values[0]) + "%"}, nil
+	case "notContains":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("notContains needs 1 value, got %d", len(values))
+		}
+		return col + " NOT LIKE ?", []any{"%" + fmt.Sprint(values[0]) + "%"}, nil
+	case "startsWith":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("startsWith needs 1 value, got %d", len(values))
+		}
+		return col + " LIKE ?", []any{fmt.Sprint(values[0]) + "%"}, nil
+	case "in":
+		if len(values) == 0 {
+			return "", nil, fmt.Errorf("in needs >=1 value")
+		}
+		placeholders := strings.Repeat("?,", len(values))
+		placeholders = strings.TrimRight(placeholders, ",")
+		return col + " IN (" + placeholders + ")", values, nil
+	case "notIn":
+		if len(values) == 0 {
+			return "", nil, fmt.Errorf("notIn needs >=1 value")
+		}
+		placeholders := strings.Repeat("?,", len(values))
+		placeholders = strings.TrimRight(placeholders, ",")
+		return col + " NOT IN (" + placeholders + ")", values, nil
+	case "gt":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("gt needs 1 value, got %d", len(values))
+		}
+		return col + " > ?", values, nil
+	case "gte":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("gte needs 1 value, got %d", len(values))
+		}
+		return col + " >= ?", values, nil
+	case "lt":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("lt needs 1 value, got %d", len(values))
+		}
+		return col + " < ?", values, nil
+	case "lte":
+		if len(values) != 1 {
+			return "", nil, fmt.Errorf("lte needs 1 value, got %d", len(values))
+		}
+		return col + " <= ?", values, nil
+	default:
+		return "", nil, fmt.Errorf("unsupported operator: %s", op)
+	}
+}
+
+// isSimpleColumn 判断 expr 是不是简单列名(可安全包 RTRIM)。
+//
+// 简单定义:字母数字下划线 + 点,没有空格 / 函数调用 / 表达式。
+func isSimpleColumn(expr string) bool {
+	if expr == "" {
+		return false
+	}
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func toRows(mapped []map[string]any, cols []fieldmapping.FieldDef) [][]any {

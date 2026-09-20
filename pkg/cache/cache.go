@@ -6,7 +6,11 @@
 //   - key 包含 principal,避免跨用户泄漏
 package cache
 
-import "time"
+import (
+	"crypto/md5"
+	"encoding/hex"
+	"time"
+)
 
 // Entry 是缓存条目。
 type Entry struct {
@@ -39,17 +43,26 @@ type Cache interface {
 // KeyBuilder 构造缓存 key。
 //
 // 公式:md5(model + cube_query_json + principal + tenant + freshness_tag)
+//
+// 注意:这个 key **必须** 包含 query body,否则不同请求(不同 filters / dims /
+// measures)会共享同一个 cache slot,后到的请求被错误地命中前一个请求的结果。
+// 历史上 Build() 返 "" (一个 TODO),所有请求共享同一 slot,表现为"任何 query
+// 都拿到第一条 cached 结果"。
 type KeyBuilder struct{}
 
 // Build 构造 key。
 func (k *KeyBuilder) Build(model string, query []byte, principal, tenant, freshness string) string {
-	// TODO: 用 md5 拼
-	_ = model
-	_ = query
-	_ = principal
-	_ = tenant
-	_ = freshness
-	return ""
+	h := md5.New()
+	h.Write([]byte(model))
+	h.Write([]byte{0})
+	h.Write(query)
+	h.Write([]byte{0})
+	h.Write([]byte(principal))
+	h.Write([]byte{0})
+	h.Write([]byte(tenant))
+	h.Write([]byte{0})
+	h.Write([]byte(freshness))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // TODO: pkg/cache/inmem.go 实现 in-memory cache

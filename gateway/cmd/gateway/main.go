@@ -17,6 +17,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/YunBright/cube/gateway/internal/handler"
 	"github.com/YunBright/cube/gateway/internal/l1cache"
@@ -36,8 +37,20 @@ func main() {
 	}
 	lg := log.New("cube-gateway")
 
-	// dapr client(脚手架阶段用 Noop,真实部署注入 grpc client)
-	dapr := daprclient.NewNoop()
+	// dapr client:经本机 dapr-sidecar HTTP 端口调其它 dapr app。
+	//
+	// 端口约定:dapr run 启动时把 DAPR_HTTP_PORT 写入进程 env(本 service 单元 = 3000),
+	// 这里直接读 env 拿到 sidecar HTTP URL。fallback localhost:3000。
+	sidecarAddr := os.Getenv("DAPR_HTTP_ENDPOINT")
+	if sidecarAddr == "" {
+		port := os.Getenv("DAPR_HTTP_PORT")
+		if port == "" {
+			port = "3000"
+		}
+		sidecarAddr = "http://127.0.0.1:" + port
+	}
+	lg.Info("dapr sidecar endpoint", "addr", sidecarAddr)
+	dapr := daprclient.NewHTTP(sidecarAddr)
 
 	// 注册表:从 dapr state store 读 + 写
 	reg := registry.New(dapr, cfg.String("dapr.state_store"), lg)

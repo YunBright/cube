@@ -76,3 +76,9 @@ cube/
 - [ ] 新增代码有对应 pkg 接口的最小测试(脚手架阶段允许 TODO)
 - [ ] 没碰 P1 拍板里 ❌ 的事项
 - [ ] 新增 family 必须同时加 `skills/add-new-data-source` 的代码示例(若案例缺失)
+
+## 8. 添加子服务(dapr app)
+
+- 是否属于已存在family，是则新建<family>-models 和 semantic-layers\<family>，否则在所属family下追加，参考已存在的semantic-layers.
+- 修改.goreleaser.yaml,增加构建配置，参考已存在的semantic-layers.
+- 修改..\deployer\deploy-cube.ps1，并提醒用户在服务器上新增system unit.

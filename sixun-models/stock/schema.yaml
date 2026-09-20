@@ -34,6 +34,12 @@ measures:
     title: 总库存量
     format: "0.00"
 
+  - name: avg_cost
+    sql: "AVG(avg_cost)"
+    type: number
+    title: 平均进价(元)
+    format: "0.00"
+
   - name: total_value_yuan
     sql: "SUM(quantity * avg_cost)"
     type: number

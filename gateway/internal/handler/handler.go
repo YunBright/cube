@@ -95,8 +95,16 @@ func (h *Handler) Load(c *gin.Context) {
 		return
 	}
 
-	// L1 miss → dapr invocation 调 cube app
-	result, err := h.Dapr.InvokeMethod(c.Request.Context(), appID, "/query", body, nil)
+	// L1 miss → dapr invocation 调 cube app。
+	//
+	// 透传调用方的 Authorization(原 stocktake JWT)给 cube app 的 dapr-sidecar:
+	//   - cube app 的 sidecar 配了 middleware.http.bearer (aud=userd)
+	//   - stocktake JWT 的 aud 已含 ["userd","stocktake"],过验即可
+	//   - 不透传 → cube app sidecar 401 (ERR_NO_AUTH)
+	extra := map[string]string{
+		"Authorization": c.Request.Header.Get("Authorization"),
+	}
+	result, err := h.Dapr.InvokeMethod(c.Request.Context(), appID, "/query", body, extra)
 	if err != nil {
 		c.JSON(502, gin.H{"error": err.Error()})
 		return
