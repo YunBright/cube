@@ -22,13 +22,68 @@ dapr run --app-id cube-gateway -- \
 # 5. 启动 compiler
 dapr run --app-id cube-compiler -- \
   go run ./compiler/cmd/compiler
+```
 
-# 6. 启动思迅实例(自动注册到 gateway)
-dapr run --app-id sixun-hbposv7 -- \
-  go run ./semantic-layers/sixun/cmd/sixun-hbposv7
+### 启动 cube app 实例(v2 — env 驱动)
 
-dapr run --app-id sixun-ysx -- \
-  go run ./semantic-layers/sixun/cmd/sixun-ysx
+> **核心变化**:cube app 的所有差异(数据源 DSN / 端口 / DuckDB / 注册地址)
+> 都通过 **环境变量** 注入,同一份 binary 可以服务多个 instance(门店)。
+
+#### 通用环境变量(`boot.Load()` 读取)
+
+| 变量 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `CUBE_APP_ID`     | ✓ | —   | 完整 source id(`<family>-<version>-<instance>`);family / version / instance 由其拆分得到 |
+| `CUBE_PORT`       |   | `:8080` | gin 监听端口 |
+| `CUBE_MAPPING_DIR`|   | `./mapping` | mapping-*.yaml 所在目录 |
+| `CUBE_MODELS_DIR` |   | (自动探测) | sixun-models 路径 |
+| `CUBE_DUCKDB_PATH`|   | `./data/<app_id>.duckdb` | 本地 DuckDB 文件 |
+| `CUBE_GATEWAY_URL`|   | `http://localhost:8080` | cube-gateway HTTP base |
+
+#### 启动一个思迅云商x 实例(`sixun-ysx-00`)
+
+```bash
+cd semantic-layers/sixun
+
+CUBE_APP_ID=sixun-ysx-00 CUBE_PORT=:8083 \
+  CUBE_GATEWAY_URL=http://localhost:8080 \
+  dapr run --app-id sixun-ysx-00 -- \
+    go run ./cmd/sixun-ysx
+```
+
+DSN / 表名 仍然从 `./cmd/sixun-ysx/config.yaml` 的 `source.dsn` / `source.table_*` 读
+(这部分每家供应商的实例可能有差异,**保持文件驱动**)。
+
+#### 启动同一 binary 的另一实例(`sixun-ysx-baiyuan1`)
+
+```bash
+CUBE_APP_ID=sixun-ysx-baiyuan1 CUBE_PORT=:8084 \
+  CUBE_GATEWAY_URL=http://localhost:8080 \
+  dapr run --app-id sixun-ysx-baiyuan1 -- \
+    go run ./cmd/sixun-ysx
+```
+
+`family`/`version` 自动从 `CUBE_APP_ID` 拆分得 `"sixun"` / `"ysx"`(`instance` = `"baiyuan1"`),
+无需另设 `CUBE_FAMILY` / `CUBE_VERSION`。
+
+#### 启动思迅7pro 实例
+
+```bash
+CUBE_APP_ID=sixun-hbposv7-jiale CUBE_PORT=:8085 \
+  CUBE_GATEWAY_URL=http://localhost:8080 \
+  dapr run --app-id sixun-hbposv7-jiale -- \
+    go run ./cmd/sixun-hbposv7
+```
+
+### 验证注册
+
+```bash
+curl -s http://localhost:8080/v1/sources | jq
+# → { "sources": [
+#     { "source":"sixun-ysx-00",         "status":"online", ... },
+#     { "source":"sixun-ysx-baiyuan1",   "status":"online", ... },
+#     { "source":"sixun-hbposv7-jiale",  "status":"online", ... }
+#   ] }
 ```
 
 ### DuckDB 运行时依赖(P0-3 + go-pduckdb)
@@ -50,7 +105,7 @@ $env:DUCKDB_LIBRARY_PATH = "C:\tools\duckdb\duckdb.dll"
 $env:PATH += ";C:\tools\duckdb"
 
 # 3. 验证
-go run ./cmd/sixun-hbposv7
+CUBE_APP_ID=sixun-ysx-00 go run ./cmd/sixun-ysx
 # 应该看到 "SQL Server connected" + "loaded model=supplier rows=N"
 ```
 
@@ -58,7 +113,7 @@ go run ./cmd/sixun-hbposv7
 ```bash
 brew install duckdb
 # libduckdb 自动装到 /opt/homebrew/lib/libduckdb.dylib
-go run ./cmd/sixun-hbposv7
+CUBE_APP_ID=sixun-ysx-00 go run ./cmd/sixun-ysx
 ```
 
 **Linux (Ubuntu/Debian)**:
@@ -84,7 +139,9 @@ sudo ldconfig
 - Stage 2: `alpine:3.20` + 下载 `libduckdb-linux-amd64.zip` 放到 `/usr/local/lib/`
 
 ```bash
-docker build --build-arg INSTANCE=sixun-hbposv7 -t cube-sixun-hbposv7 .
+docker build \
+  --build-arg INSTANCE=sixun-hbposv7 \
+  -t cube-sixun-hbposv7 .
 ```
 
 #### 测试集成
@@ -99,27 +156,29 @@ cd pkg && go test ./duckdb/...
 
 ```
 ┌─────────────────────────────────────┐
-│  cube-gateway Deployment           │
-│  + dapr sidecar(inject annotation) │
+│  cube-gateway Deployment            │
+│  + dapr sidecar(inject annotation)  │
 └─────────────────────────────────────┘
 
 ┌─────────────────────────────────────┐
-│  cube-compiler Deployment          │
-│  + RBAC 调 k8s API 重启 Pod        │
+│  cube-compiler Deployment           │
+│  + RBAC 调 k8s API 重启 Pod         │
 └─────────────────────────────────────┘
 
-┌─────────────────────────────────────┐
-│  sixun-hbposv7 Deployment          │
-│  + 独立 PVC(挂载 .duckdb)         │
-└─────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  cube-app Deployment(per-instance)          │
+│  每 instance 一个 Deployment / StatefulSet   │
+│  CUBE_APP_ID / DSN 走 env / Secret         │
+│  + 独立 PVC(挂载 ./data/<app_id>.duckdb)    │
+└─────────────────────────────────────────────┘
 ```
 
 **MVP 不实现 k8s RBAC / Pod 重启**,留给 P2。
 
 ## 健康检查
 
-- gateway `GET /health` → 200 OK
-- cube app `GET /health` → 200 OK
+- gateway `GET /healthz` → 200 `{"status":"ok"}`
+- cube app `GET /healthz` → 200 `{status, source, family, version, models, uptime}`
 - dapr sidecar 自动做 liveness / readiness probe
 
 ## 日志
@@ -128,6 +187,7 @@ cd pkg && go test ./duckdb/...
 - `app_id`:实例 ID
 - `component`:子模块(handler / registry / ...)
 - `principal`:审计用(细粒度权限相关)
+- `request_id`:端到端追踪 ID(由 gateway middleware 生成,经 x-request-id 传递到 cube app)
 
 输出 stdout,dapr sidecar 转发到日志系统(ELK / Loki)。
 
@@ -143,7 +203,9 @@ P2 候选:
 
 | 故障 | 行为 |
 |---|---|
-| cube app 挂 | gateway 收到 /v1/load 时,该 model 路由失败 → 502;BI 工具显示错误 |
+| cube app 挂 | gateway 收到 /v1/source/{source}/load 时,InvokeMethod 抛 ConnFailure → SOURCE_OFFLINE;BI 工具看到 503 + code=SOURCE_OFFLINE |
+| cube app 网络 OK 但 cpu 卡死 | ctx 10s 超时 → UPSTREAM_TIMEOUT(504) |
+| cube app 重启(进程消失) | gateway registry 90s 内仍 online;LastSeen 超时 → offline;注册再次成功后回到 online |
 | cube-gateway 挂 | BI 工具全失败;启动新实例(注册表由 dapr state store 持久化) |
 | cube-compiler 挂 | cube app 正常运行,只是不能 reload 新代码;重启 compiler 即可 |
 | dapr sidecar 挂 | dapr 自动重启(根据 liveness probe) |

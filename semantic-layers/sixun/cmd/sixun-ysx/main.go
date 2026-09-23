@@ -1,9 +1,11 @@
-// Command sixun-ysx 是思迅云商x 数据源 dapr cube app 实例。
+// Command sixun-ysx 是思迅云商 x 数据源 dapr cube app 实例。
 //
 // 与 sixun-hbposv7 同结构,差别:
 //   - 数据源 connector:ysx.Connector(云商x)
 //   - mapping.yaml:云商x 原始字段名
-//   - 独立 .duckdb 文件(P0-3)
+//   - 独立 .duckdb 文件(按 CUBE_APP_ID 区分)
+//
+// v2 改动:实例由 CUBE_APP_ID 驱动(本文件其余流程与 sixun-hbposv7 同步)。
 package main
 
 import (
@@ -15,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/YunBright/cube/pkg/cubequery"
 	"github.com/YunBright/cube/pkg/cubeschema"
@@ -22,6 +25,7 @@ import (
 	"github.com/YunBright/cube/pkg/fieldmapping"
 	"github.com/YunBright/cube/pkg/log"
 
+	"github.com/YunBright/cube/semantic-layers/sixun/internal/boot"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/source/ysx"
 
 	categorymodel "github.com/YunBright/cube/sixun-models/category"
@@ -34,12 +38,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	appID   = "sixun-ysx"
-	family  = "sixun"
-	version = "ysx"
-)
-
+// appConfig 只保留 DSN / 表名(server.http_addr 与 storage.duckdb_path 改 env)。
 type appConfig struct {
 	Source struct {
 		DSN           string `yaml:"dsn"`
@@ -50,12 +49,6 @@ type appConfig struct {
 		TableSale     string `yaml:"table_sale"`
 		TableStock    string `yaml:"table_stock"`
 	} `yaml:"source"`
-	Server struct {
-		HTTPAddr string `yaml:"http_addr"`
-	} `yaml:"server"`
-	Storage struct {
-		DuckDBPath string `yaml:"duckdb_path"`
-	} `yaml:"storage"`
 }
 
 type schemaMeta struct {
@@ -69,43 +62,60 @@ type modelFetcher struct {
 	build func(ctx context.Context, db *duckdb.Engine, rawSQL string) error
 }
 
+// /query 4xx 子码常量 —— gateway 据此映射到 apierror.Code。
+const (
+	subCodeModelNotFound     = "MODEL_NOT_FOUND"
+	subCodeVersionUnsupported = "VERSION_UNSUPPORTED"
+	subCodeQueryParseError   = "QUERY_PARSE_ERROR"
+	subCodeQueryInvalid      = "QUERY_INVALID"
+	subCodeInternalError     = "INTERNAL_ERROR"
+)
+
+type errBody struct {
+	Code    string         `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details,omitempty"`
+}
+
+func writeErr(c *gin.Context, status int, code, msg string, details map[string]any) {
+	c.JSON(status, errBody{Code: code, Message: msg, Details: details})
+}
+
 func main() {
 	ctx := context.Background()
-	lg := log.New(appID).WithComponent("main")
+
+	cfg, err := boot.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	lg := log.New(cfg.AppID).WithComponent("main")
+	lg.Info("boot loaded", "family", cfg.Family, "version", cfg.Version, "instance", cfg.Instance)
 
 	cfgData, err := os.ReadFile("./config.yaml")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "read config:", err)
 		os.Exit(1)
 	}
-	var cfg appConfig
-	if err := yaml.Unmarshal(cfgData, &cfg); err != nil {
+	var appCfg appConfig
+	if err := yaml.Unmarshal(cfgData, &appCfg); err != nil {
 		fmt.Fprintln(os.Stderr, "parse config:", err)
 		os.Exit(1)
 	}
-	if cfg.Source.DSN == "" {
+	if appCfg.Source.DSN == "" {
 		fmt.Fprintln(os.Stderr, "config.source.dsn is empty")
 		os.Exit(1)
 	}
-	lg.Info("config loaded", "version", cfg.Source.Version, "dsn_host", hostOfDSN(cfg.Source.DSN))
+	lg.Info("config loaded", "version", appCfg.Source.Version, "dsn_host", hostOfDSN(appCfg.Source.DSN))
 
-	loader, err := fieldmapping.NewLoader("./mapping")
+	loader, err := fieldmapping.NewLoader(cfg.MappingDir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load mappings:", err)
 		os.Exit(1)
 	}
 	lg.Info("mappings loaded", "models", loader.Models())
 
-	schemaDir := os.Getenv("CUBE_MODELS_DIR")
-	if schemaDir == "" {
-		if _, err := os.Stat(filepath.Join("..", "..", "..", "..", "sixun-models")); err == nil {
-			schemaDir = filepath.Join("..", "..", "..", "..", "sixun-models")
-		} else if _, err := os.Stat("./sixun-models"); err == nil {
-			schemaDir = "./sixun-models"
-		} else {
-			schemaDir = filepath.Join("..", "..", "..", "..", "sixun-models")
-		}
-	}
+	schemaDir := cfg.ResolveModelsDir()
 	lg.Info("loading schemas", "dir", schemaDir)
 	schemas := map[string]*schemaMeta{}
 	for _, name := range []string{"supplier", "product", "category", "sale_detail", "stock"} {
@@ -129,12 +139,12 @@ func main() {
 	lg.Info("schemas loaded", "count", len(schemas), "models", keysOf(schemas))
 
 	conn, err := ysx.New(ysx.Options{
-		DSN:           cfg.Source.DSN,
-		TableSupplier: cfg.Source.TableSupplier,
-		TableProduct:  cfg.Source.TableProduct,
-		TableCategory: cfg.Source.TableCategory,
-		TableSale:     cfg.Source.TableSale,
-		TableStock:    cfg.Source.TableStock,
+		DSN:           appCfg.Source.DSN,
+		TableSupplier: appCfg.Source.TableSupplier,
+		TableProduct:  appCfg.Source.TableProduct,
+		TableCategory: appCfg.Source.TableCategory,
+		TableSale:     appCfg.Source.TableSale,
+		TableStock:    appCfg.Source.TableStock,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)
@@ -143,10 +153,7 @@ func main() {
 	defer conn.Close()
 	lg.Info("SQL Server connected")
 
-	duckPath := cfg.Storage.DuckDBPath
-	if duckPath == "" {
-		duckPath = "./data/sixun-ysx.duckdb"
-	}
+	duckPath := cfg.ResolveDuckDBPath()
 	if err := os.MkdirAll(filepath.Dir(duckPath), 0o755); err != nil {
 		lg.Info("mkdir data dir failed", "err", err.Error())
 	}
@@ -204,71 +211,67 @@ func main() {
 		registeredModels = append(registeredModels, f.name)
 	}
 
-	go registerToGateway(lg, registeredModels)
+	go registerToGateway(cfg, registeredModels, lg)
 
-	// gin engine
-	addr := cfg.Server.HTTPAddr
-	if addr == "" {
-		addr = ":8083"
-	}
 	engine := gin.New()
 	engine.Use(gin.Logger(), gin.Recovery())
-	engine.POST("/query", queryHandler(db, schemas, registeredModels, lg))
-	engine.GET("/healthz", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "ok",
-			"app_id": appID,
-			"models": registeredModels,
-		})
-	})
+	engine.POST("/query", queryHandler(db, schemas, registeredModels, cfg.AppID, lg))
+	engine.GET("/healthz", cfg.HealthHandler(registeredModels))
 
-	lg.Info("starting HTTP server", "addr", addr, "models", registeredModels)
-	if err := engine.Run(addr); err != nil {
+	lg.Info("starting HTTP server", "addr", cfg.Port, "models", registeredModels)
+	if err := engine.Run(cfg.Port); err != nil {
 		lg.Info("exit", "err", err.Error())
 	}
 }
 
-func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedModels []string, lg *log.Logger) gin.HandlerFunc {
+// queryHandler 完整版(支持多 measure / dimension / filter)。
+//
+// 4xx 响应一律带 "code" 子码,供 gateway 映射到 apierror.Code。
+func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := c.GetRawData()
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "read body: " + err.Error()})
+			writeErr(c, http.StatusBadRequest, subCodeQueryParseError,
+				"read body: "+err.Error(), nil)
 			return
 		}
 
 		q, err := cubequery.Parse(body)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "parse cube query: " + err.Error()})
+			writeErr(c, http.StatusBadRequest, subCodeQueryParseError,
+				"parse cube query: "+err.Error(), nil)
 			return
 		}
 		modelName := q.Model()
 		if modelName == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "cannot infer model"})
+			writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
+				"cannot infer model", nil)
 			return
 		}
 		meta, ok := schemas[modelName]
 		if !ok || meta == nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "model not registered: " + modelName})
+			writeErr(c, http.StatusNotFound, subCodeModelNotFound,
+				"model not exposed by source: "+modelName,
+				map[string]any{"source": source, "model": modelName, "supported": supportedModels})
 			return
 		}
 		if len(q.Measures) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "at least one measure required"})
+			writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
+				"at least one measure required", nil)
 			return
 		}
 
-		// 解析所有 dimensions → 拿 SQL 表达式 + cube.js 字段名 "<model>.<name>"
-		//
-		// SELECT 输出做 RTRIM(SQL AS "<alias>") 包一层(简单列名时):
-		// SQL Server CHAR(N) 灌进 DuckDB 仍是右补空格,cube 客户端拿到
-		// "00006               " 还要再 Trim 才能用。
-		var dimCols []string       // SELECT 列表(带引号别名)
-		var dimGroup []string      // GROUP BY 列表(裸表达式)
-		var dimRefs []string       // 用于 log
+		// dimensions
+		var dimCols []string
+		var dimGroup []string
+		var dimRefs []string
 		for _, rawDim := range q.Dimensions {
 			dimRef := strings.TrimPrefix(rawDim, modelName+".")
 			d, ok := meta.Schema.FindDimension(dimRef)
 			if !ok {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "dimension not found: " + dimRef})
+				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
+					"dimension not found: "+dimRef,
+					map[string]any{"source": source, "model": modelName, "dimension": dimRef})
 				return
 			}
 			alias := modelName + "." + dimRef
@@ -281,14 +284,16 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 			dimRefs = append(dimRefs, dimRef)
 		}
 
-		// 解析所有 measures → cube.js 字段名 "<model>.<name>"
+		// measures
 		var measCols []string
 		var measRefs []string
 		for _, rawMs := range q.Measures {
 			measRef := strings.TrimPrefix(rawMs, modelName+".")
 			ms, ok := meta.Schema.FindMeasure(measRef)
 			if !ok {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "measure not found: " + measRef})
+				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
+					"measure not found: "+measRef,
+					map[string]any{"source": source, "model": modelName, "measure": measRef})
 				return
 			}
 			alias := modelName + "." + measRef
@@ -296,26 +301,30 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 			measRefs = append(measRefs, measRef)
 		}
 
-		// 构造 WHERE 子句(filters)
+		// filters
 		var whereParts []string
 		var whereArgs []any
 		for _, f := range q.Filters {
 			memberRef := strings.TrimPrefix(f.Member, modelName+".")
 			dim, ok := meta.Schema.FindDimension(memberRef)
 			if !ok {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "filter dimension not found: " + memberRef})
+				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
+					"filter dimension not found: "+memberRef,
+					map[string]any{"source": source, "model": modelName, "filter_member": memberRef})
 				return
 			}
 			expr, args, err := buildFilterExpr(dim.SQL, f.Operator, f.Values)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "filter: " + err.Error()})
+				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
+					"filter: "+err.Error(),
+					map[string]any{"source": source, "filter_member": memberRef, "operator": f.Operator})
 				return
 			}
 			whereParts = append(whereParts, expr)
 			whereArgs = append(whereArgs, args...)
 		}
 
-		// 组装 SQL
+		// SQL 拼装
 		var selectList []string
 		selectList = append(selectList, dimCols...)
 		selectList = append(selectList, measCols...)
@@ -326,7 +335,6 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 		if len(dimGroup) > 0 {
 			sql += " GROUP BY " + strings.Join(dimGroup, ", ")
 		}
-		// LIMIT 来自 q.Limit(*int)
 		limit := 1000
 		if q.Limit != nil && *q.Limit > 0 {
 			limit = *q.Limit
@@ -336,30 +344,24 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 		rows, err := db.QueryMap(sql, whereArgs...)
 		if err != nil {
 			lg.Info("duckdb query failed", "sql", sql, "err", err.Error())
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "duckdb: " + err.Error()})
+			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
+				"duckdb: "+err.Error(), map[string]any{"sql": sql})
 			return
 		}
 
 		lg.Info("query ok", "model", modelName, "sql", sql, "rows", len(rows))
 		c.JSON(http.StatusOK, gin.H{
-			"app_id":    appID,
-			"model":     modelName,
-			"sql":       sql,
-			"data":      rows,
-			"measures":  measRefs,
+			"source":     source,
+			"model":      modelName,
+			"sql":        sql,
+			"data":       rows,
+			"measures":   measRefs,
 			"dimensions": dimRefs,
 		})
 	}
 }
 
 // buildFilterExpr 把 cube.js filter operator 翻译成 SQL WHERE 片段。
-//
-// 支持: equals / notEquals / contains / notContains / in / notIn / gt / gte / lt / lte / startsWith。
-// 占位符 ? 由调用方提供 args,DuckDB prepared statement 风格。
-//
-// 字符串列自动 RTRIM:SQL Server 源 CHAR(N) 列灌进 DuckDB 后保留右补空格,
-// 等值匹配 '00006' 会因尾随空格失败。这里用 RTRIM(col) 处理,只对 dim.SQL 是
-// 简单列名时启用(不破坏复合表达式 / 函数调用)。
 func buildFilterExpr(columnSQL, op string, values []any) (string, []any, error) {
 	trimmed := isSimpleColumn(columnSQL)
 	col := columnSQL
@@ -432,8 +434,6 @@ func buildFilterExpr(columnSQL, op string, values []any) (string, []any, error) 
 }
 
 // isSimpleColumn 判断 expr 是不是简单列名(可安全包 RTRIM)。
-//
-// 简单定义:字母数字下划线 + 点,没有空格 / 函数调用 / 表达式。
 func isSimpleColumn(expr string) bool {
 	if expr == "" {
 		return false
@@ -469,30 +469,28 @@ func keysOf[V any](m map[string]V) []string {
 	return out
 }
 
-func registerToGateway(lg *log.Logger, models []string) {
-	gatewayURL := os.Getenv("CUBE_GATEWAY_URL")
-	if gatewayURL == "" {
-		gatewayURL = "http://localhost:8080"
-	}
-	body := []byte(fmt.Sprintf(`{
-		"app_id": "%s",
-		"family": "%s",
-		"version": "%s",
-		"models": %s,
-		"capabilities": ["query", "preagg", "cache_l2"],
-		"health_url": "/health"
-	}`, appID, family, version, jsonArray(models)))
+// registerToGateway 用 cfg.RegisterBody 构造注册体。
+func registerToGateway(cfg *boot.Config, models []string, lg *log.Logger) {
+	body := cfg.RegisterBody(models)
+	deadline := time.Now().Add(10 * time.Second)
 
-	resp, err := http.Post(gatewayURL+"/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		lg.Info("register attempt failed", "err", err.Error(), "url", gatewayURL)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == 204 {
-		lg.Info("registered to cube-gateway", "url", gatewayURL)
-	} else {
-		lg.Info("register returned non-204", "status", resp.Status, "url", gatewayURL)
+	for {
+		resp, err := http.Post(cfg.GatewayURL+"/register", "application/json", bytes.NewReader(body))
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusNoContent {
+				lg.Info("registered to cube-gateway", "url", cfg.GatewayURL)
+			} else {
+				lg.Info("register returned non-204", "status", resp.Status, "url", cfg.GatewayURL)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			lg.Info("register attempt failed (giving up)", "err", err.Error(), "url", cfg.GatewayURL)
+			return
+		}
+		lg.Info("register attempt failed, retrying", "err", err.Error(), "url", cfg.GatewayURL)
+		time.Sleep(2 * time.Second)
 	}
 }
 
@@ -521,7 +519,5 @@ func hostOfDSN(dsn string) string {
 	return rest[:q]
 }
 
-func jsonArray(ss []string) string {
-	b, _ := json.Marshal(ss)
-	return string(b)
-}
+// 防止 json 包 unused 警告。
+var _ = json.Marshal

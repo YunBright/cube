@@ -5,7 +5,12 @@
 
 ## 1. 项目本质
 
-基于 Dapr 的**多实例语义层网关**。每个数据源类型(思迅/粮油/…)→ 一个 Dapr app 家族,每个版本(云商x / 7pro)→ 家族内一个独立 app 实例(`sixun-ysx` / `sixun-hbposv7`)。对外暴露 Cube.js 兼容 API(`/v1/load` + `/v1/meta`),内部用 DuckDB 做预聚合 + L1/L2 缓存。
+基于 Dapr 的**多实例语义层网关**。每个数据源类型(思迅/粮油/…)→ 一个 Dapr app 家族,
+每个版本(云商x / 7pro)→ 家族内一个 binary,
+每个 store/instance(门店 / 租户)→ 一个 dapr cube app 进程,由 `CUBE_APP_ID` 区分
+(`sixun-ysx-00` / `sixun-ysx-baiyuan1` / `sixun-hbposv7-jiale`)。
+对外暴露 Cube.js 兼容 API(`/v1/source/{source}/load` + `/v1/sources`),内部用 DuckDB 做预聚合 + L1/L2 缓存。
+所有非 2xx 响应必须返回统一错误信封(`pkg/apierror`)。
 
 参考 cube-core 的 **schema / measure / dimension / pre-aggregation** 设计,**不照搬 driver 抽象**——driver 由 Dapr app 隔离。
 
@@ -27,21 +32,30 @@ cube/
 | 维度 | 命名 | 示例 |
 |---|---|---|
 | 家族 | `[数据源名英文]` | `sixun` / `liangyou` |
-| 实例(dapr app id) | `[家族]-[版本短码]` | `sixun-hbposv7` / `sixun-ysx` |
+| Binary(per family × version) | `[family]-[version]` | `sixun-hbposv7` / `sixun-ysx` |
+| Instance(dapr app id / source) | `[family]-[version]-[store/instance-alias]` | `sixun-hbposv7-jiale` / `sixun-ysx-00` |
 | Model | `[业务实体英文单数]` | `supplier` / `product` / `order` |
 | Go module | `github.com/YunBright/cube/<子目录>` | `cube/pkg` |
+
+> instance id 在 gateway URL 端用 `^[\w-]+-[\w-]+-[\w-]+$` 校验(3 段)。
+> 在 boot 端(dapr app-id 字符集限制)进一步收紧为 `^[a-z0-9][a-z0-9-]*[a-z0-9]$`(不允许下划线 / 首位 hyphen),
+> 同时 `len(segments) ≥ 3`。
+> family / version **由 CUBE_APP_ID 拆分得到**,不设独立 env。
 
 ## 4. 拍板决策(P0 + P1,不要重新发明)
 
 | 决策 | 选择 | 不要做的 |
 |---|---|---|
 | 多版本共享 schema | 抽 `<family>-models` module,差异在 mapping.yaml | ❌ 复制代码、❌ 写 Go 硬编码映射 |
-| DuckDB 存储 | 每个 dapr cube app 独立 .duckdb 文件 | ❌ 共享一个 DB |
+| DuckDB 存储 | 每个 dapr cube app instance 独立 .duckdb 文件(命名 `<app_id>.duckdb`) | ❌ 共享一个 DB |
+| Instance 配置 | env 驱动(`CUBE_APP_ID` 等),同 binary 多 instance | ❌ 硬编码 const、❌ 编译时区分 instance |
 | 部署模式 | hosted (k8s) + 本地 dev (docker-compose) | ❌ 其他模式 |
 | mapping.yaml 语义 | **仅字段名 + 类型 + 单位**(无 enum_map / 无 transform) | ❌ 写 enum_map、❌ 写 transform |
-| 权限分层 | gateway 粗粒度(model 访问)+ cube app 细粒度(行/列) | ❌ gateway 实现全部权限 |
+| 权限分层 | gateway 粗粒度(source 访问)+ cube app 细粒度(行/列) | ❌ gateway 实现全部权限 |
 | L1 缓存命中 | 直接返回,**完全跳过 cube app** | ❌ 还调 cube app |
-| MVP API 范围 | `/v1/load` + `/v1/meta` | ❌ `/v1/sql`、❌ 其它端点 |
+| Query 寻址 | `POST /v1/source/{source}/load`,source 直接对应 app_id | ❌ model → app_id 路由 |
+| MVP API 范围 | `/v1/source/{source}/load` + `/v1/sources` + `/register` + `/healthz` | ❌ `/v1/sql`、❌ `/v1/load`、❌ `/v1/meta` |
+| 错误信封 | 所有非 2xx 用 `pkg/apierror` 统一形状 `{code, message, details}`,`X-Request-Id` header | ❌ `gin.H{"error":...}`、❌ 各端点自定义 |
 | HTTP 框架 | **`gin-gonic/gin v1.10.x`**(所有 dapr app 入口端点统一用) | ❌ 直接 `net/http`、`❌ chi/echo/fiber` 等其它 web 框架 |
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
 
@@ -54,6 +68,8 @@ cube/
 - Dapr SDK 统一从 `pkg/daprclient` 引,不要各 app 直接 `import "github.com/dapr/go-sdk/client"`
 - Dapr building blocks 使用范围:Service Invocation / State Store / PubSub / Secrets / Distributed Lock;**不要引入 Actors / Workflow**(P2 再说)
 - 所有错误往上抛,不要吞;日志用 `pkg/log`
+- 任何 HTTP 错误响应**必须**走 `pkg/apierror`(`WriteError` / `WriteErrorWithSource`),
+  禁止直接 `c.JSON(4xx/5xx, gin.H{"error": ...})`
 - 不要写 SQL 注入风险入口(P1-8 选了不做 /v1/sql,不要自行加回来)
 
 ## 6. AI Skills

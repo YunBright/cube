@@ -7,10 +7,12 @@
 //	Headers: Content-Type: application/json, dapr-* metadata as HTTP headers
 //	Body: raw JSON bytes
 //
-// This is the production path for cube-gateway (and any cube app) when running
-// under dapr run with --app-protocol http. The "noop" stub is only for tests
-// and pre-dapr development.
-
+// 错误模型:InvokeMethod / PublishToPubSub / GetState / SaveState 都返回 *InvokeError
+// (errors.go) 区分 ErrTimeout / ErrConnFailure / ErrHTTPStatus 三种 Kind。调用方用
+// errors.As 拿到 Kind + StatusCode + Body 后做最终映射。
+//
+// 超时策略:本包不设默认 http.Client.Timeout —— 0 表示无 client 级 deadline,由调用方
+// 通过 context.WithTimeout 自行控制。
 package daprclient
 
 import (
@@ -21,26 +23,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
 // HTTPClient 是基于 HTTP 的 dapr 客户端,直接调本机 dapr-sidecar。
 //
 // 配置项:
 //   - SidecarAddr:"http://127.0.0.1:3500"(或 3000 / 3003 / ... 按 dapr-http-port)
-//   - Timeout:    10s 默认(跟 stocktake cubeclient 保持一致)
+//   - HTTPClient: 可注入(测试用),默认 Timeout=0(由 ctx 控制)
 type HTTPClient struct {
-	SidecarAddr string        // 例 "http://127.0.0.1:3000"
-	HTTPClient  *http.Client  // 可注入(测试用),默认 10s timeout
+	SidecarAddr string       // 例 "http://127.0.0.1:3000"
+	HTTPClient  *http.Client // 可注入(测试用),默认 Timeout=0
 }
 
 // NewHTTP 构造 HTTP dapr 客户端。
 //
 // sidecarAddr 形如 "http://127.0.0.1:3000" —— dapr run 启动的 sidecar HTTP 端口。
+// HTTPClient 默认 Timeout=0,所有 deadline 由调用方通过 ctx.WithTimeout 控制。
 func NewHTTP(sidecarAddr string) *HTTPClient {
 	return &HTTPClient{
 		SidecarAddr: sidecarAddr,
-		HTTPClient:  &http.Client{Timeout: 30 * time.Second},
+		HTTPClient:  &http.Client{}, // Timeout=0
 	}
 }
 
@@ -51,6 +53,12 @@ func (c *HTTPClient) SetHTTPClient(h *http.Client) { c.HTTPClient = h }
 //
 // URL: <sidecar>/v1.0/invoke/<targetAppID>/method/<method>
 // extra 中的 key 自动转 dapr-<key> 头(透传到目标 sidecar)。
+//
+// 错误分类:
+//   - ctx deadline exceeded / http.Client 超时 → *InvokeError{Kind: ErrTimeout}
+//   - 其他 transport 错误(refused / DNS / EOF)→ *InvokeError{Kind: ErrConnFailure}
+//   - 上游 4xx / 5xx → *InvokeError{Kind: ErrHTTPStatus, StatusCode, Body}
+//   - SidecarAddr 未配置 → errors.New (string error,不带 Kind 信息)
 func (c *HTTPClient) InvokeMethod(ctx context.Context, targetAppID, method string, data []byte, extra map[string]string) ([]byte, error) {
 	if c.SidecarAddr == "" {
 		return nil, errors.New("daprclient http: SidecarAddr 未配置")
@@ -66,19 +74,29 @@ func (c *HTTPClient) InvokeMethod(ctx context.Context, targetAppID, method strin
 	}
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("daprclient http: invoke %s/%s: %w", targetAppID, method, err)
+		return nil, classifyTransportErr(targetAppID, method, err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("daprclient http: invoke %s/%s: status=%d body=%s",
-			targetAppID, method, resp.StatusCode, string(body))
+		return nil, &InvokeError{
+			TargetAppID: targetAppID,
+			Method:      method,
+			Kind:        ErrHTTPStatus,
+			StatusCode:  resp.StatusCode,
+			Body:        body,
+		}
 	}
 	return body, nil
 }
 
 // PublishToPubSub HTTP 实现:POST <sidecar>/v1.0/publish/<pubsub>/<topic>。
+//
+// 错误分类与 InvokeMethod 一致。
 func (c *HTTPClient) PublishToPubSub(ctx context.Context, pubsub, topic string, data []byte) error {
+	if c.SidecarAddr == "" {
+		return errors.New("daprclient http: SidecarAddr 未配置")
+	}
 	url := fmt.Sprintf("%s/v1.0/publish/%s/%s", c.SidecarAddr, pubsub, topic)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
@@ -87,13 +105,18 @@ func (c *HTTPClient) PublishToPubSub(ctx context.Context, pubsub, topic string, 
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("daprclient http: publish %s/%s: %w", pubsub, topic, err)
+		return classifyTransportErr("pubsub:"+pubsub, topic, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("daprclient http: publish %s/%s: status=%d body=%s",
-			pubsub, topic, resp.StatusCode, string(body))
+		return &InvokeError{
+			TargetAppID: pubsub,
+			Method:      topic,
+			Kind:        ErrHTTPStatus,
+			StatusCode:  resp.StatusCode,
+			Body:        body,
+		}
 	}
 	return nil
 }
@@ -101,7 +124,13 @@ func (c *HTTPClient) PublishToPubSub(ctx context.Context, pubsub, topic string, 
 // GetState HTTP 实现:GET <sidecar>/v1.0/state/<store>/<key>。
 //
 // 返 (raw value bytes, exists, error) —— 不存在 = (nil, false, nil)。
+//
+// 注:本路径不是 critical path,保留与旧行为兼容 —— 404 转 (nil, false, nil),
+// 不上抛 InvokeError。其他非 2xx 仍返回 *InvokeError{ErrHTTPStatus}。
 func (c *HTTPClient) GetState(ctx context.Context, store, key string) ([]byte, bool, error) {
+	if c.SidecarAddr == "" {
+		return nil, false, errors.New("daprclient http: SidecarAddr 未配置")
+	}
 	url := fmt.Sprintf("%s/v1.0/state/%s/%s", c.SidecarAddr, store, key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -109,7 +138,7 @@ func (c *HTTPClient) GetState(ctx context.Context, store, key string) ([]byte, b
 	}
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return nil, false, fmt.Errorf("daprclient http: get state %s/%s: %w", store, key, err)
+		return nil, false, classifyTransportErr("state:"+store, key, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
@@ -117,8 +146,13 @@ func (c *HTTPClient) GetState(ctx context.Context, store, key string) ([]byte, b
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, false, fmt.Errorf("daprclient http: get state %s/%s: status=%d body=%s",
-			store, key, resp.StatusCode, string(body))
+		return nil, false, &InvokeError{
+			TargetAppID: store,
+			Method:      key,
+			Kind:        ErrHTTPStatus,
+			StatusCode:  resp.StatusCode,
+			Body:        body,
+		}
 	}
 	body, _ := io.ReadAll(resp.Body)
 	if len(body) == 0 {
@@ -131,6 +165,9 @@ func (c *HTTPClient) GetState(ctx context.Context, store, key string) ([]byte, b
 //
 // value 序列化成单个 state item [{ "key": "...", "value": <any> }]。
 func (c *HTTPClient) SaveState(ctx context.Context, store, key string, value []byte) error {
+	if c.SidecarAddr == "" {
+		return errors.New("daprclient http: SidecarAddr 未配置")
+	}
 	url := fmt.Sprintf("%s/v1.0/state/%s", c.SidecarAddr, store)
 	// value 可能是 JSON 字符串或裸字节。把它包成对象 ——
 	// dapr state API 要求数组元素是 {"key": ..., "value": <任意 JSON>}
@@ -150,13 +187,18 @@ func (c *HTTPClient) SaveState(ctx context.Context, store, key string, value []b
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("daprclient http: save state %s/%s: %w", store, key, err)
+		return classifyTransportErr("state:"+store, key, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		rb, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("daprclient http: save state %s/%s: status=%d body=%s",
-			store, key, resp.StatusCode, string(rb))
+		return &InvokeError{
+			TargetAppID: store,
+			Method:      key,
+			Kind:        ErrHTTPStatus,
+			StatusCode:  resp.StatusCode,
+			Body:        rb,
+		}
 	}
 	return nil
 }

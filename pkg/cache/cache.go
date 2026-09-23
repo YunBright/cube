@@ -42,7 +42,12 @@ type Cache interface {
 
 // KeyBuilder 构造缓存 key。
 //
-// 公式:md5(model + cube_query_json + principal + tenant + freshness_tag)
+// 公式:md5(source + 0 + query + 0 + principal + 0 + tenant + 0 + freshness)
+//
+// source = 数据源 id(== dapr app_id,例如 "sixun-ysx-00")。
+// 用 source 而不是 model 做隔离,保证不同 store 的同一 model 查询不会互相
+// 串缓存 —— 例如 supplier.count 对 sixun-ysx-00 的结果不应满足
+// sixun-ysx-baiyuan1 的同名查询。
 //
 // 注意:这个 key **必须** 包含 query body,否则不同请求(不同 filters / dims /
 // measures)会共享同一个 cache slot,后到的请求被错误地命中前一个请求的结果。
@@ -51,9 +56,9 @@ type Cache interface {
 type KeyBuilder struct{}
 
 // Build 构造 key。
-func (k *KeyBuilder) Build(model string, query []byte, principal, tenant, freshness string) string {
+func (k *KeyBuilder) Build(source string, query []byte, principal, tenant, freshness string) string {
 	h := md5.New()
-	h.Write([]byte(model))
+	h.Write([]byte(source))
 	h.Write([]byte{0})
 	h.Write(query)
 	h.Write([]byte{0})

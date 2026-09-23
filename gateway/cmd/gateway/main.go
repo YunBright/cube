@@ -2,27 +2,31 @@
 //
 // 端点(基于 gin-gonic/gin):
 //
-//	POST /register    dapr cube app 启动注册
-//	POST /v1/load     cube 兼容查询(P1-8 选 B,不含 /v1/sql)
-//	GET  /v1/meta     cube 兼容元信息(从注册表聚合)
-//	GET  /health      健康检查
+//	POST /register               dapr cube app 启动注册
+//	POST /v1/source/:source/load cube 兼容查询(取代旧的 /v1/load)
+//	GET  /v1/sources             列出已注册 source 及其状态(取代旧的 /v1/meta)
+//	GET  /healthz                健康检查
 //
 // 流程(BI → gateway → cube app):
-//  1. /v1/load  → 解析 cube query → 查注册表得到 target app_id
-//  2. 查 L1 缓存 → 命中直接返回(P1-7 选 A)
-//  3. 未命中 → 经 dapr invocation 转发到 cube app(透传 principal)
-//  4. 写 L1 缓存 → 返回 BI
+//  1. /v1/source/{source}/load  → 解析 cube query → 查注册表得到 dapr app_id(== source)
+//  2. 查 L1 缓存 → 命中直接返回
+//  3. 未命中 → 经 dapr invocation 转发到 cube app(透传 principal/tenant)
+//  4. 写 L1 缓存 + MarkSeen → 返回 BI
+//
+// v2 改动:
+//   - 不再有 model → app_id 路由,直接 source → app_id(1:1)
+//   - 引入中间件:request_id(全链路追踪)+ error_recovery(panic → INTERNAL_ERROR 包络)
+//   - 删除 router 包;source 是 URL 段,直接 reg.LookupByID(source)
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/YunBright/cube/gateway/internal/handler"
 	"github.com/YunBright/cube/gateway/internal/l1cache"
+	"github.com/YunBright/cube/gateway/internal/middleware"
 	"github.com/YunBright/cube/gateway/internal/registry"
-	"github.com/YunBright/cube/gateway/internal/router"
 	"github.com/YunBright/cube/pkg/config"
 	"github.com/YunBright/cube/pkg/daprclient"
 	"github.com/YunBright/cube/pkg/log"
@@ -55,29 +59,26 @@ func main() {
 	// 注册表:从 dapr state store 读 + 写
 	reg := registry.New(dapr, cfg.String("dapr.state_store"), lg)
 
-	// 路由:model → app_id(优先查注册表,fallback 到 config.yaml)
-	rtr := router.New(reg, parseStaticRouting(cfg))
-
 	// L1 缓存
 	cch := l1cache.New(cfg.Int("l1_cache.ttl_seconds"))
 
-	// HTTP handlers
+	// HTTP handlers(Auth 暂为 nil,MVP 阶段无强制鉴权)
 	h := handler.New(handler.Deps{
-		Cfg:      cfg,
 		Logger:   lg,
 		Dapr:     dapr,
 		Registry: reg,
-		Router:   rtr,
 		L1Cache:  cch,
+		Auth:     nil,
 	})
 
-	// gin engine:显式加 logger + recovery(不用 gin.Default())
+	// gin engine:显式加 request_id + error_recovery(不用 gin.Logger() / gin.Recovery())
 	engine := gin.New()
-	engine.Use(gin.Logger(), gin.Recovery())
+	engine.Use(middleware.RequestID())
+	engine.Use(middleware.ErrorRecovery(lg))
 
 	engine.POST("/register", h.Register)
-	engine.POST("/v1/load", h.Load)
-	engine.GET("/v1/meta", h.Meta)
+	engine.POST("/v1/source/:source/load", h.SourceLoad)
+	engine.GET("/v1/sources", h.ListSources)
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "app_id": "cube-gateway"})
 	})
@@ -92,22 +93,8 @@ func main() {
 	}
 }
 
-// parseStaticRouting 解析 config.yaml 的 routing 段(dev fallback)。
-func parseStaticRouting(_ config.Loader) []router.StaticRoute {
-	// TODO: 解析 yaml
-	return nil
-}
-
-// debug helper:把 body 打印到 stderr,辅助早期调试。
-func dumpBody(body []byte, tag string) {
-	if len(body) > 0 {
-		_ = tag
-		fmt.Println(tag, string(body))
-	}
-}
-
-// jsonMustMarshal 调试用。
-func jsonMustMarshal(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
-}
+// 防止 import 被裁掉的占位 —— 保留 dumpBody/jsonMustMarshal 给 dev 用,
+// 后面步骤会清理或补全。
+var (
+	_ = fmt.Println
+)
