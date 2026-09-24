@@ -31,6 +31,8 @@ type Client interface {
 	GetState(ctx context.Context, store, key string) ([]byte, bool, error)
 	// SaveState 存到 state store。
 	SaveState(ctx context.Context, store, key string, value []byte) error
+	// DeleteState 从 state store 删 key。
+	DeleteState(ctx context.Context, store, key string) error
 	// Close 关闭底层连接。
 	Close() error
 }
@@ -58,6 +60,11 @@ func (Noop) GetState(ctx context.Context, store, key string) ([]byte, bool, erro
 
 // SaveState Noop 实现。
 func (Noop) SaveState(ctx context.Context, store, key string, value []byte) error {
+	return nil
+}
+
+// DeleteState Noop 实现。
+func (Noop) DeleteState(ctx context.Context, store, key string) error {
 	return nil
 }
 

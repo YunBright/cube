@@ -36,6 +36,7 @@ const (
 	RATE_LIMITED              Code = "RATE_LIMITED"              // 429 — 预留,MVP 不接入
 	INTERNAL_ERROR            Code = "INTERNAL_ERROR"            // 500 — gateway panic / 未预期错误
 	UPSTREAM_ERROR            Code = "UPSTREAM_ERROR"            // 502 — 上游返回非 2xx 但不属于上面分类
+	DAPR_APP_ID_INVALID       Code = "DAPR_APP_ID_INVALID"       // 400 — register body 的 dapr_app_id 字段缺失或字符集非法
 )
 
 // codeHTTPStatus 是 Code → HTTP status 的单一映射表。
@@ -55,6 +56,7 @@ var codeHTTPStatus = map[Code]int{
 	RATE_LIMITED:              http.StatusTooManyRequests,
 	INTERNAL_ERROR:            http.StatusInternalServerError,
 	UPSTREAM_ERROR:            http.StatusBadGateway,
+	DAPR_APP_ID_INVALID:       http.StatusBadRequest,
 }
 
 // HTTPStatus 返回 c 对应的 HTTP 状态码。未知 Code 退化为 500。

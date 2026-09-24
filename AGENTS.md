@@ -33,7 +33,8 @@ cube/
 |---|---|---|
 | 家族 | `[数据源名英文]` | `sixun` / `liangyou` |
 | Binary(per family × version) | `[family]-[version]` | `sixun-hbposv7` / `sixun-ysx` |
-| Instance(dapr app id / source) | `[family]-[version]-[store/instance-alias]` | `sixun-hbposv7-jiale` / `sixun-ysx-00` |
+| Wire source id(URL 用) | `[family]-[version]-[store/instance-alias]` | `sixun-hbposv7-jiale` / `sixun-ysx-00` |
+| Dapr app id(寻址用,plan B 解耦) | `cube-[family]-[version]-[store/instance-alias]` | `cube-sixun-hbposv7-jiale` / `cube-sixun-ysx-00` |
 | Model | `[业务实体英文单数]` | `supplier` / `product` / `order` |
 | Go module | `github.com/YunBright/cube/<子目录>` | `cube/pkg` |
 
@@ -48,15 +49,17 @@ cube/
 |---|---|---|
 | 多版本共享 schema | 抽 `<family>-models` module,差异在 mapping.yaml | ❌ 复制代码、❌ 写 Go 硬编码映射 |
 | DuckDB 存储 | 每个 dapr cube app instance 独立 .duckdb 文件(命名 `<app_id>.duckdb`) | ❌ 共享一个 DB |
-| Instance 配置 | env 驱动(`CUBE_APP_ID` 等),同 binary 多 instance | ❌ 硬编码 const、❌ 编译时区分 instance |
+| Instance 配置 | env 驱动(`CUBE_APP_ID` 是 wire id;`DAPR_APP_ID` 由 dapr 自动注入,cube app 报给 gateway 当 dapr app-id 寻址用),同 binary 多 instance | ❌ 硬编码 const、❌ 编译时区分 instance |
 | 部署模式 | hosted (k8s) + 本地 dev (docker-compose) | ❌ 其他模式 |
 | mapping.yaml 语义 | **仅字段名 + 类型 + 单位**(无 enum_map / 无 transform) | ❌ 写 enum_map、❌ 写 transform |
 | 权限分层 | gateway 粗粒度(source 访问)+ cube app 细粒度(行/列) | ❌ gateway 实现全部权限 |
 | L1 缓存命中 | 直接返回,**完全跳过 cube app** | ❌ 还调 cube app |
-| Query 寻址 | `POST /v1/source/{source}/load`,source 直接对应 app_id | ❌ model → app_id 路由 |
-| MVP API 范围 | `/v1/source/{source}/load` + `/v1/sources` + `/register` + `/healthz` | ❌ `/v1/sql`、❌ `/v1/load`、❌ `/v1/meta` |
+| Query 寻址 | `POST /v1/source/{source}/load` → gateway 按注册时上报的 `dapr_app_id` 调 dapr(plan B 解耦) | ❌ model → app_id 路由 |
+| MVP API 范围 | `/v1/source/{source}/load` + `/v1/sources` + `/register` + `/unregister` + `/healthz` | ❌ `/v1/sql`、❌ `/v1/load`、❌ `/v1/meta` |
+| Cube app 优雅关闭 | cube app 收到 `SIGTERM` / `SIGINT` → 调 `POST cube-gateway/unregister`(body `{app_id: "..."}`,2s deadline,失败仅记日志)→ `os.Exit(0)`;gateway 立即从 registry + state store 删除条目,**幂等**(未注册也返 204) | ❌ 等下次 invoke 失败再发现(BI 视图长时间脏数据),❌ 阻塞退出等 unregister(会被 kubelet 30s SIGKILL 兜底) |
 | 错误信封 | 所有非 2xx 用 `pkg/apierror` 统一形状 `{code, message, details}`,`X-Request-Id` header | ❌ `gin.H{"error":...}`、❌ 各端点自定义 |
 | HTTP 框架 | **`gin-gonic/gin v1.10.x`**(所有 dapr app 入口端点统一用) | ❌ 直接 `net/http`、`❌ chi/echo/fiber` 等其它 web 框架 |
+| Source 在线判定 | **被动验证**:handler 不前置 IsOnline 检查,任何已注册 source 都直接 `dapr.InvokeMethod`,真实 `SOURCE_OFFLINE` 由 dapr 真实调用失败(`ErrConnFailure`)触发;`/v1/sources` 视图 status 字段恒为 "online"(信息性,不代表实际可达),LastSeen 仅作运维排查信号 | ❌ 时间窗口式离线判定(冷启动源 90s 后假 offline),❌ 主动探活(复杂、对 middleware.http.bearer 链路脆弱),❌ 直连 app / kube 健康度(直连 `DAPR_APP_CHANNEL_ADDRESS`,k8s pod IP 飘移即失效) |
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
 
 ## 5. 编码约束

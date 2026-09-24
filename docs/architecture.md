@@ -15,19 +15,23 @@
             │  • L1 缓存(per-source 隔离)      │
             │  • 粗粒度权限(source 访问)       │
             │  • 注册表(state store,per-app_id)│
-            │  • 统一错误信封(13 个机器可读码) │
+            │  • 统一错误信封(14 个机器可读码) │
             └──────────────┬───────────────────┘
                            │ dapr invocation
         ┌──────────────────┼──────────────────────────┐
         ▼                  ▼                          ▼
  ┌──────────────┐   ┌──────────────┐           ┌──────────────┐
+ │ cube-        │   │ cube-        │           │ cube-        │
  │ sixun-ysx-00 │   │ sixun-ysx-   │           │ sixun-       │
  │              │   │   baiyuan1   │           │   hbposv7-   │
- │              │   │              │           │   jiale      │
- │  同 binary   │   │  同 binary   │           │              │
- │  不同 app_id │   │  不同 app_id │           │  另一 binary │
- │  不同 DSN    │   │  不同 DSN    │           │  各自一份    │
- │              │   │              │           │              │
+ │  ↑ wire:     │   │  ↑ wire:     │           │   jiale      │
+ │ sixun-ysx-00 │   │ sixun-ysx-   │           │              │
+ │              │   │   baiyuan1   │           │  ↑ wire:     │
+ │  同 binary   │   │  同 binary   │           │ sixun-       │
+ │  不同 dapr   │   │  不同 dapr   │           │   hbposv7-   │
+ │   app_id     │   │   app_id     │           │   jiale      │
+ │  不同 DSN    │   │  不同 DSN    │           │  另一 binary │
+ │              │   │              │           │  各自一份    │
  │ • mapping    │   │ • mapping    │           │ • mapping    │
  │ • DuckDB     │   │ • DuckDB     │           │ • DuckDB     │
  │   (独立)     │   │   (独立)     │           │   (独立)     │
@@ -52,6 +56,11 @@
 > **关键变化(v2)**:gateway **不再做 model → app_id 路由**。
 > 每个 cube query 由 URL 上的 `{source}` 段直接寻址到对应 dapr app,
 > **store 级隔离**(同一 family+version 多店时不再相互覆盖)。
+>
+> **wire id 与 dapr app-id 解耦(plan B)**:URL 上的 `source`(`sixun-hbposv7-jiale`)
+> 与 dapr 寻址用的 `app_id`(`cube-sixun-hbposv7-jiale`)可以不同。
+> cube app 启动时读 dapr 注入的 `DAPR_APP_ID` 在 /register 上报给 gateway。
+> 见 `docs/dapr-app-contract.md` §1。
 
 ## 关键决策
 

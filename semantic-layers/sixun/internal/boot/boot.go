@@ -39,9 +39,21 @@ import (
 var appIDRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`)
 
 // Config 是从环境变量 + config.yaml 读出来的启动配置。
+//
+// v2 关键不变量(解耦后):
+//
+//	wire source id (AppID)        = "<family>-<version>-<instance>"
+//	dapr app-id  (DaprAppID)       = "cube-<family>-<version>-<instance>"  (默认推导)
+//
+// 两者字符集都受 dapr 限制(无下划线 / 数字 / 小写字母 / 短横线),CUBE_DAPR_APP_ID
+// env 可显式覆盖(罕见)。
 type Config struct {
-	// AppID = dapr app-id / 数据源 source id(例:"sixun-ysx-00")
+	// AppID 是 wire source id(注册到 gateway 时上报 + URL /v1/source/{source}/load 段)。
+	// 例:"sixun-hbposv7-jiale"(不带 cube- 前缀)。
 	AppID string
+	// DaprAppID 是 dapr sidecar 用的 app-id(`dapr run --app-id <DaprAppID>`),
+	// gateway 转发时按它寻址 cube app。默认 "cube-" + AppID;env CUBE_DAPR_APP_ID 覆盖。
+	DaprAppID string
 	// Family 从 AppID 拆分得到(第 1 段)。
 	Family string
 	// Version 从 AppID 拆分得到(第 2 段)。
@@ -63,11 +75,23 @@ type Config struct {
 	GatewayURL string
 }
 
-// Load 读环境变量,校验,派生 Family/Version/Instance。
+// Load 读环境变量,校验,派生 Family/Version/Instance / DaprAppID。
 //
 // 必填: CUBE_APP_ID
-// 选填: CUBE_PORT=":8080" / CUBE_MAPPING_DIR="./mapping" /
-//       CUBE_MODELS_DIR / CUBE_DUCKDB_PATH / CUBE_GATEWAY_URL="http://localhost:8080"
+// 选填:
+//   - DAPR_APP_ID       — dapr sidecar 注入,作为 daprAppID 首选源(本进程在 dapr
+//                         下启动时 dapr 自动 set;非 dapr 环境下为空)
+//   - CUBE_DAPR_APP_ID  — 手动覆盖,优先级低于 DAPR_APP_ID,空字符串视为未设
+//   - CUBE_PORT=":8080"
+//   - CUBE_MAPPING_DIR="./mapping"
+//   - CUBE_MODELS_DIR
+//   - CUBE_DUCKDB_PATH
+//   - CUBE_GATEWAY_URL="http://localhost:8080"
+//
+// DaprAppID 解析顺序(首个非空胜出):
+//   1. DAPR_APP_ID      — dapr sidecar 注入的"事实源"(最权威)
+//   2. CUBE_DAPR_APP_ID — 运维手动覆盖(罕见;主要是裸起 / 调试时用)
+//   3. "cube-" + CUBE_APP_ID — 推导默认值
 //
 // 失败时返回的 err 形如 "boot: CUBE_APP_ID required"。
 func Load() (*Config, error) {
@@ -88,6 +112,18 @@ func Load() (*Config, error) {
 		}
 	}
 
+	// DaprAppID 三档优先级。
+	daprAppID := strings.TrimSpace(os.Getenv("DAPR_APP_ID"))
+	if daprAppID == "" {
+		daprAppID = strings.TrimSpace(os.Getenv("CUBE_DAPR_APP_ID"))
+	}
+	if daprAppID == "" {
+		daprAppID = "cube-" + appID
+	}
+	if !appIDRE.MatchString(daprAppID) {
+		return nil, fmt.Errorf("boot: dapr app-id %q must match ^[a-z0-9-]+$ (source: %s)", daprAppID, daprAppIDSource())
+	}
+
 	port := os.Getenv("CUBE_PORT")
 	if port == "" {
 		port = ":8080"
@@ -105,6 +141,7 @@ func Load() (*Config, error) {
 
 	return &Config{
 		AppID:      appID,
+		DaprAppID:  daprAppID,
 		Family:     parts[0],
 		Version:    parts[1],
 		Instance:   parts[2],
@@ -114,6 +151,18 @@ func Load() (*Config, error) {
 		DuckDBPath: os.Getenv("CUBE_DUCKDB_PATH"),
 		GatewayURL: gatewayURL,
 	}, nil
+}
+
+// daprAppIDSource 返回 daprAppID 来源的诊断标签(DAPR_APP_ID / CUBE_DAPR_APP_ID / 推导),
+// 用于错误日志和 HealthHandler 调试输出。
+func daprAppIDSource() string {
+	if v := strings.TrimSpace(os.Getenv("DAPR_APP_ID")); v != "" {
+		return "DAPR_APP_ID"
+	}
+	if v := strings.TrimSpace(os.Getenv("CUBE_DAPR_APP_ID")); v != "" {
+		return "CUBE_DAPR_APP_ID"
+	}
+	return "derived"
 }
 
 // DefaultDuckDBPath 返回默认 DuckDB 文件路径。
@@ -164,16 +213,21 @@ func (c *Config) ResolveModelsDir() string {
 // version / models / status,方便外部探活 + 调试。
 //
 // status="ok" / "degraded" 由调用方决定;这里固定 "ok",主流程挂了 gin 自然不响应。
+//
+// wire / dapr 两套 id 同时回(运维需要):
+//   - source      == c.AppID    (URL / /register 用)
+//   - dapr_app_id == c.DaprAppID (dapr sidecar 寻址用)
 func (c *Config) HealthHandler(registeredModels []string) gin.HandlerFunc {
 	startedAt := time.Now()
 	return func(ctx *gin.Context) {
 		ctx.JSON(200, gin.H{
-			"status":  "ok",
-			"source":  c.AppID,
-			"family":  c.Family,
-			"version": c.Version,
-			"models":  registeredModels,
-			"uptime":  time.Since(startedAt).String(),
+			"status":      "ok",
+			"source":      c.AppID,
+			"dapr_app_id": c.DaprAppID,
+			"family":      c.Family,
+			"version":     c.Version,
+			"models":      registeredModels,
+			"uptime":      time.Since(startedAt).String(),
 		})
 	}
 }
@@ -182,15 +236,35 @@ func (c *Config) HealthHandler(registeredModels []string) gin.HandlerFunc {
 //
 // 注册体里 family / version 是从 AppID 派生的(冗余写入,
 // gateway 不重新解析);source 字段 == AppID,保持 wire 一致。
+//
+// v2 关键: dapr_app_id 显式上报 — gateway 用它寻址 dapr app,
+// 不是直接拿 source 当 app-id。
+//
+// 协议说明见 cube/docs/dapr-app-contract.md §2。
 func (c *Config) RegisterBody(registeredModels []string) []byte {
 	body := map[string]any{
-		"app_id":       c.AppID,
+		"app_id":       c.AppID,    // wire source id
+		"dapr_app_id":  c.DaprAppID, // dapr sidecar app-id(寻址用)
 		"family":       c.Family,
 		"version":      c.Version,
-		"source":       c.AppID,
+		"source":       c.AppID,    // == app_id(冗余,wire 兼容)
 		"models":       registeredModels,
 		"capabilities": []string{"query", "preagg", "cache_l2"},
 		"health_url":   "/healthz",
+	}
+	b, _ := json.Marshal(body)
+	return b
+}
+
+// UnregisterBody 构造 /unregister 请求体。
+//
+// 对称 RegisterBody:cube app 在 SIGTERM/SIGINT 时 POST 给 cube-gateway,
+// gateway 立即从 registry 删条目;幂等,gateway 重启 / 已被 unregister 也返 204。
+//
+// 协议说明见 cube/docs/dapr-app-contract.md §2。
+func (c *Config) UnregisterBody() []byte {
+	body := map[string]any{
+		"app_id": c.AppID,
 	}
 	b, _ := json.Marshal(body)
 	return b

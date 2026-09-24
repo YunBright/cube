@@ -61,7 +61,8 @@ func New(d Deps) *Handler { return &Handler{Deps: d} }
 
 // Register 处理 dapr cube app 的启动注册。
 //
-// 请求体:见 registry.AppInfo。校验 AppID 3 段格式 → 写注册表 → 持久化。
+// 请求体:见 registry.AppInfo。校验 AppID 3 段格式 → 校验 dapr_app_id
+// 字符集(空则 fallback 到 AppID)→ 写注册表 → 持久化。
 func (h *Handler) Register(c *gin.Context) {
 	var info registry.AppInfo
 	if err := c.ShouldBindJSON(&info); err != nil {
@@ -75,14 +76,58 @@ func (h *Handler) Register(c *gin.Context) {
 				WithDetails(map[string]any{"app_id": info.AppID}))
 			return
 		}
+		var daprErr *registry.ErrDaprAppIDInvalid
+		if errors.As(err, &daprErr) {
+			WriteError(c, apierror.New(apierror.DAPR_APP_ID_INVALID,
+				"dapr_app_id must match ^[a-z0-9][a-z0-9-]*[a-z0-9]$").
+				WithDetails(map[string]any{
+					"app_id":      info.AppID,
+					"dapr_app_id": daprErr.Value,
+				}))
+			return
+		}
 		WriteError(c, apierror.New(apierror.INTERNAL_ERROR, "register failed: "+err.Error()))
 		return
 	}
 	h.Logger.Info("cube app registered",
 		"registered_app_id", info.AppID,
+		"dapr_app_id", info.DaprAppID,
 		"family", info.Family,
 		"version", info.Version,
 		"models", len(info.Models),
+	)
+	c.Status(http.StatusNoContent)
+}
+
+// Unregister 处理 cube app 优雅关闭时的 unregister(POST /unregister)。
+//
+// 请求体:{"app_id": "<family>-<version>-<instance>"}
+//
+// 行为:
+//   - app_id 格式校验失败 → 400
+//   - 调 registry.Unregister —— **幂等**:无论 source 是否已注册都返 204
+//     (cube app 在 SIGTERM/SIGINT 路径上调用,gateway 重启 / 已 unregister 都不应阻塞退出)
+//   - 持久化层失败仅记日志,不阻塞响应
+//
+// 协议说明见 cube/docs/dapr-app-contract.md §2。
+func (h *Handler) Unregister(c *gin.Context) {
+	var body struct {
+		AppID string `json:"app_id"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		WriteError(c, apierror.New(apierror.QUERY_PARSE_ERROR, "invalid unregister body: "+err.Error()))
+		return
+	}
+	if body.AppID == "" || !sourceFormatRE.MatchString(body.AppID) {
+		WriteError(c, apierror.New(apierror.SOURCE_FORMAT_INVALID,
+			"app_id must be 3 hyphen-delimited segments").
+			WithDetails(map[string]any{"app_id": body.AppID}))
+		return
+	}
+	deleted := h.Registry.Unregister(c.Request.Context(), body.AppID)
+	h.Logger.Info("cube app unregistered",
+		"app_id", body.AppID,
+		"was_registered", deleted,
 	)
 	c.Status(http.StatusNoContent)
 }
@@ -158,12 +203,9 @@ func (h *Handler) SourceLoad(c *gin.Context) {
 			"source not registered: "+source, source, nil)
 		return
 	}
-	if !info.IsOnline(h.Registry.StaleAfter()) {
-		WriteErrorWithSource(c, apierror.SOURCE_OFFLINE,
-			"source offline: "+source, source,
-			map[string]any{"last_seen": info.LastSeen.Format(time.RFC3339)})
-		return
-	}
+	// 不再前置 IsOnline 判定 —— 改为被动:任何已注册 source 都尝试 invoke,
+	// 让 dapr 真实失败信号(ErrConnFailure / ErrHTTPStatus)决定最终错误码。
+	// 这避免了"注册后无人调 → 90s 后假 offline"的伪信号。
 
 	// ---- L1 缓存 ----
 	keyBuilder := &cache.KeyBuilder{}
@@ -178,14 +220,25 @@ func (h *Handler) SourceLoad(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamCallTimeout)
 	defer cancel()
 
+	// 寻址:dapr_app_id(由 cube app 注册时上报) — 不是 URL 上的 source。
+	// plan B 解耦后,wire source id 与 dapr app-id 可以不同
+	// (例:sixun-hbposv7-jiale 寻址 cube-sixun-hbposv7-jiale)。
+	daprTarget := info.DaprAppID
+	if daprTarget == "" {
+		// 极端兜底:registry 应保证非空。空了 fallback 到 source,日志告警。
+		h.Logger.Warn("registry entry has empty dapr_app_id, fallback to source",
+			"source", source)
+		daprTarget = source
+	}
+
 	extra := map[string]string{
 		daprclient.MetadataKeyPrincipal: principal,
 		daprclient.MetadataKeyTenant:    defaultTenant,
 		"Authorization":                 c.Request.Header.Get("Authorization"),
 	}
-	result, err := h.Dapr.InvokeMethod(ctx, source, "/query", body, extra)
+	result, err := h.Dapr.InvokeMethod(ctx, daprTarget, "/query", body, extra)
 	if err != nil {
-		writeUpstreamError(c, source, model, err)
+		writeUpstreamError(c, source, daprTarget, model, err)
 		return
 	}
 
@@ -198,28 +251,34 @@ func (h *Handler) SourceLoad(c *gin.Context) {
 
 // ListSources 列出已注册 source 及其状态(GET /v1/sources)。
 //
-// 取代旧的 /v1/meta。
+// 取代旧的 /v1/meta。每条 entry 同时暴露 wire source id 与 dapr_app_id
+// (plan B:两者可不同),运维可一眼看清"URL 上写的 id 实际寻址到哪个 dapr app"。
 func (h *Handler) ListSources(c *gin.Context) {
-	staleAfter := h.Registry.StaleAfter()
 	infos := h.Registry.All()
 	type entry struct {
-		Source       string    `json:"source"`
+		Source       string    `json:"source"`       // wire id(URL 用)
+		DaprAppID    string    `json:"dapr_app_id"`  // dapr sidecar app-id(寻址用)
 		Family       string    `json:"family"`
 		Version      string    `json:"version"`
 		Models       []string  `json:"models"`
 		Capabilities []string  `json:"capabilities"`
-		Status       string    `json:"status"`
-		LastSeen     time.Time `json:"last_seen"`
+		Status       string    `json:"status"`       // 总是 "online" —— 被动验证,真实可用性看实际 invoke
+		LastSeen     time.Time `json:"last_seen"`     // 仅供运维排查;不做离线判定
 	}
 	out := make([]entry, 0, len(infos))
 	for _, info := range infos {
+		daprID := info.DaprAppID
+		if daprID == "" {
+			daprID = info.AppID // 旧条目 fallback,新条目注册时已兜底
+		}
 		out = append(out, entry{
 			Source:       info.Source,
+			DaprAppID:    daprID,
 			Family:       info.Family,
 			Version:      info.Version,
 			Models:       info.Models,
 			Capabilities: info.Capabilities,
-			Status:       info.Status(staleAfter),
+			Status:       "online",
 			LastSeen:     info.LastSeen,
 		})
 	}
@@ -230,6 +289,11 @@ func (h *Handler) ListSources(c *gin.Context) {
 }
 
 // writeUpstreamError 把 dapr InvokeError / 业务子码映射到 apierror.Code。
+//
+// 参数:
+//   - source  = URL 上的 wire id(给响应 details.source 用,人对人友好)
+//   - daprApp = 实际寻址的 dapr app-id(给 SourceOfMessage 等诊断字段用,
+//                让运维知道是哪个 dapr app 出的问题)
 //
 // 业务流程:
 //  1. errors.As 拿 *InvokeError
@@ -245,20 +309,20 @@ func (h *Handler) ListSources(c *gin.Context) {
 //  3. 兜底:若 err 自身是 context.DeadlineExceeded / context.Canceled
 //     (fake / 自定义 dapr client 直接返回 ctx.Err()) → UPSTREAM_TIMEOUT
 //  4. 未匹配 → UPSTREAM_ERROR(generic)
-func writeUpstreamError(c *gin.Context, source, model string, err error) {
+func writeUpstreamError(c *gin.Context, source, daprApp, model string, err error) {
 	var invErr *daprclient.InvokeError
 	if errors.As(err, &invErr) {
 		switch invErr.Kind {
 		case daprclient.ErrTimeout:
 			WriteErrorWithSource(c, apierror.UPSTREAM_TIMEOUT,
-				"upstream timeout: "+source, source, nil)
+				"upstream timeout: "+daprApp, source, nil)
 			return
 		case daprclient.ErrConnFailure:
 			WriteErrorWithSource(c, apierror.SOURCE_OFFLINE,
-				"source connection failure: "+source, source, nil)
+				"source connection failure: "+daprApp, source, nil)
 			return
 		case daprclient.ErrHTTPStatus:
-			code := mapHTTPStatusToCode(invErr.StatusCode, invErr.Body, source, model)
+			code := mapHTTPStatusToCode(invErr.StatusCode, invErr.Body, source, daprApp, model)
 			WriteError(c, code)
 			return
 		}
@@ -266,7 +330,7 @@ func writeUpstreamError(c *gin.Context, source, model string, err error) {
 	// 兜底:ctx.Err() 直接漏到调用方(fake / 自定义 client 可能这样)。
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		WriteErrorWithSource(c, apierror.UPSTREAM_TIMEOUT,
-			"upstream timeout: "+source, source, nil)
+			"upstream timeout: "+daprApp, source, nil)
 		return
 	}
 	// 非 InvokeError / 未识别 Kind —— 兜底为 UPSTREAM_ERROR
@@ -275,14 +339,27 @@ func writeUpstreamError(c *gin.Context, source, model string, err error) {
 }
 
 // mapHTTPStatusToCode 把上游 HTTP 状态 + body 翻译成 apierror.Code。
-func mapHTTPStatusToCode(status int, body []byte, source, model string) *apierror.Error {
+func mapHTTPStatusToCode(status int, body []byte, source, daprApp, model string) *apierror.Error {
 	details := map[string]any{
 		"source":          source,
+		"dapr_app_id":     daprApp,
 		"model":           model,
 		"upstream_status": status,
 	}
 	switch {
 	case status == http.StatusNotFound:
+		// 404 双重含义,必须按 body 子码区分:
+		//   1) cube app 返 404 + code=MODEL_NOT_FOUND → MODEL_NOT_FOUND_IN_SOURCE (404)
+		//      cube app 按协议对未知 model 返这个组合(sixun-hbposv7 main.go)
+		//   2) cube app 返 404 但 body 没 code → dapr sidecar 找不到目标 app,
+		//      或是 gin router 没匹配上 → SOURCE_OFFLINE (503)
+		// body 扫描顺序:先业务子码(MODEL_NOT_FOUND),再兜底离线。
+		bodyStr := string(body)
+		if strings.Contains(bodyStr, `"code":"MODEL_NOT_FOUND"`) {
+			details["model"] = model
+			return apierror.New(apierror.MODEL_NOT_FOUND_IN_SOURCE,
+				"model not exposed by source: "+model).WithDetails(details)
+		}
 		// dapr sidecar 找不到目标 app(进程没起 / sidecar 没注册)
 		return apierror.New(apierror.SOURCE_OFFLINE,
 			"source not found by dapr (app may be down)").WithDetails(details)

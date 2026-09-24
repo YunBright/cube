@@ -33,12 +33,17 @@ dapr run --app-id cube-compiler -- \
 
 | 变量 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `CUBE_APP_ID`     | ✓ | —   | 完整 source id(`<family>-<version>-<instance>`);family / version / instance 由其拆分得到 |
+| `CUBE_APP_ID`     | ✓ | —   | **wire source id**(`<family>-<version>-<instance>`);family / version / instance 由其拆分得到 |
+| `DAPR_APP_ID`     |   | (dapr 自动注入) | dapr sidecar app-id。**首选源** — dapr 启动时自动注入。/register body 用此上报给 gateway 当 dapr app-id |
+| `CUBE_DAPR_APP_ID`|   | `"cube-" + CUBE_APP_ID` | 手动覆盖 dapr app-id。空值走推导默认值。**通常不需要设** |
 | `CUBE_PORT`       |   | `:8080` | gin 监听端口 |
 | `CUBE_MAPPING_DIR`|   | `./mapping` | mapping-*.yaml 所在目录 |
 | `CUBE_MODELS_DIR` |   | (自动探测) | sixun-models 路径 |
 | `CUBE_DUCKDB_PATH`|   | `./data/<app_id>.duckdb` | 本地 DuckDB 文件 |
 | `CUBE_GATEWAY_URL`|   | `http://localhost:8080` | cube-gateway HTTP base |
+
+DaprAppID 解析优先级(首个非空胜出):`DAPR_APP_ID` → `CUBE_DAPR_APP_ID` → 推导默认。
+详见 `docs/dapr-app-contract.md` §2.1。
 
 #### 启动一个思迅云商x 实例(`sixun-ysx-00`)
 
@@ -47,7 +52,7 @@ cd semantic-layers/sixun
 
 CUBE_APP_ID=sixun-ysx-00 CUBE_PORT=:8083 \
   CUBE_GATEWAY_URL=http://localhost:8080 \
-  dapr run --app-id sixun-ysx-00 -- \
+  dapr run --app-id cube-sixun-ysx-00 -- \
     go run ./cmd/sixun-ysx
 ```
 
@@ -59,7 +64,7 @@ DSN / 表名 仍然从 `./cmd/sixun-ysx/config.yaml` 的 `source.dsn` / `source.
 ```bash
 CUBE_APP_ID=sixun-ysx-baiyuan1 CUBE_PORT=:8084 \
   CUBE_GATEWAY_URL=http://localhost:8080 \
-  dapr run --app-id sixun-ysx-baiyuan1 -- \
+  dapr run --app-id cube-sixun-ysx-baiyuan1 -- \
     go run ./cmd/sixun-ysx
 ```
 
@@ -71,18 +76,27 @@ CUBE_APP_ID=sixun-ysx-baiyuan1 CUBE_PORT=:8084 \
 ```bash
 CUBE_APP_ID=sixun-hbposv7-jiale CUBE_PORT=:8085 \
   CUBE_GATEWAY_URL=http://localhost:8080 \
-  dapr run --app-id sixun-hbposv7-jiale -- \
+  dapr run --app-id cube-sixun-hbposv7-jiale -- \
     go run ./cmd/sixun-hbposv7
 ```
+
+### 关于 wire id 与 dapr app-id
+
+启动时 `CUBE_APP_ID` 是 **wire source id**(URL 用),`dapr run --app-id` 是
+**dapr 寻址用的 app-id**(默认带 `cube-` 前缀)。两者不必相同 — cube app 启动时
+会读 dapr 注入的 `DAPR_APP_ID` 环境变量,然后在 /register body 里把
+`dapr_app_id` 上报给 gateway。绝大多数场景 cube app **不需要任何额外配置**,
+仅 `CUBE_APP_ID` + `dapr run --app-id cube-...` 两行即可,具体见
+`docs/dapr-app-contract.md` §2.1。
 
 ### 验证注册
 
 ```bash
 curl -s http://localhost:8080/v1/sources | jq
 # → { "sources": [
-#     { "source":"sixun-ysx-00",         "status":"online", ... },
-#     { "source":"sixun-ysx-baiyuan1",   "status":"online", ... },
-#     { "source":"sixun-hbposv7-jiale",  "status":"online", ... }
+#     { "source":"sixun-ysx-00",  "dapr_app_id":"cube-sixun-ysx-00",  "status":"online", ... },
+#     { "source":"sixun-ysx-baiyuan1",  "dapr_app_id":"cube-sixun-ysx-baiyuan1",  "status":"online", ... },
+#     { "source":"sixun-hbposv7-jiale", "dapr_app_id":"cube-sixun-hbposv7-jiale", "status":"online", ... }
 #   ] }
 ```
 
@@ -205,7 +219,7 @@ P2 候选:
 |---|---|
 | cube app 挂 | gateway 收到 /v1/source/{source}/load 时,InvokeMethod 抛 ConnFailure → SOURCE_OFFLINE;BI 工具看到 503 + code=SOURCE_OFFLINE |
 | cube app 网络 OK 但 cpu 卡死 | ctx 10s 超时 → UPSTREAM_TIMEOUT(504) |
-| cube app 重启(进程消失) | gateway registry 90s 内仍 online;LastSeen 超时 → offline;注册再次成功后回到 online |
+| cube app 重启(进程消失) | gateway registry 不删;新 invoke 自动尝试新的 dapr sidecar 实例;注册再次成功后 LastSeen 刷新 |
 | cube-gateway 挂 | BI 工具全失败;启动新实例(注册表由 dapr state store 持久化) |
 | cube-compiler 挂 | cube app 正常运行,只是不能 reload 新代码;重启 compiler 即可 |
 | dapr sidecar 挂 | dapr 自动重启(根据 liveness probe) |

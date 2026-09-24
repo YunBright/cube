@@ -37,6 +37,8 @@ type fakeDapr struct {
 	invokeCount int32 // 原子,统计 invoke 次数
 	state    map[string][]byte
 	saveErr  error
+	deleteErr error
+	deleteCalled atomic.Bool // 记录 DeleteState 是否被调过
 }
 
 func (f *fakeDapr) InvokeMethod(ctx context.Context, target, method string, data []byte, extra map[string]string) ([]byte, error) {
@@ -66,6 +68,17 @@ func (f *fakeDapr) SaveState(ctx context.Context, store, key string, value []byt
 	cp := make([]byte, len(value))
 	copy(cp, value)
 	f.state[key] = cp
+	return nil
+}
+
+func (f *fakeDapr) DeleteState(ctx context.Context, store, key string) error {
+	f.deleteCalled.Store(true)
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	if f.state != nil {
+		delete(f.state, key)
+	}
 	return nil
 }
 
@@ -122,6 +135,7 @@ func newTestServer(t *testing.T, dapr daprclient.Client) (*httptest.Server, *reg
 	engine.Use(middleware.RequestID())
 	engine.Use(middleware.ErrorRecovery(lg))
 	engine.POST("/register", h.Register)
+	engine.POST("/unregister", h.Unregister)
 	engine.POST("/v1/source/:source/load", h.SourceLoad)
 	engine.GET("/v1/sources", h.ListSources)
 	engine.GET("/healthz", func(c *gin.Context) {
@@ -210,8 +224,11 @@ func TestListSources_Empty(t *testing.T) {
 	}
 }
 
-// ---- 4. ListSources online + offline ----
-
+// ---- 4. ListSources —— 被动验证模式下所有已注册 source 都报 online ----
+//
+// 历史原因:旧实现里 LastSeen 5 分钟前 → 视为 offline。
+// 现在 handler 不再前置 IsOnline 检查,/v1/sources 视图统一报 "online";
+// LastSeen 字段保留为运维排查信号,但不再驱动 status。
 func TestListSources_OnlineAndOffline(t *testing.T) {
 	dapr := &fakeDapr{}
 	srv, reg, _ := newTestServer(t, dapr)
@@ -219,7 +236,7 @@ func TestListSources_OnlineAndOffline(t *testing.T) {
 	register(t, srv, "sixun-ysx-00")
 	register(t, srv, "sixun-ysx-99")
 
-	// 手动把 second 的 LastSeen 推到 5 分钟前 → 视为 offline
+	// 把 second 的 LastSeen 推到 5 分钟前 —— 旧实现会判为 offline,新实现不影响。
 	if info, ok := reg.LookupByID("sixun-ysx-99"); ok {
 		info.LastSeen = time.Now().Add(-5 * time.Minute)
 	}
@@ -240,11 +257,12 @@ func TestListSources_OnlineAndOffline(t *testing.T) {
 		e := s.(map[string]any)
 		statusBySrc[e["source"].(string)] = e["status"].(string)
 	}
+	// 被动验证:无论 LastSeen 多旧,已注册 source 都报 online。
 	if statusBySrc["sixun-ysx-00"] != "online" {
 		t.Errorf("sixun-ysx-00 should be online, got %s", statusBySrc["sixun-ysx-00"])
 	}
-	if statusBySrc["sixun-ysx-99"] != "offline" {
-		t.Errorf("sixun-ysx-99 should be offline, got %s", statusBySrc["sixun-ysx-99"])
+	if statusBySrc["sixun-ysx-99"] != "online" {
+		t.Errorf("sixun-ysx-99 should be online (passive mode), got %s", statusBySrc["sixun-ysx-99"])
 	}
 }
 
@@ -319,14 +337,17 @@ func TestSourceLoad_SourceNotRegistered(t *testing.T) {
 	}
 }
 
-// ---- 7. SourceLoad source offline (stale LastSeen) ----
-
+// ---- 7. SourceLoad 被动验证:stale LastSeen 不再前置拦截 ----
+//
+// 历史:旧实现里 LastSeen 10 分钟前 → handler 立刻返 503 SOURCE_OFFLINE。
+// 现在 handler 不前置 IsOnline;已注册 source 总是尝试 dapr 真实 invoke;
+// fake dapr (无 invokeFn) 会返 "no invokeFn set" 错 → 走 UPSTREAM_ERROR(502)。
 func TestSourceLoad_SourceOffline_Stale(t *testing.T) {
 	dapr := &fakeDapr{}
 	srv, reg, _ := newTestServer(t, dapr)
 	register(t, srv, "sixun-ysx-00")
 	if info, ok := reg.LookupByID("sixun-ysx-00"); ok {
-		info.LastSeen = time.Now().Add(-10 * time.Minute) // 远超 stale
+		info.LastSeen = time.Now().Add(-10 * time.Minute) // 远超旧 stale 窗口
 	}
 
 	body := []byte(`{"measures":["supplier.count"]}`)
@@ -336,12 +357,22 @@ func TestSourceLoad_SourceOffline_Stale(t *testing.T) {
 		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("want 503, got %d", resp.StatusCode)
+
+	// 被动验证:不再返 503 SOURCE_OFFLINE。
+	// fakeDapr 默认 invokeFn == nil → InvokeMethod 返 "no invokeFn set" 错
+	// → 走 UPSTREAM_ERROR 路径 → 502。
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		e := decodeError(t, resp.Body)
+		if e.Code == apierror.SOURCE_OFFLINE {
+			t.Fatalf("passive mode: should NOT short-circuit to SOURCE_OFFLINE on stale LastSeen, got 503 %s", e.Code)
+		}
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("want 502 UPSTREAM_ERROR (no invokeFn), got %d", resp.StatusCode)
 	}
 	e := decodeError(t, resp.Body)
-	if e.Code != apierror.SOURCE_OFFLINE {
-		t.Errorf("want SOURCE_OFFLINE, got %s", e.Code)
+	if e.Code != apierror.UPSTREAM_ERROR {
+		t.Errorf("want UPSTREAM_ERROR, got %s", e.Code)
 	}
 }
 
@@ -501,6 +532,76 @@ func TestSourceLoad_ModelNotFound(t *testing.T) {
 	e := decodeError(t, resp.Body)
 	if e.Code != apierror.MODEL_NOT_FOUND_IN_SOURCE {
 		t.Errorf("want MODEL_NOT_FOUND_IN_SOURCE, got %s", e.Code)
+	}
+}
+
+// TestSourceLoad_ModelNotFound_404Status 复现 plan B 暴露的契约 bug:
+//
+// cube app 按协议对未知 model 返 404 + body code=MODEL_NOT_FOUND
+// (sixun-hbposv7 main.go::writeErr(c, http.StatusNotFound, subCodeModelNotFound, ...))。
+// gateway 之前只看 400 status,扫到 404 直接归类为 SOURCE_OFFLINE(dapr 找不到 app),
+// 把业务 404 误判为离线,导致 TestCubeGatewayLoadModelNotFound 503 而非 404。
+//
+// 修复:mapHTTPStatusToCode 收到 404 时先扫 body 子码,
+// 命中 MODEL_NOT_FOUND → 404 MODEL_NOT_FOUND_IN_SOURCE;
+// body 无 code → SOURCE_OFFLINE(dapr 真的找不到 app)。
+func TestSourceLoad_ModelNotFound_404Status(t *testing.T) {
+	dapr := &fakeDapr{
+		invokeFn: func(ctx context.Context, target, method string, data []byte, extra map[string]string) ([]byte, error) {
+			return nil, &daprclient.InvokeError{
+				TargetAppID: target, Method: method,
+				Kind: daprclient.ErrHTTPStatus, StatusCode: 404,
+				Body: []byte(`{"code":"MODEL_NOT_FOUND","message":"model not exposed by source","details":{"supported":["supplier","product"]}}`),
+			}
+		},
+	}
+	srv, _, _ := newTestServer(t, dapr)
+	register(t, srv, "sixun-ysx-00")
+
+	body := []byte(`{"measures":["nonexistent.count"]}`)
+	resp, err := http.Post(srv.URL+"/v1/source/sixun-ysx-00/load",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+	e := decodeError(t, resp.Body)
+	if e.Code != apierror.MODEL_NOT_FOUND_IN_SOURCE {
+		t.Errorf("want MODEL_NOT_FOUND_IN_SOURCE (NOT SOURCE_OFFLINE), got %s", e.Code)
+	}
+}
+
+// TestSourceLoad_Upstream404NoBody 真"dapr 找不到 app"路径 — body 为空 / 无 code 子码,
+// 应归类为 SOURCE_OFFLINE (503)。这是 404 的兜底分支。
+func TestSourceLoad_Upstream404NoBody(t *testing.T) {
+	dapr := &fakeDapr{
+		invokeFn: func(ctx context.Context, target, method string, data []byte, extra map[string]string) ([]byte, error) {
+			return nil, &daprclient.InvokeError{
+				TargetAppID: target, Method: method,
+				Kind: daprclient.ErrHTTPStatus, StatusCode: 404,
+				Body: []byte(`ERR_DIRECT_INVOKE: app cube-sixun-ysx-00 not registered`),
+			}
+		},
+	}
+	srv, _, _ := newTestServer(t, dapr)
+	register(t, srv, "sixun-ysx-00")
+
+	body := []byte(`{"measures":["supplier.count"]}`)
+	resp, err := http.Post(srv.URL+"/v1/source/sixun-ysx-00/load",
+		"application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d", resp.StatusCode)
+	}
+	e := decodeError(t, resp.Body)
+	if e.Code != apierror.SOURCE_OFFLINE {
+		t.Errorf("want SOURCE_OFFLINE, got %s", e.Code)
 	}
 }
 
@@ -767,6 +868,114 @@ func TestRegister_ValidFormats(t *testing.T) {
 				t.Errorf("want 204, got %d", got)
 			}
 		})
+	}
+}
+
+// ---- 22. unregister happy path:已注册 source 被 unregister 后从 registry 消失 ----
+
+func TestUnregister_Happy(t *testing.T) {
+	dapr := &fakeDapr{}
+	srv, reg, _ := newTestServer(t, dapr)
+	register(t, srv, "sixun-ysx-00")
+
+	// 验证已注册
+	if _, ok := reg.LookupByID("sixun-ysx-00"); !ok {
+		t.Fatalf("setup: source should exist in registry")
+	}
+
+	// unregister
+	body := []byte(`{"app_id":"sixun-ysx-00"}`)
+	resp, err := http.Post(srv.URL+"/unregister", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("want 204, got %d", resp.StatusCode)
+	}
+
+	// 验证已删除
+	if _, ok := reg.LookupByID("sixun-ysx-00"); ok {
+		t.Errorf("source should be removed from registry after unregister")
+	}
+}
+
+// ---- 23. unregister 幂等:未注册的 source 也返 204(gateway 重启 / 已被 unregister) ----
+
+func TestUnregister_Idempotent(t *testing.T) {
+	dapr := &fakeDapr{}
+	srv, _, _ := newTestServer(t, dapr)
+	// 不 register 直接 unregister —— 应仍返 204
+
+	body := []byte(`{"app_id":"sixun-ysx-99"}`)
+	resp, err := http.Post(srv.URL+"/unregister", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("want 204 (idempotent), got %d", resp.StatusCode)
+	}
+}
+
+// ---- 24. unregister body 格式校验:1 段 / 2 段 / 空 → 400 ----
+
+func TestUnregister_BadFormat(t *testing.T) {
+	dapr := &fakeDapr{}
+	srv, _, _ := newTestServer(t, dapr)
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty", `{"app_id":""}`},
+		{"one_segment", `{"app_id":"bad"}`},
+		{"two_segment", `{"app_id":"sixun-ysx"}`},
+		{"missing", `{}`},
+		{"malformed_json", `{not-json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(srv.URL+"/unregister", "application/json",
+				bytes.NewReader([]byte(tc.body)))
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("want 400, got %d", resp.StatusCode)
+			}
+			e := decodeError(t, resp.Body)
+			// empty / missing 是 SOURCE_FORMAT_INVALID,malformed_json 是 QUERY_PARSE_ERROR
+			if tc.name == "malformed_json" {
+				if e.Code != apierror.QUERY_PARSE_ERROR {
+					t.Errorf("want QUERY_PARSE_ERROR, got %s", e.Code)
+				}
+			} else {
+				if e.Code != apierror.SOURCE_FORMAT_INVALID {
+					t.Errorf("want SOURCE_FORMAT_INVALID, got %s", e.Code)
+				}
+			}
+		})
+	}
+}
+
+// ---- 25. unregister 后 state store DeleteState 被调用(持久化清理) ----
+
+func TestUnregister_DeleteStateCalled(t *testing.T) {
+	dapr := &fakeDapr{}
+	srv, _, fd := newTestServer(t, dapr)
+	register(t, srv, "sixun-ysx-00")
+
+	resp, err := http.Post(srv.URL+"/unregister", "application/json",
+		bytes.NewReader([]byte(`{"app_id":"sixun-ysx-00"}`)))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp.Body.Close()
+
+	if !fd.deleteCalled.Load() {
+		t.Errorf("DeleteState should be called on unregister (state store key: registry:sixun-ysx-00)")
 	}
 }
 

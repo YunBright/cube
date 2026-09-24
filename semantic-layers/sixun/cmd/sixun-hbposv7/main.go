@@ -26,8 +26,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/YunBright/cube/pkg/cubequery"
@@ -234,6 +236,7 @@ func main() {
 
 	// 8. 注册到 gateway
 	go registerToGateway(cfg, registeredModels, lg)
+	go watchShutdown(cfg, lg)
 
 	// 9. HTTP server
 	engine := gin.New()
@@ -249,8 +252,18 @@ func main() {
 
 // queryHandler MVP 实现:单 measure + 单 dimension。
 //
+// 与 cube/semantic-layers/sixun/cmd/sixun-ysx/main.go::queryHandler 对齐 wire 形状:
+//   - 响应顶层 measures (array of bare ref) + dimensions (array of bare ref),
+//     不再用单数 measure / dim(plan B 阶段家族内所有 cube app 应输出相同结构)
+//   - SQL 列别名用 "<model>.<ref>" 扁平命名(如 "supplier.count"),
+//     DuckDB 原样回传 → wire 端 data[0] 键就是扁平别名
+//   - 不再 emit app_id 字段(plan B 解耦后,wire 端用 source 单字段即可)
+//
 // 4xx 响应带子码 —— gateway 据此映射到 apierror.Code(MODEL_NOT_FOUND_IN_SOURCE /
 // VERSION_UNSUPPORTED / QUERY_PARSE_ERROR / QUERY_INVALID / UPSTREAM_ERROR)。
+//
+// MVP 仍只取 q.Measures[0] / q.Dimensions[0];展开为 for-range 数组的演进见 ysx 的
+// measCols/dimCols 模式 — 留作后续 cube app 端 queryHandler 进一步重构。
 func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := c.GetRawData()
@@ -292,9 +305,12 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 				map[string]any{"source": source, "model": modelName, "measure": measureRef})
 			return
 		}
+
+		// dimRef 提到外层,供 SQL 拼装使用(<model>.<dimRef> 扁平别名)。
+		var dimRef string
 		var dimSQL string
 		if len(q.Dimensions) > 0 {
-			dimRef := strings.TrimPrefix(q.Dimensions[0], modelName+".")
+			dimRef = strings.TrimPrefix(q.Dimensions[0], modelName+".")
 			d, ok := meta.Schema.FindDimension(dimRef)
 			if !ok {
 				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
@@ -305,13 +321,21 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 			dimSQL = d.SQL
 		}
 
+		// SQL 列别名扁平命名,与 ysx 对齐。
+		// DuckDB 原样回传双引号包裹的别名,所以 data[0] 键就是 "<model>.<ref>"。
+		fullMeasure := modelName + "." + measureRef
 		var sql string
+		var dimRefs []string
 		if dimSQL != "" {
+			fullDim := modelName + "." + dimRef
 			sql = fmt.Sprintf(
-				"SELECT %s AS dimension, %s AS measure FROM %s GROUP BY %s LIMIT 1000",
-				dimSQL, ms.SQL, meta.Schema.SQLTable, dimSQL)
+				"SELECT %s AS %q, %s AS %q FROM %s GROUP BY %s LIMIT 1000",
+				dimSQL, fullDim, ms.SQL, fullMeasure, meta.Schema.SQLTable, dimSQL)
+			dimRefs = []string{dimRef}
 		} else {
-			sql = fmt.Sprintf("SELECT %s AS measure FROM %s LIMIT 1000", ms.SQL, meta.Schema.SQLTable)
+			sql = fmt.Sprintf(
+				"SELECT %s AS %q FROM %s LIMIT 1000",
+				ms.SQL, fullMeasure, meta.Schema.SQLTable)
 		}
 
 		rows, err := db.QueryMap(sql)
@@ -324,13 +348,12 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 
 		lg.Info("query ok", "model", modelName, "sql", sql, "rows", len(rows))
 		c.JSON(http.StatusOK, gin.H{
-			"source":  source,
-			"app_id":  source,
-			"model":   modelName,
-			"sql":     sql,
-			"data":    rows,
-			"measure": measureRef,
-			"dim":     dimSQL,
+			"source":     source,
+			"model":      modelName,
+			"sql":        sql,
+			"data":       rows,
+			"measures":   []string{measureRef}, // bare ref 数组,与 ysx 对齐
+			"dimensions": dimRefs,               // 空数组 或 [bare dim ref]
 		})
 	}
 }
@@ -378,6 +401,43 @@ func registerToGateway(cfg *boot.Config, models []string, lg *log.Logger) {
 		lg.Info("register attempt failed, retrying", "err", err.Error(), "url", cfg.GatewayURL)
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// watchShutdown 监听 SIGTERM / SIGINT,触发时调用 unregisterFromGateway 后退出。
+//
+// 设计:见 cmd/sixun-ysx/main.go 的同函数注释(共用同一份语义)。
+func watchShutdown(cfg *boot.Config, lg *log.Logger) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	lg.Info("shutdown signal received", "sig", sig.String())
+	unregisterFromGateway(cfg, lg)
+	os.Exit(0)
+}
+
+// unregisterFromGateway 调 cube-gateway /unregister,2s deadline,失败仅记日志。
+func unregisterFromGateway(cfg *boot.Config, lg *log.Logger) {
+	body := cfg.UnregisterBody()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cfg.GatewayURL+"/unregister", bytes.NewReader(body))
+	if err != nil {
+		lg.Info("unregister: build request failed", "err", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		lg.Info("unregister failed (best-effort)", "err", err.Error(), "url", cfg.GatewayURL)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		lg.Info("unregistered from cube-gateway", "url", cfg.GatewayURL)
+		return
+	}
+	lg.Info("unregister returned non-204", "status", resp.Status, "url", cfg.GatewayURL)
 }
 
 func hostOfDSN(dsn string) string {

@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/YunBright/cube/pkg/cubequery"
@@ -212,6 +214,7 @@ func main() {
 	}
 
 	go registerToGateway(cfg, registeredModels, lg)
+	go watchShutdown(cfg, lg)
 
 	engine := gin.New()
 	engine.Use(gin.Logger(), gin.Recovery())
@@ -492,6 +495,50 @@ func registerToGateway(cfg *boot.Config, models []string, lg *log.Logger) {
 		lg.Info("register attempt failed, retrying", "err", err.Error(), "url", cfg.GatewayURL)
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// watchShutdown 监听 SIGTERM / SIGINT,触发时调用 unregisterFromGateway 后退出。
+//
+// 设计:
+//   - 与 engine.Run 各自的 signal handler 共存 —— Go 的 net/http 也接 SIGINT/SIGTERM
+//     做 graceful shutdown,这里并行触发 unregister,互不阻塞。
+//   - unregisterFromGateway 内置 2s deadline,失败仅记日志 —— 不可阻塞进程退出,
+//     否则 kubelet 30s 后给 SIGKILL 就麻烦了。
+//   - 调 os.Exit(0) 是有意的:engine.Run 在 signal 后会自然返回,但要在它返回前
+//     先发完 unregister —— os.Exit 直接走避免 main 自然退出还要等 deferred close
+//     (duckdb / SQL Server) 跑完,把 unregister 卡在 deadline 外。
+func watchShutdown(cfg *boot.Config, lg *log.Logger) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	sig := <-sigCh
+	lg.Info("shutdown signal received", "sig", sig.String())
+	unregisterFromGateway(cfg, lg)
+	os.Exit(0)
+}
+
+// unregisterFromGateway 调 cube-gateway /unregister,2s deadline,失败仅记日志。
+func unregisterFromGateway(cfg *boot.Config, lg *log.Logger) {
+	body := cfg.UnregisterBody()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cfg.GatewayURL+"/unregister", bytes.NewReader(body))
+	if err != nil {
+		lg.Info("unregister: build request failed", "err", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		lg.Info("unregister failed (best-effort)", "err", err.Error(), "url", cfg.GatewayURL)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		lg.Info("unregistered from cube-gateway", "url", cfg.GatewayURL)
+		return
+	}
+	lg.Info("unregister returned non-204", "status", resp.Status, "url", cfg.GatewayURL)
 }
 
 func hostOfDSN(dsn string) string {

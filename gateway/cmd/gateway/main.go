@@ -71,12 +71,17 @@ func main() {
 		Auth:     nil,
 	})
 
+	// 主动探活已移除(plan B 修订):改为被动验证 —— handler 直接调 dapr,
+	// 真实 SOURCE_OFFLINE 由 dapr 真实调用失败(ErrConnFailure)触发。
+	// 详见 docs/dapr-app-contract.md §7 与 AGENTS.md "Source 在线判定"决策。
+
 	// gin engine:显式加 request_id + error_recovery(不用 gin.Logger() / gin.Recovery())
 	engine := gin.New()
 	engine.Use(middleware.RequestID())
 	engine.Use(middleware.ErrorRecovery(lg))
 
 	engine.POST("/register", h.Register)
+	engine.POST("/unregister", h.Unregister)
 	engine.POST("/v1/source/:source/load", h.SourceLoad)
 	engine.GET("/v1/sources", h.ListSources)
 	engine.GET("/healthz", func(c *gin.Context) {

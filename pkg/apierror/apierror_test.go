@@ -29,6 +29,7 @@ func TestHTTPStatus_Mapping(t *testing.T) {
 		{apierror.RATE_LIMITED, http.StatusTooManyRequests},
 		{apierror.INTERNAL_ERROR, http.StatusInternalServerError},
 		{apierror.UPSTREAM_ERROR, http.StatusBadGateway},
+		{apierror.DAPR_APP_ID_INVALID, http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		if got := apierror.HTTPStatus(c.code); got != c.want {
@@ -44,11 +45,13 @@ func TestHTTPStatus_UnknownCode(t *testing.T) {
 	}
 }
 
-// TestAllCodes_CoversTable AllCodes 返回值应能反查回 codeHTTPStatus(13 个)。
+// TestAllCodes_CoversTable AllCodes 返回值应能反查回 codeHTTPStatus(14 个)。
+//
+// v2 末 plan B 增 DAPR_APP_ID_INVALID,所以是 14 个。
 func TestAllCodes_CoversTable(t *testing.T) {
 	codes := apierror.AllCodes()
-	if len(codes) != 13 {
-		t.Errorf("AllCodes returned %d codes, want 13", len(codes))
+	if len(codes) != 14 {
+		t.Errorf("AllCodes returned %d codes, want 14", len(codes))
 	}
 }
 

@@ -33,14 +33,18 @@ family (思迅 / 粮油 / 生鲜)
 
 每个 dapr cube app 进程由 `CUBE_APP_ID` 区分,例:
 
-| 二进制 | CUBE_APP_ID | family | version | instance |
-|---|---|---|---|---|
-| `sixun-ysx`     | `sixun-ysx-00`        | sixun | ysx     | 00 |
-| `sixun-ysx`     | `sixun-ysx-baiyuan1`  | sixun | ysx     | baiyuan1 |
-| `sixun-hbposv7` | `sixun-hbposv7-jiale` | sixun | hbposv7 | jiale |
+| 二进制 | CUBE_APP_ID (wire) | dapr `--app-id` | family | version | instance |
+|---|---|---|---|---|---|
+| `sixun-ysx`     | `sixun-ysx-00`        | `cube-sixun-ysx-00`        | sixun | ysx     | 00 |
+| `sixun-ysx`     | `sixun-ysx-baiyuan1`  | `cube-sixun-ysx-baiyuan1`  | sixun | ysx     | baiyuan1 |
+| `sixun-hbposv7` | `sixun-hbposv7-jiale` | `cube-sixun-hbposv7-jiale` | sixun | hbposv7 | jiale |
 
 family / version / instance 由 `CUBE_APP_ID` 拆分得到,**不设独立 env**。
 DSN 与表名仍走 `./config.yaml`(每店可能不同)。
+
+`dapr --app-id` 与 `CUBE_APP_ID` 唯一不同点:多 `cube-` 前缀(plan B 解耦)。
+cube app 启动时 dapr 自动注入 `DAPR_APP_ID` 环境变量,cube app 读后上报给 gateway
+(详见 `docs/dapr-app-contract.md` §2.1)。
 
 ## mapping.yaml 语义(P1-5 选 A)
 

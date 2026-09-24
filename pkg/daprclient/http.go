@@ -210,3 +210,34 @@ func (c *HTTPClient) Close() error {
 	}
 	return nil
 }
+
+// DeleteState HTTP 实现:DELETE <sidecar>/v1.0/state/<store>/<key>。
+//
+// 用于 cube app 优雅关闭时 unregister —— 不强制要求 key 存在
+// (dapr DELETE 对不存在的 key 返 204,行为幂等)。
+func (c *HTTPClient) DeleteState(ctx context.Context, store, key string) error {
+	if c.SidecarAddr == "" {
+		return errors.New("daprclient http: SidecarAddr 未配置")
+	}
+	url := fmt.Sprintf("%s/v1.0/state/%s/%s", c.SidecarAddr, store, key)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("daprclient http: new delete-state request: %w", err)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return classifyTransportErr("state:"+store, key, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		rb, _ := io.ReadAll(resp.Body)
+		return &InvokeError{
+			TargetAppID: store,
+			Method:      key,
+			Kind:        ErrHTTPStatus,
+			StatusCode:  resp.StatusCode,
+			Body:        rb,
+		}
+	}
+	return nil
+}
