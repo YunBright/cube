@@ -28,6 +28,7 @@ import (
 	"github.com/YunBright/cube/pkg/log"
 
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/boot"
+	"github.com/YunBright/cube/semantic-layers/sixun/internal/source"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/source/ysx"
 
 	categorymodel "github.com/YunBright/cube/sixun-models/category"
@@ -50,6 +51,13 @@ type appConfig struct {
 		TableCategory string `yaml:"table_category"`
 		TableSale     string `yaml:"table_sale"`
 		TableStock    string `yaml:"table_stock"`
+		// RowLimit 是所有角色共用的拉取行数上限;<=0 时回落到 source.DefaultRowLimit。
+		RowLimit int `yaml:"row_limit"`
+		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
+		//
+		// 商品表必须给足:hbposv10 的 t_bd_item_info 实测 27299 行,
+		// 上限过小会静默丢商品,表现为"部分条码扫不出来"且无任何报错。
+		RowLimits map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
 }
 
@@ -147,6 +155,7 @@ func main() {
 		TableCategory: appCfg.Source.TableCategory,
 		TableSale:     appCfg.Source.TableSale,
 		TableStock:    appCfg.Source.TableStock,
+		RowLimits:     source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)

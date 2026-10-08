@@ -33,3 +33,47 @@ type Config struct {
 	// Version 用于日志
 	Version string `yaml:"version"`
 }
+
+// Fetch 角色名。与 Connector 各 Fetch* 方法一一对应,用于按角色配行数上限。
+const (
+	RoleSupplier = "supplier"
+	RoleProduct  = "product"
+	RoleCategory = "category"
+	RoleSale     = "sale"
+	RoleStock    = "stock"
+)
+
+// DefaultRowLimit 是未显式配置时的行数上限兜底值。
+//
+// 历史包袱:两个 connector 曾把 "SELECT TOP 10000 *" 硬编码在 fetchTable 里,
+// 意图是"别一次性拉太多"。实测思迅 hbposv10 的 t_bd_item_info 有 27299 行,
+// 硬截断会静默丢掉 63% 的商品 —— 表现是"某些商品扫码查不到",
+// 而服务、sidecar、健康检查全绿,没有任何报错。
+//
+// 因此行数上限必须外置到配置,且各角色可以单独调。
+const DefaultRowLimit = 10000
+
+// RowLimits 按角色解析行数上限。零值 / 未覆盖的角色回落到 DefaultRowLimit。
+type RowLimits struct {
+	defaultLimit int
+	byRole       map[string]int
+}
+
+// NewRowLimits 构造 RowLimits。defaultLimit <= 0 时用 DefaultRowLimit。
+func NewRowLimits(defaultLimit int, byRole map[string]int) *RowLimits {
+	if defaultLimit <= 0 {
+		defaultLimit = DefaultRowLimit
+	}
+	return &RowLimits{defaultLimit: defaultLimit, byRole: byRole}
+}
+
+// For 返回该角色的行数上限。always > 0。
+func (r *RowLimits) For(role string) int {
+	if r != nil {
+		if v, ok := r.byRole[role]; ok && v > 0 {
+			return v
+		}
+		return r.defaultLimit
+	}
+	return DefaultRowLimit
+}
