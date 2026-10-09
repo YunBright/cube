@@ -46,12 +46,22 @@ const (
 // DefaultRowLimit 是未显式配置时的行数上限兜底值。
 //
 // 历史包袱:两个 connector 曾把 "SELECT TOP 10000 *" 硬编码在 fetchTable 里,
-// 意图是"别一次性拉太多"。实测思迅 hbposv10 的 t_bd_item_info 有 27299 行,
-// 硬截断会静默丢掉 63% 的商品 —— 表现是"某些商品扫码查不到",
-// 而服务、sidecar、健康检查全绿,没有任何报错。
+// 意图是"别一次性拉太多"。实测行数(2026-10-09):
 //
-// 因此行数上限必须外置到配置,且各角色可以单独调。
-const DefaultRowLimit = 10000
+//	t_bd_item_info    (商品) ysx/hbposv10 = 27299,hbposv7/hbposepro = 44313
+//	t_im_branch_stock (库存) ysx/hbposv10 = 23576,hbposv7/hbposepro = 10607
+//	t_bd_supcust_info (供应商) 218 / 300
+//	t_bd_item_cls     (分类)   186 / 596
+//
+// 10000 的上限让 ysx 丢 63% 商品、hbposv7 丢 77%,**库存表还丢 57%**
+// —— 后者会让盘点单的账面数量直接是错的。表现统一是"某些条码扫不到",
+// 服务 / sidecar / 健康检查全绿,没有任何报错。
+//
+// 因此默认值必须**高于所有维表的真实行数**:漏配配置时多拉一点数据
+// (实测 27299 行 × 65 列全量 = 3.6MB / 1.4s)远比静默丢数据安全。
+// **截断必须是显式决定,不是默认行为。** 真要限流时按角色单独配
+// source.row_limits(sale 流水表才是该限的那个)。
+const DefaultRowLimit = 50000
 
 // RowLimits 按角色解析行数上限。零值 / 未覆盖的角色回落到 DefaultRowLimit。
 type RowLimits struct {

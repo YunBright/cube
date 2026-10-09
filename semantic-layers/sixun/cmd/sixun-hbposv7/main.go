@@ -23,12 +23,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -83,11 +83,11 @@ type modelFetcher struct {
 
 // 子码常量(emit 到 4xx JSON 的 "code" 字段,供 gateway 映射到 apierror.Code)。
 const (
-	subCodeModelNotFound     = "MODEL_NOT_FOUND"
+	subCodeModelNotFound      = "MODEL_NOT_FOUND"
 	subCodeVersionUnsupported = "VERSION_UNSUPPORTED"
-	subCodeQueryParseError   = "QUERY_PARSE_ERROR"
-	subCodeQueryInvalid      = "QUERY_INVALID"
-	subCodeInternalError     = "INTERNAL_ERROR"
+	subCodeQueryParseError    = "QUERY_PARSE_ERROR"
+	subCodeQueryInvalid       = "QUERY_INVALID"
+	subCodeInternalError      = "INTERNAL_ERROR"
 )
 
 // errBody 是 /query 4xx 响应的统一形状。
@@ -256,20 +256,22 @@ func main() {
 	}
 }
 
-// queryHandler MVP 实现:单 measure + 单 dimension。
+// queryHandler 与 sixun-ysx 共用 cubequery.Build(见 pkg/cubequery/build.go)。
 //
-// 与 cube/semantic-layers/sixun/cmd/sixun-ysx/main.go::queryHandler 对齐 wire 形状:
-//   - 响应顶层 measures (array of bare ref) + dimensions (array of bare ref),
-//     不再用单数 measure / dim(plan B 阶段家族内所有 cube app 应输出相同结构)
-//   - SQL 列别名用 "<model>.<ref>" 扁平命名(如 "supplier.count"),
-//     DuckDB 原样回传 → wire 端 data[0] 键就是扁平别名
-//   - 不再 emit app_id 字段(plan B 解耦后,wire 端用 source 单字段即可)
+// ⚠️ 2026-10-09 修复:此前这里是**另一套残缺实现** —— 只取 Measures[0] /
+// Dimensions[0]、**完全忽略 Filters**、LIMIT 硬编码 1000、没有 RTRIM。
+//
+// 后果不是"功能少"而是**返回错误的数据**:带 filter 的查询被静默丢弃后,
+// SQL 退化成"取前 1000 行",而 supertrade 的 GetProduct 直接取 data[0]
+// → 扫一个条码可能拿到**另一个商品**的库存,200 OK、零报错。
+// 另外本 family 的 t_bd_item_info.id 是 char 定长补空格("6922303199721       "),
+// 缺 RTRIM 让该门店的条码搜索永远匹配不上。
+//
+// 两个 family 共用 sixun-models 下的同一份 schema,查询语义必须一致,
+// 所以这段逻辑现在只在共用包里存在一份。
 //
 // 4xx 响应带子码 —— gateway 据此映射到 apierror.Code(MODEL_NOT_FOUND_IN_SOURCE /
 // VERSION_UNSUPPORTED / QUERY_PARSE_ERROR / QUERY_INVALID / UPSTREAM_ERROR)。
-//
-// MVP 仍只取 q.Measures[0] / q.Dimensions[0];展开为 for-range 数组的演进见 ysx 的
-// measCols/dimCols 模式 — 留作后续 cube app 端 queryHandler 进一步重构。
 func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := c.GetRawData()
@@ -298,70 +300,47 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 				map[string]any{"source": source, "model": modelName, "supported": supportedModels})
 			return
 		}
-		if len(q.Measures) == 0 {
-			writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
-				"at least one measure required", nil)
-			return
-		}
-		measureRef := strings.TrimPrefix(q.Measures[0], modelName+".")
-		ms, ok := meta.Schema.FindMeasure(measureRef)
-		if !ok {
-			writeErr(c, http.StatusNotFound, subCodeModelNotFound,
-				"measure not found: "+measureRef,
-				map[string]any{"source": source, "model": modelName, "measure": measureRef})
-			return
-		}
 
-		// dimRef 提到外层,供 SQL 拼装使用(<model>.<dimRef> 扁平别名)。
-		var dimRef string
-		var dimSQL string
-		if len(q.Dimensions) > 0 {
-			dimRef = strings.TrimPrefix(q.Dimensions[0], modelName+".")
-			d, ok := meta.Schema.FindDimension(dimRef)
-			if !ok {
-				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
-					"dimension not found: "+dimRef,
-					map[string]any{"source": source, "model": modelName, "dimension": dimRef})
+		built, err := cubequery.Build(q, meta.Schema)
+		if err != nil {
+			var be *cubequery.BuildError
+			if errors.As(err, &be) && be.Kind == "filter" {
+				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid, be.Msg,
+					map[string]any{"source": source, "filter_member": be.Ref})
 				return
 			}
-			dimSQL = d.SQL
-		}
-
-		// SQL 列别名扁平命名,与 ysx 对齐。
-		// DuckDB 原样回传双引号包裹的别名,所以 data[0] 键就是 "<model>.<ref>"。
-		fullMeasure := modelName + "." + measureRef
-		var sql string
-		var dimRefs []string
-		if dimSQL != "" {
-			fullDim := modelName + "." + dimRef
-			sql = fmt.Sprintf(
-				"SELECT %s AS %q, %s AS %q FROM %s GROUP BY %s LIMIT 1000",
-				dimSQL, fullDim, ms.SQL, fullMeasure, meta.Schema.SQLTable, dimSQL)
-			dimRefs = []string{dimRef}
-		} else {
-			sql = fmt.Sprintf(
-				"SELECT %s AS %q FROM %s LIMIT 1000",
-				ms.SQL, fullMeasure, meta.Schema.SQLTable)
-		}
-
-		rows, err := db.QueryMap(sql)
-		if err != nil {
-			lg.Info("duckdb query failed", "sql", sql, "err", err.Error())
-			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
-				"duckdb: "+err.Error(), map[string]any{"sql": sql})
+			writeErr(c, http.StatusNotFound, subCodeModelNotFound, err.Error(),
+				map[string]any{"source": source, "model": modelName, "ref": beRef(err)})
 			return
 		}
 
-		lg.Info("query ok", "model", modelName, "sql", sql, "rows", len(rows))
+		rows, err := db.QueryMap(built.SQL, built.Args...)
+		if err != nil {
+			lg.Info("duckdb query failed", "sql", built.SQL, "err", err.Error())
+			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
+				"duckdb: "+err.Error(), map[string]any{"sql": built.SQL})
+			return
+		}
+
+		lg.Info("query ok", "model", modelName, "sql", built.SQL, "rows", len(rows))
 		c.JSON(http.StatusOK, gin.H{
 			"source":     source,
 			"model":      modelName,
-			"sql":        sql,
+			"sql":        built.SQL,
 			"data":       rows,
-			"measures":   []string{measureRef}, // bare ref 数组,与 ysx 对齐
-			"dimensions": dimRefs,               // 空数组 或 [bare dim ref]
+			"measures":   built.MeasureRefs,
+			"dimensions": built.DimRefs,
 		})
 	}
+}
+
+// beRef 从 BuildError 里取出错 member(没有就返回空串)。
+func beRef(err error) string {
+	var be *cubequery.BuildError
+	if errors.As(err, &be) {
+		return be.Ref
+	}
+	return ""
 }
 
 func toRows(mapped []map[string]any, cols []fieldmapping.FieldDef) [][]any {

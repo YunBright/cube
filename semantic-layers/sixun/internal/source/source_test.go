@@ -49,13 +49,54 @@ func TestRowLimitsRejectsNonPositiveOverride(t *testing.T) {
 	}
 }
 
-// 回归锁:连接器曾经把 "SELECT TOP 10000 *" 硬编码,导致 hbposv10 的 t_bd_item_info
-// (实测 27299 行)被静默截断 63%,商品扫码查不到且无任何报错。
-// 这里锁住"默认上限远小于真实商品表行数"这一事实,提醒默认值不是安全网。
-func TestDefaultRowLimitIsBelowRealProductTableSize(t *testing.T) {
-	const measuredItemRows = 27299 // hbposv10 t_bd_item_info 实测 COUNT(*)
-	if DefaultRowLimit >= measuredItemRows {
-		t.Fatalf("DefaultRowLimit %d >= measured product rows %d:硬截断会再次丢商品",
-			DefaultRowLimit, measuredItemRows)
+// 回归锁:连接器曾把 "SELECT TOP 10000 *" 硬编码,导致商品表被静默截断
+// (ysx 丢 63% / hbposv7 丢 77%),**库存表也丢 57%** —— 盘点账面数量直接是错的,
+// 而服务 / sidecar / 健康检查全绿,没有任何报错。
+//
+// 这条锁的方向:**默认值必须高于所有维表的真实行数**。
+// 早先它断言的是反方向(默认 < 真实行数,用来"提醒默认值不安全"),
+// 那是把已知缺陷钉死成了规格;真正的修法是把默认值抬上去,
+// 于是 2026-10-09 把它翻了过来 —— 数据被截断时必须有人能看见,
+// 而静默截断比不过载危险得多:过载会报错,截断只会让大半商品凭空消失。
+//
+// 实测值来自 2026-10-09 对两个源库 COUNT(*) 的直接查询。
+func TestDefaultRowLimitCoversRealTableSizes(t *testing.T) {
+	cases := []struct {
+		table string
+		rows  int
+	}{
+		{"ysx  t_bd_item_info    (商品)", 27299},
+		{"ysx  t_im_branch_stock (库存)", 23576},
+		{"ysx  t_bd_supcust_info (供应商)", 218},
+		{"ysx  t_bd_item_cls     (分类)", 186},
+		{"hbposv7 t_bd_item_info    (商品)", 44313},
+		{"hbposv7 t_im_branch_stock (库存)", 10607},
+		{"hbposv7 t_bd_supcust_info (供应商)", 300},
+		{"hbposv7 t_bd_item_cls     (分类)", 596},
+	}
+	for _, c := range cases {
+		if DefaultRowLimit < c.rows {
+			t.Fatalf("DefaultRowLimit %d < 实测行数 %d (%s):会静默截断维表,"+
+				"表现为条码扫不出来且零报错", DefaultRowLimit, c.rows, c.table)
+		}
+	}
+}
+
+// RowLimits 必须让每个角色都能单独放宽 —— 这是"截断只能是显式决定"的落地方式:
+// 想限流某个表就单独配,而不是让所有表共用一个可能不够用的数。
+func TestRowLimitsCanRelaxEachRoleIndependently(t *testing.T) {
+	const bigTable = 44313
+	rl := NewRowLimits(DefaultRowLimit, map[string]int{
+		RoleProduct: bigTable * 4,
+		RoleStock:   bigTable * 4,
+		RoleSale:    100000, // 流水表才是该单独限流的那个
+	})
+	for _, role := range []string{RoleProduct, RoleStock} {
+		if got := rl.For(role); got < bigTable {
+			t.Fatalf("%s 上限 %d < 维表实测 %d,仍会截断", role, got, bigTable)
+		}
+	}
+	if got := rl.For(RoleSale); got != 100000 {
+		t.Fatalf("sale 应能单独限流, got %d", got)
 	}
 }

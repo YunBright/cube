@@ -19,6 +19,16 @@ mappings:
     target: supplier_id
     type: string
 
+  # 2026-10-09 新增:商品基本单位。
+  # hbposepro 侧同样是 t_bd_item_info.unit_no (char),值直接就是单位名本身
+  # (实测 6922303199721 = '提'),不需要 join 单位表。
+  # ⚠️ sixun-models/product/schema.yaml 是 ysx + hbposv7 **共享**的,
+  # 所以两个 family 的 mapping 必须同时映射 unit_no;
+  # 漏掉一边会导致查 product.unit 时该 family 的 DuckDB 表无此列而 SQL 报错。
+  - source: unit_no
+    target: unit
+    type: string
+
   - source: sale_price          # 售价 numeric(优先用 sale_price,而非 price)
     target: price_yuan
     type: decimal

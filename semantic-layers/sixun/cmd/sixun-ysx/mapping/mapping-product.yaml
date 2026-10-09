@@ -19,6 +19,13 @@ mappings:
     target: supplier_id
     type: string
 
+  # 2026-10-09 新增:商品基本单位。
+  # t_bd_item_info.unit_no 是 char(4),**值直接就是单位名本身**(实测 '提'),
+  # 不是单位编号,所以不需要 join 单位表、不需要 enum_map/transform。
+  - source: unit_no
+    target: unit
+    type: string
+
   - source: sale_price
     target: price_yuan
     type: decimal

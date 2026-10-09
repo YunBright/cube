@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -74,11 +75,11 @@ type modelFetcher struct {
 
 // /query 4xx 子码常量 —— gateway 据此映射到 apierror.Code。
 const (
-	subCodeModelNotFound     = "MODEL_NOT_FOUND"
+	subCodeModelNotFound      = "MODEL_NOT_FOUND"
 	subCodeVersionUnsupported = "VERSION_UNSUPPORTED"
-	subCodeQueryParseError   = "QUERY_PARSE_ERROR"
-	subCodeQueryInvalid      = "QUERY_INVALID"
-	subCodeInternalError     = "INTERNAL_ERROR"
+	subCodeQueryParseError    = "QUERY_PARSE_ERROR"
+	subCodeQueryInvalid       = "QUERY_INVALID"
+	subCodeInternalError      = "INTERNAL_ERROR"
 )
 
 type errBody struct {
@@ -273,104 +274,49 @@ func queryHandler(db *duckdb.Engine, schemas map[string]*schemaMeta, supportedMo
 			return
 		}
 
-		// dimensions
-		var dimCols []string
-		var dimGroup []string
-		var dimRefs []string
-		for _, rawDim := range q.Dimensions {
-			dimRef := strings.TrimPrefix(rawDim, modelName+".")
-			d, ok := meta.Schema.FindDimension(dimRef)
-			if !ok {
-				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
-					"dimension not found: "+dimRef,
-					map[string]any{"source": source, "model": modelName, "dimension": dimRef})
-				return
-			}
-			alias := modelName + "." + dimRef
-			expr := d.SQL
-			if isSimpleColumn(expr) {
-				expr = "RTRIM(" + expr + ")"
-			}
-			dimCols = append(dimCols, fmt.Sprintf("%s AS %q", expr, alias))
-			dimGroup = append(dimGroup, d.SQL)
-			dimRefs = append(dimRefs, dimRef)
-		}
-
-		// measures
-		var measCols []string
-		var measRefs []string
-		for _, rawMs := range q.Measures {
-			measRef := strings.TrimPrefix(rawMs, modelName+".")
-			ms, ok := meta.Schema.FindMeasure(measRef)
-			if !ok {
-				writeErr(c, http.StatusNotFound, subCodeModelNotFound,
-					"measure not found: "+measRef,
-					map[string]any{"source": source, "model": modelName, "measure": measRef})
-				return
-			}
-			alias := modelName + "." + measRef
-			measCols = append(measCols, fmt.Sprintf("%s AS %q", ms.SQL, alias))
-			measRefs = append(measRefs, measRef)
-		}
-
-		// filters
-		var whereParts []string
-		var whereArgs []any
-		for _, f := range q.Filters {
-			memberRef := strings.TrimPrefix(f.Member, modelName+".")
-			dim, ok := meta.Schema.FindDimension(memberRef)
-			if !ok {
-				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
-					"filter dimension not found: "+memberRef,
-					map[string]any{"source": source, "model": modelName, "filter_member": memberRef})
-				return
-			}
-			expr, args, err := buildFilterExpr(dim.SQL, f.Operator, f.Values)
-			if err != nil {
-				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid,
-					"filter: "+err.Error(),
-					map[string]any{"source": source, "filter_member": memberRef, "operator": f.Operator})
-				return
-			}
-			whereParts = append(whereParts, expr)
-			whereArgs = append(whereArgs, args...)
-		}
-
-		// SQL 拼装
-		var selectList []string
-		selectList = append(selectList, dimCols...)
-		selectList = append(selectList, measCols...)
-		sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectList, ", "), meta.Schema.SQLTable)
-		if len(whereParts) > 0 {
-			sql += " WHERE " + strings.Join(whereParts, " AND ")
-		}
-		if len(dimGroup) > 0 {
-			sql += " GROUP BY " + strings.Join(dimGroup, ", ")
-		}
-		limit := 1000
-		if q.Limit != nil && *q.Limit > 0 {
-			limit = *q.Limit
-		}
-		sql += fmt.Sprintf(" LIMIT %d", limit)
-
-		rows, err := db.QueryMap(sql, whereArgs...)
+		// SQL 拼装走共用包 cubequery.Build —— sixun-hbposv7 用的是同一份实现。
+		// 见 pkg/cubequery/build.go 顶部说明:这段逻辑曾各写一份,
+		// hbposv7 那份残缺实现会**静默丢弃 filters**,导致查询返回错误商品。
+		built, err := cubequery.Build(q, meta.Schema)
 		if err != nil {
-			lg.Info("duckdb query failed", "sql", sql, "err", err.Error())
-			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
-				"duckdb: "+err.Error(), map[string]any{"sql": sql})
+			var be *cubequery.BuildError
+			if errors.As(err, &be) && be.Kind == "filter" {
+				writeErr(c, http.StatusBadRequest, subCodeQueryInvalid, be.Msg,
+					map[string]any{"source": source, "filter_member": be.Ref})
+				return
+			}
+			writeErr(c, http.StatusNotFound, subCodeModelNotFound, err.Error(),
+				map[string]any{"source": source, "model": modelName, "ref": beRef(err)})
 			return
 		}
 
-		lg.Info("query ok", "model", modelName, "sql", sql, "rows", len(rows))
+		rows, err := db.QueryMap(built.SQL, built.Args...)
+		if err != nil {
+			lg.Info("duckdb query failed", "sql", built.SQL, "err", err.Error())
+			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
+				"duckdb: "+err.Error(), map[string]any{"sql": built.SQL})
+			return
+		}
+
+		lg.Info("query ok", "model", modelName, "sql", built.SQL, "rows", len(rows))
 		c.JSON(http.StatusOK, gin.H{
 			"source":     source,
 			"model":      modelName,
-			"sql":        sql,
+			"sql":        built.SQL,
 			"data":       rows,
-			"measures":   measRefs,
-			"dimensions": dimRefs,
+			"measures":   built.MeasureRefs,
+			"dimensions": built.DimRefs,
 		})
 	}
+}
+
+// beRef 从 BuildError 里取出错 member(没有就返回空串)。
+func beRef(err error) string {
+	var be *cubequery.BuildError
+	if errors.As(err, &be) {
+		return be.Ref
+	}
+	return ""
 }
 
 // buildFilterExpr 把 cube.js filter operator 翻译成 SQL WHERE 片段。
