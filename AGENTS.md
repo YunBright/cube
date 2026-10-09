@@ -2,6 +2,7 @@
 
 > 本文件给所有 AI 助手(viber coding / Cursor / Aider / MiniMax Code 等)阅读,约束生成代码的风格与边界。
 > 任何 AI 在动手前必须读完本文件 + `docs/architecture.md`。
+> **要改 schema / mapping / 拉数,再加读 `docs/data-source-mapping-playbook.md`。**
 
 ## 1. 项目本质
 
@@ -61,6 +62,9 @@ cube/
 | HTTP 框架 | **`gin-gonic/gin v1.10.x`**(所有 dapr app 入口端点统一用) | ❌ 直接 `net/http`、`❌ chi/echo/fiber` 等其它 web 框架 |
 | Source 在线判定 | **被动验证**:handler 不前置 IsOnline 检查,任何已注册 source 都直接 `dapr.InvokeMethod`,真实 `SOURCE_OFFLINE` 由 dapr 真实调用失败(`ErrConnFailure`)触发;`/v1/sources` 视图 status 字段恒为 "online"(信息性,不代表实际可达),LastSeen 仅作运维排查信号 | ❌ 时间窗口式离线判定(冷启动源 90s 后假 offline),❌ 主动探活(复杂、对 middleware.http.bearer 链路脆弱),❌ 直连 app / kube 健康度(直连 `DAPR_APP_CHANNEL_ADDRESS`,k8s pod IP 飘移即失效) |
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
+| 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.Build`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
+| 拉取行数上限 | **`DefaultRowLimit = 50000`,必须高于所有维表实测行数**;按角色在 `config.yaml` 的 `source.row_limits` 覆盖 | ❌ 设成小于实测行数的值(曾硬编码 `TOP 10000` → ysx 丢 63% 商品、hbposv7 丢 77%、**库存表丢 57%**,零报错) |
+| char 补空格 | 在**查询层**统一 `RTRIM`(SELECT 与 filter 两侧都包,GROUP BY 用裸列),已固化在 `pkg/cubequery` | ❌ 加载层 trim、❌ 调用方 LIKE/trim 兜底 |
 
 ## 5. 编码约束
 
@@ -77,22 +81,33 @@ cube/
 
 ## 6. AI Skills
 
-`skills/<skill-name>/SKILL.md` 是项目级 AI 教学材料,任何 AI 在做对应任务前**必须先读**对应 skill:
+> ⚠️ **现状:`skills/` 目录尚未建立**,下表是规划中的 skill 清单。
+> 当前这些内容散落在 `docs/` 里;**动手前请先读 `docs/data-source-mapping-playbook.md`**
+> (写 mapping / 改 schema 的完整实施办法 + 2026-10-09 实战记录)。
 
-| Skill | 何时读 |
-|---|---|
-| `add-new-data-source` | 新建家族(如加"粮油") |
-| `add-new-version` | 现有家族加新版本 |
-| `add-new-model` | 加新 model(如 customer) |
-| `write-field-mapping` | 写 mapping.yaml |
-| `design-schema` | 写 schema.yaml |
-| `write-preaggregation` | 写 DuckDB 预聚合 |
-| `debug-query` | 排查 cube query 慢/错 |
+| Skill | 何时读 | 当前落点 |
+|---|---|---|
+| `add-new-data-source` | 新建家族(如加"粮油") | `AGENTS.md` §8 + `docs/architecture.md` |
+| `add-new-version` | 现有家族加新版本 | `AGENTS.md` §8 |
+| `add-new-model` | 加新 model(如 customer) | `docs/semantic-layer-design.md` |
+| `write-field-mapping` | 写 mapping.yaml | **`docs/data-source-mapping-playbook.md`** |
+| `design-schema` | 写 schema.yaml | `docs/semantic-layer-design.md` |
+| `write-preaggregation` | 写 DuckDB 预聚合 | `docs/semantic-layer-design.md` |
+| `debug-query` | 排查 cube query 慢/错 | `docs/dapr-app-contract.md` |
 
 ## 7. 完成前自检
 
-- [ ] `go build ./...` 在仓库根能跑通
+- [ ] `go build ./...` 在**对应 module 目录**能跑通
+      (本仓库是多 module + `go.work`,在**仓库根**跑 `go build ./...` 会
+      输出 `matched no packages` —— 这不是错误,要在 `pkg/`、
+      `semantic-layers/sixun/`、`gateway/` 等各自 module 目录里跑)
 - [ ] 新增代码有对应 pkg 接口的最小测试(脚手架阶段允许 TODO)
+- [ ] 测试断言的方向服务于**真实约束**,不是当前的实现细节
+      (反例:曾有一条测试断言 `DefaultRowLimit < 27299`,把"默认值截断数据"
+      这个**缺陷**钉成了规格,导致缺陷复活时它仍然全绿)
+- [ ] 改了 schema/mapping → 已重启 cube app 全量重拉 → 已用 `COUNT(*)`
+      确认行数等于源库实测值(没有被 row_limit 截断)
+- [ ] 共享 schema(`sixun-models/`)的改动 → **所有 family 的 mapping 都同步改了**
 - [ ] 没碰 P1 拍板里 ❌ 的事项
 - [ ] 新增 family 必须同时加 `skills/add-new-data-source` 的代码示例(若案例缺失)
 

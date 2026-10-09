@@ -46,12 +46,14 @@ CUBE_APP_ID=sixun-hbposv7-jiale CUBE_PORT=:8085 CUBE_GATEWAY_URL=http://localhos
 ## 文档
 
 - [架构](docs/architecture.md)
+- [数据源勘察与 mapping 编写手册](docs/data-source-mapping-playbook.md)(勘察数据源 / 写 mapping / 重拉与验证)
 - [Dapr app 协议](docs/dapr-app-contract.md)(v2:`/v1/source/{source}/load` + 错误信封)
-- [运行时运维](docs/runtime-ops.md)(env 驱动 + 多 instance 启动)
+- [运行时运维](docs/runtime-ops.md)(env 驱动 + 多 instance 启动 + 模型生效与验证)
 - [语义层设计](docs/semantic-layer-design.md)
 - [权限模型](docs/security.md)
 - [缓存策略](docs/cache-strategy.md)
 
 ## AI 协作
 
-任何 AI 助手必须先读 [AGENTS.md](AGENTS.md),按对应任务读 `skills/<name>/SKILL.md`。
+任何 AI 助手必须先读 [AGENTS.md](AGENTS.md),按对应任务读 `docs/` 下对应文档
+(`skills/` 目录尚未建立,内容目前以 `docs/` 形式维护)。

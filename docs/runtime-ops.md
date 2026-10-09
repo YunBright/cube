@@ -195,6 +195,75 @@ cd pkg && go test ./duckdb/...
 - cube app `GET /healthz` → 200 `{status, source, family, version, models, uptime}`
 - dapr sidecar 自动做 liveness / readiness probe
 
+## 改动 schema / mapping 后:生效与验证
+
+> 完整流程见 [数据源勘察与 mapping 编写手册](data-source-mapping-playbook.md) §3~§6。
+
+### 模型是运行时读盘,不是编译进二进制
+
+`boot.ResolveModelsDir()` 用 `os.Stat` 探测(`CUBE_MODELS_DIR` 或相对路径),
+**没有 `go:embed`**。所以:
+
+- 只推二进制 = 模型**完全没变**
+- `deploy-cube.ps1` 的 tar 里**包含** `mapping/` 与 `sixun-models/`,正常部署会带上
+- `config.yaml` **不在 tar 里**(手工维护),不会被覆盖
+
+部署后**主动验证**,不要假设:
+
+```bash
+ssh gyy "grep -n 'target: unit' /opt/YunBright/cube/semantic-layers/sixun-ysx/mapping/mapping-product.yaml"
+```
+
+### 必须重启才会重拉
+
+新列写进 DuckDB 的唯一路径是启动时的 `Fetch → mapping → LoadFrom`:
+
+```bash
+ssh gyy "systemctl --user restart cube-sixun-ysx.service && sleep 90 && systemctl --user is-active cube-sixun-ysx.service"
+```
+
+### ⚠️ 空结果不等于配置错了
+
+重拉过程中查询会返回 `{"data":[]}`。**先判断是不是还没拉完,再怀疑配置**:
+
+```bash
+ssh gyy "ls -la /opt/YunBright/cube/semantic-layers/sixun-ysx/data/"   # 看 .duckdb/.wal 时间戳
+```
+
+### 用 COUNT(*) 自检有没有被 row_limit 截断
+
+```bash
+curl -s -X POST http://127.0.0.1:8083/query -H 'Content-Type: application/json' \
+  -d '{"measures":["product.count"],"dimensions":[]}'
+# → 27299 == 源库实测行数 ✅
+# → 10000 / 50000 这类整数 = 被 row_limit 截断了 ❌
+```
+
+`COUNT(*)` **恰好等于某个上限值**,基本可以断定数据被静默截断。
+
+多 family 一致性验证:同一条 query body 打不同端口,比对返回的 `sql` 字段是否**逐字节相同**。
+
+## row_limit(拉取行数上限)
+
+`source.DefaultRowLimit = 50000`(`semantic-layers/sixun/internal/source/source.go`),
+`config.yaml` 可按角色覆盖:
+
+```yaml
+source:
+  row_limit: 50000        # 未覆盖角色的兜底
+  row_limits:
+    product: 50000         # 源库实测 27299 / 44313
+    stock:   40000         # 源库实测 23576 / 10607
+    supplier: 2000
+    category: 2000
+    # sale 流水表不要跟着放大 —— 它才是该单独限流的那个
+```
+
+2026-10-09 实测:硬编码 `TOP 10000` 曾让 ysx 静默丢 63% 商品、hbposv7 丢 77%,
+**库存表还丢 57%**(会让盘点账面数量直接是错的),而全链路零报错。
+实测 27299 行 × 65 列全量拉取仅 3.6MB / 1.4s。
+**默认值必须高于所有维表的实测行数** —— 正确性不能依赖"记得配这一项"。
+
 ## 日志
 
 所有 app 用 `pkg/log`(JSON 格式),字段:
