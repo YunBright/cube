@@ -1,0 +1,143 @@
+# purchase_sheet model - 思迅家族共享 schema(采购单头)
+#
+# 源表:t_pm_sheet_master(两个 family 同名同表)
+#
+# ⚠️ 采购单不在 t_im_sheet_master —— 那是库存类单据
+#   (实测 trans_no 只有 KB 扣补单 / OO 库存调整 / JO 报损 / KO 领用)。
+#   采购模块(pm)的单据才在这张表,按 trans_no 区分:
+#     PI 采购收货单  ← 业务上的"采购进货单",hbposv7 10571 张 / ysx 24377 张
+#     RO 采购退货单  ← hbposv7 2074 张 / ysx 3562 张
+#     PO 采购订单 / WP 线上采购订单 / RT 采购退货通知单 / XJ 询价单 / YX 永续订单
+#   前缀释义来自思迅字典表 t_sys_sheet_no,不是猜的。
+#
+# 实测已审核(approve_flag='1'):hbposv7 PI 10569 / RO 2074;ysx PI 24376 / RO 3561
+# 结算单通过 settlement_line.voucher_id 关联本表。
+#
+# 金额不做 dimension(理由同 settlement):带 dimensions: [purchase_sheet.id] 取单据金额。
+name: purchase_sheet
+sql_table: purchase_sheet
+storage: live  # 不落 DuckDB:刚收货的单要立刻可查,落盘快照会漏(见 settlement/schema.yaml 顶部说明)
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 单据号
+    description: 源列 sheet_no。hbposv7 char(20) 补空格,ysx char(14) 不补,查询层统一 RTRIM
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 供应商 ID
+    description: 源列 supcust_no。实测 PI 行全部非空(hbposv7 73 个供应商 / ysx 140 个)
+
+  - name: document_type
+    sql: document_type
+    type: string
+    title: 单据类型
+    description: 源列 trans_no。进货单只取 PI,退货单只取 RO
+    enum_values:
+      - { value: "PI", label: 采购收货单 }
+      - { value: "RO", label: 采购退货单 }
+      - { value: "RT", label: 采购退货通知单 }
+      - { value: "PO", label: 采购订单 }
+      - { value: "WP", label: 线上采购订单 }
+      - { value: "XJ", label: 询价单 }
+      - { value: "YX", label: 永续订单 }
+
+  - name: approve_status
+    sql: approve_status
+    type: string
+    title: 审核状态
+    enum_values:
+      - { value: "0", label: 未审核 }
+      - { value: "1", label: 已审核 }
+
+  - name: order_status
+    sql: order_status
+    type: string
+    title: 订单状态
+    description: 源列 order_status
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: pay_way
+    sql: pay_way
+    type: string
+    title: 付款方式
+
+  - name: currency
+    sql: currency
+    type: string
+    title: 币种
+    description: 源列 coin_no,实测恒为 RMB
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date。实测跨度 hbposv7 2024-12~2026-10 / ysx 2021-09~2026-10
+
+  - name: finished_at
+    sql: finished_at
+    type: time
+    title: 审核完成时间
+    description: 源列 work_date
+
+  - name: valid_at
+    sql: valid_at
+    type: time
+    title: 生效日期
+    description: 源列 valid_date
+
+  - name: operator_id
+    sql: operator_id
+    type: string
+    title: 制单人
+
+  - name: confirmer
+    sql: confirmer
+    type: string
+    title: 审核人
+    description: 源列 confirm_man
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 other1。实测装的是异常说明文本(如"破损、被偷"、"食品破包")
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 单据数
+
+  - name: total_amount_yuan
+    sql: "SUM(amount)"
+    type: number
+    title: 单据金额合计(元)
+    format: "0.00"
+    description: 源列 sheet_amt。实测 hbposv7 PI 合计 1131.5 万 / ysx 2986.4 万
+
+  - name: total_order_amount_yuan
+    sql: "SUM(order_amount)"
+    type: number
+    title: 订货金额合计(元)
+    format: "0.00"
+    description: 源列 order_amt
+
+joins:
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one
+
+  - name: purchase_sheet_line
+    sql: purchase_sheet_line
+    on: "{CUBE}.id = purchase_sheet_line.sheet_id"
+    relationship: one_to_many

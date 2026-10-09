@@ -3,9 +3,13 @@
 # ysx 的 t_mp_saleflow 有 order_status 字段(区分销售/退货):
 #   S = 销售
 #   R = 退货
-#   (具体值以你环境为准,schema.yaml 会通过 enum_values 列出常见值)
+#   但**这里不映射它** —— hbposv7 配的 t_rm_order_saleflow 实测没有这一列,
+#   共享 schema 若依赖 family 专属列,hbposv7 查该维度/度量就是 column not found。
+#   schema 的 order_status 维度用 COALESCE(order_status, CASE WHEN quantity<0 ...) 兜底,
+#   两个 family 统一按数量正负判断销售/退货。
 #
-# 注意:ysx 没有 sale_money,所以 amount 必须用 SQL 算 SUM(unit_price * quantity)。
+# 注意:本 model 的源表在**两个库实测都是 0 行空表**,
+# 销售数据请用新的 sale_day(t_rm_daysum,实测 59.8 万 / 120.8 万行)。
 version: 1
 model: sale_detail
 
@@ -38,7 +42,3 @@ mappings:
   - source: oper_date
     target: sold_at
     type: datetime
-
-  - source: order_status        # ysx 独有,直接映射
-    target: order_status
-    type: string

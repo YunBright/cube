@@ -187,21 +187,45 @@ mappings:
 但那是**数据质量问题,不是 mapping 的问题** —— 在 mapping 里偷偷清洗等于
 把"源库长这样"这个事实藏起来,让排查时无从查证。
 
-### 3.3 schema/mapping 是**运行时读盘**,不是编译进二进制
+### 3.3 schema/mapping 已用 `go:embed` 编译进二进制(2026-10-09 起)
 
-`boot.ResolveModelsDir()` 用 `os.Stat` 探测路径(`CUBE_MODELS_DIR` 或相对路径),
-**没有 `go:embed`**。所以:
+- schema:`sixun-models/<model>/schema.yaml`,经 `sixun-models/embed.go` 的 `models.FS()` 暴露
+- mapping:`semantic-layers/sixun/cmd/<binary>/mapping/mapping-<model>.yaml`,每个 binary 一份
 
-- 只部署二进制 = 模型完全没变
-- `deploy-cube.ps1` 的 tar 里**包含** mapping/ 与 sixun-models/,正常部署会带上
-- 但 `config.yaml` **不在 tar 里**(手工维护),不会被动覆盖 —— 这点是好事
+所以现在:
 
-部署后**必须主动验证**远端文件真的更新了,不要假设:
+- 部署**只推二进制**,`deploy-cube.ps1` 的 tar 里**不再包含** mapping/ 与 sixun-models/
+  (脚本的 `prune` 步骤会把远端遗留的这两个目录删掉 —— 留着比删掉更危险,
+  因为 `ls mapping/` 成功会让人以为"模型已部署",而运行的其实是二进制里的内嵌副本)
+- **改了 schema/mapping 必须重新构建**,只重推旧二进制不会有任何变化
+- `config.yaml` 仍在盘上(含源库 DSN 口令),也仍不在 tar 里 —— 这点是好事,不会被覆盖
+- `CUBE_MODELS_DIR` / `CUBE_MAPPING_DIR` 已删除。读盘路径静默失败:路径对不上时
+  一个模型都加载不到,启动却**不报错**,要到查询时才炸
+
+改完先跑资产完整性测试(缺 mapping / 空 mapping / 拼错 model 名都会红):
 
 ```bash
-ssh gyy "grep -n 'target: unit' /opt/YunBright/cube/semantic-layers/sixun-ysx/mapping/mapping-product.yaml"
-ssh gyy "grep -n -A2 'name: unit' /opt/YunBright/cube/sixun-models/product/schema.yaml"
+cd semantic-layers/sixun
+go test ./cmd/sixun-ysx/... ./cmd/sixun-hbposv7/... ./internal/embedcheck/...
 ```
+
+部署后看启动日志确认二进制带了新模型:
+
+```bash
+ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep 'loading schemas'"
+```
+
+### 3.4 新增 model 的完整清单(加 go:embed 之后)
+
+1. `sixun-models/<model>/schema.yaml` + `preagg.go`
+2. `semantic-layers/sixun/cmd/sixun-ysx/mapping/mapping-<model>.yaml`
+3. `semantic-layers/sixun/cmd/sixun-hbposv7/mapping/mapping-<model>.yaml`
+4. 若是 `storage: live`:该实例 `config.yaml` 补 `table_<model>`
+5. `go test ./...` —— 少任何一步 `embedcheck` 都会直接失败
+6. 重新构建部署 + 重启(§4)
+
+第 2、3 步以前可以漏(漏了只是少一份 mapping),现在会**测试失败**;
+第 4 步漏了则是启动期日志里的 `live model 缺 source.table_*`,该 model 不可查。
 
 ---
 
@@ -273,12 +297,20 @@ LIMIT 5
 修法**不是**给 hbposv7 打一个 RTRIM 补丁,而是把 SQL 构造抽进共用包:
 
 ```
-pkg/cubequery/build.go   ← Query → SQL 的唯一实现
-   ├── cmd/sixun-ysx/main.go      调 cubequery.Build
-   └── cmd/sixun-hbposv7/main.go  调 cubequery.Build
+pkg/cubequery/                ← Query → SQL 的唯一实现
+   build.go   buildFilter / buildOrder / TrimExpr   (DuckDB 方言)
+   tsql.go    rewriteColumns / numberPlaceholders    (T-SQL 方言,live 透传)
+        ↑ buildOrder 与 buildFilter 是**两个方言共用**的,只有别名列名引号不同
+   ├── cmd/sixun-ysx/main.go      按 storage 分流调 Build / BuildTSQL
+   └── cmd/sixun-hbposv7/main.go  同上
 ```
 
 **补丁只能修这一次症状;共用代码才能让分叉不可能再发生。**
+
+> 加 ORDER BY 时这条规则直接生效:`buildOrder` 写在 `build.go`,
+> 两条路径只通过 `quote` 参数区分别名引号(`"` vs `[`),
+> 并由 `TestOrder_DialectsAgree` 锁住"同一条 query 两条路径逐字一致"。
+> 若当初把 ORDER BY 各写一份,就会重演"live 有排序、duck 没有"的分叉。
 
 ### 5.1 抽共用代码时的陷阱:顺手"优化"语义
 

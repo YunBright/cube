@@ -37,10 +37,59 @@ dapr run --app-id cube-compiler -- \
 | `DAPR_APP_ID`     |   | (dapr 自动注入) | dapr sidecar app-id。**首选源** — dapr 启动时自动注入。/register body 用此上报给 gateway 当 dapr app-id |
 | `CUBE_DAPR_APP_ID`|   | `"cube-" + CUBE_APP_ID` | 手动覆盖 dapr app-id。空值走推导默认值。**通常不需要设** |
 | `CUBE_PORT`       |   | `:8080` | gin 监听端口 |
-| `CUBE_MAPPING_DIR`|   | `./mapping` | mapping-*.yaml 所在目录 |
-| `CUBE_MODELS_DIR` |   | (自动探测) | sixun-models 路径 |
 | `CUBE_DUCKDB_PATH`|   | `./data/<app_id>.duckdb` | 本地 DuckDB 文件 |
 | `CUBE_GATEWAY_URL`|   | `http://localhost:8080` | cube-gateway HTTP base |
+| `CUBE_REFRESH_EVERY`|  | `30m` | duck 模型定时重拉间隔;`0` 关闭 |
+
+> **没有** `CUBE_MODELS_DIR` / `CUBE_MAPPING_DIR` —— schema 与 mapping 都用
+> `go:embed` 编译进二进制了(2026-10-09 改动)。曾经有,已删,理由见下方
+> 「模型已编译进二进制」。
+
+### 配置从哪读:`config.local.yaml` > `config.yaml`
+
+| 文件 | 进版本库 | 作用 |
+|---|---|---|
+| `config.yaml` | ❌(`.gitignore` 第 26 行) | 实例配置本体,**也是打包进归档的那份** |
+| `config.local.yaml` | ❌ | 本地验证用的覆盖文件,存在即生效 |
+| `config.example.yaml` | ✅ | 模板(新环境从这里拷) |
+
+app / `sqlcheck` / `sqlq` 都按这个优先级读,**不读环境变量**。规则实现在
+`semantic-layers/sixun/internal/appcfg`,有测试钉住。
+
+本地连真实源库验证(比如把 DSN 指到 ssh 隧道端口、或指向测试库)时:
+
+```bash
+# 1. 拷一份本地覆盖(此文件不会进版本库)
+cp cmd/sixun-hbposv7/config.example.yaml cmd/sixun-hbposv7/config.local.yaml
+#    编辑它填 dsn 和 11 个 table_*
+
+# 2. 跑验证,不带 -config,自动选中 config.local.yaml
+go run ./cmd/sqlcheck -family hbposv7
+go run ./cmd/sqlq -family hbposv7 -q "SELECT COUNT(*) FROM t_fm_recpay_gx_master"
+go run ./cmd/sqlq -config cmd/sixun-hbposv7 -q "..."   # 也可以直接给目录
+```
+
+每次运行都会打印实际用的文件,别靠猜:
+
+```
+=== config: cmd\sixun-hbposv7\config.local.yaml ===
+```
+
+> ⚠️ **`config.local.yaml` 绝不能留在服务器上**。它优先级高于 `config.yaml`,
+> 一旦存在就会盖住部署刚推下去的 `config.yaml`,症状是「部署改了配置但没生效」
+> 且**零报错**。`deploy-cube.ps1 -Step prune` 每次部署都会删掉远端同名文件。
+> app 启动日志的 `config loaded` 行也带 `file=`,一眼能看出用的是哪份。
+
+### ⚠️ `config.yaml` 会被部署覆盖
+
+归档里**含** `config.yaml`,所以每次部署都用**打包机本机工作区的那份**
+覆盖远端。因为它不在版本库,「仓库里那份」并不存在 —— 换台机器打包,
+部署的就是那台机器的配置。两个后果:
+
+1. 远端任何对手工 `config.yaml` 的修改(例如轮换源库口令)会在下次部署被**静默还原**
+2. 要改配置就改**工作区那份**,然后重新部署
+
+详见 `.goreleaser.yaml` 头部与 `deploy-cube.ps1` 的 `.DESCRIPTION`。
 
 DaprAppID 解析优先级(首个非空胜出):`DAPR_APP_ID` → `CUBE_DAPR_APP_ID` → 推导默认。
 详见 `docs/dapr-app-contract.md` §2.1。
@@ -195,23 +244,82 @@ cd pkg && go test ./duckdb/...
 - cube app `GET /healthz` → 200 `{status, source, family, version, models, uptime}`
 - dapr sidecar 自动做 liveness / readiness probe
 
+cube app 的 `/healthz` 另有三段,排查刷新问题时先看它们:
+
+```json
+{
+  "status": "ok",
+  "data":    { "interval_seconds": 1800, "data_age_seconds": 52,
+               "consecutive_failures": 0, "models": { "product": { ... } } },
+  "refresh": { "mode": "dapr-job", "job_name": "cube-refresh",
+               "triggered": 3, "skipped_overlap": 0 }
+}
+```
+
+- `status` = `degraded` 时仍返 **200**(数据旧 ≠ 服务不可用),别用 5xx 判活
+- `data_age_seconds` 超过 `2 × interval_seconds` 才判 stale,避免刚启动时误报
+- `refresh.mode` 见下节
+
+## 刷新驱动:dapr-job 优先,ticker 兜底
+
+duck 模型的定时重拉由 `internal/refreshschedule` 统一管,两种模式:
+
+| mode | 含义 | 触发源 |
+|---|---|---|
+| `dapr-job` | 已登记到 Dapr Scheduler | sidecar 到点 POST `/job/cube-refresh` |
+| `ticker` | 登记失败,退回进程内定时器 | `time.Ticker` |
+| `disabled` | `interval <= 0` | 无 |
+
+**为什么必须有兜底**:Dapr Jobs 是 alpha 能力,可用性取决于集群里 Scheduler 与 sidecar 的连通性。
+2026-10-10 实测:sidecar 被指向 `localhost:50006` 时 Jobs API 直接挂死(超时,不是 404),
+表现是「登记没成功也没报错」。纯 job 的话结果就是**数据永远不刷新、healthz 全绿**。
+
+**ticker 不是终点 —— 收到 job 触发会自动切回。** Scheduler 恢复后,之前留在 etcd 里的
+job 会继续投递(触发时找不到可用 sidecar 的会进 staging queue,等 sidecar 可用后自动补投)。
+app 一收到自己的 job,就同时证明了 Scheduler 活着、etcd 数据完好、sidecar 在线,
+于是**立刻切回 `dapr-job` 并停掉 ticker**:
+
+```
+收到 dapr job 触发,判定 Scheduler 已恢复,切回 dapr-job 并停止 ticker
+```
+
+不切的话,ticker 与 job 会同时刷同一个 DuckDB(刷新频率翻倍),而且 `refresh.mode`
+会显示 `ticker` 而 job 其实一直在触发 —— **那个字段会开始说谎**。
+
+所以运维上:
+
+- `refresh.mode: ticker` 且 `refresh.schedule_error` 有值 = Scheduler 不可用,查调度器
+- 恢复后不必重启 cube app,等下一次 job 触发会自动切回(最迟一个间隔)
+- `refresh.triggered` / `skipped_overlap` 是**进程内**计数,重启归零;
+  `skipped_overlap` 持续增长说明刷新耗时已超过间隔(在途守卫在丢触发),
+  该调大 `refresh.every` 或优化加载
+
 ## 改动 schema / mapping 后:生效与验证
 
 > 完整流程见 [数据源勘察与 mapping 编写手册](data-source-mapping-playbook.md) §3~§6。
 
-### 模型是运行时读盘,不是编译进二进制
+### 模型已编译进二进制(go:embed)
 
-`boot.ResolveModelsDir()` 用 `os.Stat` 探测(`CUBE_MODELS_DIR` 或相对路径),
-**没有 `go:embed`**。所以:
+`schema.yaml` 与 `mapping.yaml` 都用 `go:embed` 编译进各自的二进制:
 
-- 只推二进制 = 模型**完全没变**
-- `deploy-cube.ps1` 的 tar 里**包含** `mapping/` 与 `sixun-models/`,正常部署会带上
-- `config.yaml` **不在 tar 里**(手工维护),不会被覆盖
+- schema: `sixun-models/<model>/schema.yaml`,经 `sixun-models/embed.go` 暴露 `models.FS()`
+- mapping: `semantic-layers/sixun/cmd/<binary>/mapping/mapping-<model>.yaml`,每个 binary 一份
 
-部署后**主动验证**,不要假设:
+所以:
+
+- 部署**只需要推二进制**(`config.yaml` 仍手工维护,含 DSN 口令)
+- `deploy-cube.ps1` 的 tar 里**不再包含** `mapping/` 与 `sixun-models/`
+- **改了 schema / mapping 必须重新构建** —— 只重推旧二进制不会有任何变化
+- 读盘路径(`CUBE_MODELS_DIR`)已彻底删除。原因是它静默失败:路径对不上时
+  一个模型都加载不到,而启动**不报错**,要到查询时才炸
+
+资产完整性由测试兜底(`go test ./cmd/sixun-ysx/... ./cmd/sixun-hbposv7/...`):
+schema 缺 mapping、mapping 为空、mapping 拼错 model 名,都会让测试失败。
+
+验证二进制里确实带了新模型,看启动日志这一行即可:
 
 ```bash
-ssh gyy "grep -n 'target: unit' /opt/YunBright/cube/semantic-layers/sixun-ysx/mapping/mapping-product.yaml"
+ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep 'loading schemas'"
 ```
 
 ### 必须重启才会重拉
@@ -292,3 +400,4 @@ P2 候选:
 | cube-gateway 挂 | BI 工具全失败;启动新实例(注册表由 dapr state store 持久化) |
 | cube-compiler 挂 | cube app 正常运行,只是不能 reload 新代码;重启 compiler 即可 |
 | dapr sidecar 挂 | dapr 自动重启(根据 liveness probe) |
+| Scheduler 不可用(广播地址错 / 容器停) | 启动时登记失败 → 自动回退 ticker,`refresh.mode=ticker` + `schedule_error` 有值;数据照常刷新。Scheduler 恢复后由 job 触发自动切回,不必重启 app |

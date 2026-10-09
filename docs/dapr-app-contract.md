@@ -140,9 +140,84 @@ X-Request-Id: <optional>               // 不传则 gateway 自动生成
   "timeDimensions": [
     { "dimension": "supplier.registered_at", "granularity": "month" }
   ],
+  "order": [
+    { "id": "supplier.count", "order": "desc" }
+  ],
   "limit": 100
 }
 ```
+
+**`order` 语义**(2026-10-09 起支持,`pkg/cubequery.buildOrder`):
+
+| 规则 | 说明 |
+|---|---|
+| `id` 格式 | `<model>.<ref>`,可指向 **dimension 或 measure** |
+| `order` 取值 | `asc` / `desc`,大小写不敏感;**省略按 `asc`** |
+| 其它取值 | **400 `QUERY_INVALID`**(方向是用户可控文本,不在白名单就拒) |
+| 必须同时被 select | 排的成员必须出现在 `dimensions` / `measures` 里,否则 **400** |
+| member 不在 schema | **400 `QUERY_INVALID`**,`details.order_member` |
+
+排序按 **SELECT 别名**实现(`"settlement.settled_at"` / `[settlement.settled_at]`),
+DuckDB 与 T-SQL 两条路径共用同一份编译逻辑,语义逐字一致。
+
+> ⚠️ 不给 `order` 时 `limit` 是**任意截取**(ysx 4348 张结算单、hbposv7 799 张,
+> TOP/LIMIT 按存储顺序取前 N 行)。列表类场景必须显式给 `order`,
+> 否则返回哪几行不确定。
+
+**`offset` / `total`**
+
+| 字段 | 语义 |
+|---|---|
+| `offset` | 跳过前 N 行。数字或单元素数组均可;负数/字符串/浮点 → **400** |
+| `offset > 0` 且无 `order` | **400** ——分页必须建立在稳定排序上(T-SQL 的 OFFSET/FETCH 也强制要求 ORDER BY) |
+| `total: true` | 返回不受 limit/offset 影响的总行数;用 `COUNT(*) OVER()` 一次算出,不额外查第二遍 |
+
+**`timeDimensions`**(按日/周/月/季/年聚合 + 时间窗过滤)
+
+```json
+{
+  "measures": ["sale_day.net_sale_quantity"],
+  "timeDimensions": [
+    { "dimension": "sale_day.business_date", "dateRange": "last_90_days", "granularity": "month" }
+  ],
+  "order": [{ "id": "sale_day.business_date.month", "order": "desc" }],
+  "limit": 12,
+  "total": true
+}
+```
+
+- `granularity` 输出 key 是 `<model>.<dim>.<gran>`,可直接用于 `order`
+- `dateRange` 支持 `["2026-07-01","2026-09-30"]`、`"2026-08-15"`、以及
+  `today / yesterday / last_7_days / last_30_days / last_90_days / this_month / last_month / this_year`
+- **看不懂的 dateRange 一律 400**,绝不静默忽略(静默忽略 = 查了全历史却以为是近期)
+- schema 里 `char_date: true` 的维度走原列字符串比较(可走索引),不套 `CAST`
+
+**日期类 filter operator**:`inDateRange` / `notInDateRange` / `onTheDate` /
+`beforeDate` / `afterDate`(排他)。值必须是 `YYYY-MM-DD`,否则 400。
+
+**`segments`**:schema 里预定义的过滤片段,调用方只写名字。
+名字不存在时 400,并在错误里列出可用名字。
+
+**`joins`(多表关联)**
+
+查询里可以引用**别的 model** 的成员,编译器按当前 model 的 `joins:` 声明连表:
+
+```json
+{
+  "measures": ["settlement_line.amount_yuan"],
+  "dimensions": ["settlement.document_type", "purchase_sheet.document_type"]
+}
+```
+
+| 规则 | 行为 |
+|---|---|
+| 关联来源 | **只走 schema 显式声明的 joins**,不做 JIT 自动关联 |
+| JOIN 类型 | `many_to_one` 用 `LEFT`(查档案,无档案的行不该凭空消失) |
+| 支持范围 | 目前只支持 `storage: live` model 之间的 join |
+| `one_to_many` 扇出 | 被放大的那一侧的度量 → **400**,错误里指出该用多的一侧 |
+
+最后一条是**安全闸**:join 进 N 行后对"一"那一侧求 SUM 会得到 N 倍金额,
+SQL 合法、查询 200 OK、金额凭空翻倍。宁可 400 也不要这种错数字。
 
 ### 成功响应
 
@@ -230,13 +305,13 @@ x-request-id: <request_id>                  // 端到端传递
 | `SOURCE_OFFLINE`            | 503 | dapr 真实抛 `ErrConnFailure`(sidecar 死了 / placement 找不到 app)**或** cube app 返回 404 且 body 不含 `MODEL_NOT_FOUND` 子码 |
 | `UPSTREAM_TIMEOUT`          | 504 | ctx deadline exceeded |
 | `VERSION_UNSUPPORTED`       | 400 | cube app 返回 `{"code":"VERSION_UNSUPPORTED",…}` |
-| `MODEL_NOT_FOUND_IN_SOURCE` | 404 | cube app 返回 `{"code":"MODEL_NOT_FOUND",…}` |
+| `MODEL_NOT_FOUND_IN_SOURCE` | 404 | cube app 返回 `{"code":"MODEL_NOT_FOUND",…}`;**只用于「该 source 不暴露这个 model」** |
 | `QUERY_PARSE_ERROR`         | 400 | body 读不出来 / JSON 无效 |
-| `QUERY_INVALID`             | 400 | JSON OK 但 model 字段空 / measures 为空 |
+| `QUERY_INVALID`             | 400 | JSON OK 但语义非法:model 字段空 / measures 为空 / 引用了不存在的 dimension 或 measure |
 | `NO_PRINCIPAL`              | 401 | `cfg.AuthRequired && Authorization` header 缺失 |
 | `FORBIDDEN`                 | 403 | `Authorizer.Allow` 返回 false |
 | `RATE_LIMITED`              | 429 | (P2,当前未 wire) |
-| `INTERNAL_ERROR`            | 500 | gateway panic |
+| `INTERNAL_ERROR`            | 500 | gateway **自身** panic(注意:cube app 的 5xx 归 `UPSTREAM_ERROR` 502,不扫 5xx 子码) |
 | `UPSTREAM_ERROR`            | 502 | 其他非 2xx 上游响应;`details.upstream_status` + 截断 512B `details.upstream_body` |
 
 ### cube app 4xx 子码协议
@@ -255,7 +330,39 @@ cube app 的 /query 在 4xx 响应里 emit `code` 子码:
 | `VERSION_UNSUPPORTED`  | 400 | `VERSION_UNSUPPORTED`       | 400 |
 | `QUERY_PARSE_ERROR`    | 400 | `QUERY_PARSE_ERROR`         | 400 |
 | `QUERY_INVALID`        | 400 | `QUERY_INVALID`             | 400 |
+| `INTERNAL_ERROR`       | 500 | `UPSTREAM_ERROR`            | 502 |
 | (其他 / 缺省)            | *   | `UPSTREAM_ERROR`            | 502 |
+
+> 上游 5xx 一律归 `UPSTREAM_ERROR` 502(语义就是"我这边好的,是上游 cube app 挂了"),
+> 与 4xx 分支"扫 body 子码"的做法不同 —— 5xx 背后的原因对调用方没有可操作性,
+> 再细分只会让人以为该重试某个具体环节。
+
+#### `MODEL_NOT_FOUND` 的适用范围(2026-10-10 收窄)
+
+**`MODEL_NOT_FOUND` 只表示一件事:这个 source 不暴露这个 model。**
+它**不**覆盖"model 存在、但查询引用了不存在的 dimension / measure"。
+
+2026-10-10 生产现场抓到:查询里把 `settlement.sheet_no` 写错(真实字段是 `id`),
+cube app 当时把 `BuildError{Kind:"dimension"}` 兜底成了 404 + `MODEL_NOT_FOUND`,
+gateway 扫到子码后翻成 `model not exposed by source: settlement`。
+于是排查被引向「这个门店是不是没注册 settlement / schema 有没有推上去」,
+而真正要改的只是查询里的一个字段名 —— **契约问题被误报成了查询问题**,
+两者的重试策略正好相反(前者重试无用,后者改了就好)。
+
+收窄后的分层(cube app 的 `queryHandler` 必须逐 `BuildError.Kind` 分派,
+不允许兜底成同一个码):
+
+| 情形 | cube app | gateway | 含义 |
+|---|---|---|---|
+| 该 source 不暴露这个 model | 404 `MODEL_NOT_FOUND` | 404 `MODEL_NOT_FOUND_IN_SOURCE` | 契约/部署问题,运维介入 |
+| dimension / measure 不存在 | 400 `QUERY_INVALID`(`details.ref` 回传字段名) | 400 `QUERY_INVALID` | 查询写错了,调用方改查询 |
+| filter / order 成员不合法、`measures` 为空、model 无法推断 | 400 `QUERY_INVALID` | 400 `QUERY_INVALID` | 同上 |
+| 非 `BuildError` 的编译失败 | 500 `INTERNAL_ERROR` | 502 `UPSTREAM_ERROR` | 我们的 bug,**不是任何业务结论** |
+
+**兜底方向的原则**:编译阶段的未知失败绝不能降级成 `MODEL_NOT_FOUND` ——
+那是把"我们的 bug"说成"这个 source 没有这个 model",排查方向从查询跑偏到部署。
+回归锁在 `cmd/sixun-*/errcode_test.go`,其中 `UnknownModelIs404` 与
+`UnknownDimensionIs400` / `UnknownMeasureIs400` 必须成对存在。
 
 gateway 用 `errors.As(err, &invErr)` + body 文本扫描(`"MODEL_NOT_FOUND"` 子串)做匹配。
 **关键**:对 404 响应也要先扫 body 子码 — cube app 按协议对未知 model 返 404 + MODEL_NOT_FOUND,

@@ -46,11 +46,11 @@ type AuthChecker interface {
 
 // Deps 是 handler 的依赖注入。
 type Deps struct {
-	Logger  *log.Logger
-	Dapr    daprclient.Client
+	Logger   *log.Logger
+	Dapr     daprclient.Client
 	Registry *registry.Registry
 	L1Cache  *l1cache.Cache
-	Auth    AuthChecker // 可选;nil → 不做鉴权
+	Auth     AuthChecker // 可选;nil → 不做鉴权
 }
 
 // Handler 持有依赖,提供注册方法(handler 签名为 gin 的 func(*gin.Context))。
@@ -249,6 +249,50 @@ func (h *Handler) SourceLoad(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json", result)
 }
 
+// SourceMeta 返回某个 source 的完整 model/dimension/measure 清单
+// (GET /v1/source/:source/meta)。
+//
+// 为什么需要它:source 上有 10 个 model、每个几十个 member,调用方
+// (supertrade / BI)没法靠人肉记住字段名。cube app 自己最清楚 schema,
+// 所以由 cube app 暴露 /meta,gateway 只做寻址与透传 ——
+// gateway 不持有 schema,也就不会有一份会过期的副本。
+func (h *Handler) SourceMeta(c *gin.Context) {
+	source := c.Param("source")
+	if !sourceFormatRE.MatchString(source) {
+		WriteErrorWithSource(c, apierror.SOURCE_FORMAT_INVALID,
+			"source must be 3 hyphen-delimited segments", source, nil)
+		return
+	}
+	info, ok := h.Registry.LookupByID(source)
+	if !ok {
+		WriteErrorWithSource(c, apierror.SOURCE_NOT_REGISTERED,
+			"source not registered: "+source, source, nil)
+		return
+	}
+	daprTarget := info.DaprAppID
+	if daprTarget == "" {
+		h.Logger.Warn("registry entry has empty dapr_app_id, fallback to source",
+			"source", source)
+		daprTarget = source
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), upstreamCallTimeout)
+	defer cancel()
+	extra := map[string]string{
+		daprclient.MetadataKeyPrincipal: defaultPrincipal,
+		daprclient.MetadataKeyTenant:    defaultTenant,
+		"Authorization":                 c.Request.Header.Get("Authorization"),
+	}
+	result, err := h.Dapr.InvokeMethod(ctx, daprTarget, "/meta", nil, extra)
+	if err != nil {
+		writeUpstreamError(c, source, daprTarget, "", err)
+		return
+	}
+	h.Registry.MarkSeen(source)
+	// meta **不进 L1**:schema 会随部署变化,缓存一份旧的清单比不缓存更糟。
+	c.Header("X-Cube-Cache", "BYPASS")
+	c.Data(http.StatusOK, "application/json", result)
+}
+
 // ListSources 列出已注册 source 及其状态(GET /v1/sources)。
 //
 // 取代旧的 /v1/meta。每条 entry 同时暴露 wire source id 与 dapr_app_id
@@ -256,14 +300,14 @@ func (h *Handler) SourceLoad(c *gin.Context) {
 func (h *Handler) ListSources(c *gin.Context) {
 	infos := h.Registry.All()
 	type entry struct {
-		Source       string    `json:"source"`       // wire id(URL 用)
-		DaprAppID    string    `json:"dapr_app_id"`  // dapr sidecar app-id(寻址用)
+		Source       string    `json:"source"`      // wire id(URL 用)
+		DaprAppID    string    `json:"dapr_app_id"` // dapr sidecar app-id(寻址用)
 		Family       string    `json:"family"`
 		Version      string    `json:"version"`
 		Models       []string  `json:"models"`
 		Capabilities []string  `json:"capabilities"`
-		Status       string    `json:"status"`       // 总是 "online" —— 被动验证,真实可用性看实际 invoke
-		LastSeen     time.Time `json:"last_seen"`     // 仅供运维排查;不做离线判定
+		Status       string    `json:"status"`    // 总是 "online" —— 被动验证,真实可用性看实际 invoke
+		LastSeen     time.Time `json:"last_seen"` // 仅供运维排查;不做离线判定
 	}
 	out := make([]entry, 0, len(infos))
 	for _, info := range infos {
@@ -293,7 +337,7 @@ func (h *Handler) ListSources(c *gin.Context) {
 // 参数:
 //   - source  = URL 上的 wire id(给响应 details.source 用,人对人友好)
 //   - daprApp = 实际寻址的 dapr app-id(给 SourceOfMessage 等诊断字段用,
-//                让运维知道是哪个 dapr app 出的问题)
+//     让运维知道是哪个 dapr app 出的问题)
 //
 // 业务流程:
 //  1. errors.As 拿 *InvokeError
@@ -301,11 +345,11 @@ func (h *Handler) ListSources(c *gin.Context) {
 //     - ErrTimeout → UPSTREAM_TIMEOUT (504)
 //     - ErrConnFailure → SOURCE_OFFLINE (503)
 //     - ErrHTTPStatus:
-//       - 404 → SOURCE_OFFLINE (dapr sidecar 找不到 app)
-//       - 400 + body 含 "MODEL_NOT_FOUND" → MODEL_NOT_FOUND_IN_SOURCE
-//       - 400 + body 含 "VERSION_UNSUPPORTED" → VERSION_UNSUPPORTED
-//       - 5xx → UPSTREAM_ERROR with upstream_status
-//       - 其他 4xx → UPSTREAM_ERROR with upstream_status + truncated body
+//     - 404 → SOURCE_OFFLINE (dapr sidecar 找不到 app)
+//     - 400 + body 含 "MODEL_NOT_FOUND" → MODEL_NOT_FOUND_IN_SOURCE
+//     - 400 + body 含 "VERSION_UNSUPPORTED" → VERSION_UNSUPPORTED
+//     - 5xx → UPSTREAM_ERROR with upstream_status
+//     - 其他 4xx → UPSTREAM_ERROR with upstream_status + truncated body
 //  3. 兜底:若 err 自身是 context.DeadlineExceeded / context.Canceled
 //     (fake / 自定义 dapr client 直接返回 ctx.Err()) → UPSTREAM_TIMEOUT
 //  4. 未匹配 → UPSTREAM_ERROR(generic)

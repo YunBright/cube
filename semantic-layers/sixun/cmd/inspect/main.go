@@ -6,16 +6,17 @@
 //	go run ./cmd/inspect ./cmd/sixun-hbposv7/config.yaml
 //
 // 输出格式:
-//   === ALL TABLES ===
-//     table1
-//     table2
-//   ...
-//   === TABLE supplier (sixun7_supplier) ===
-//     cups            nvarchar
-//     cups_name       nvarchar
-//     ...
-//     --- samples ---
-//     row 1: map[cups:SUP001 cups_name:可口可乐 ...]
+//
+//	=== ALL TABLES ===
+//	  table1
+//	  table2
+//	...
+//	=== TABLE supplier (sixun7_supplier) ===
+//	  cups            nvarchar
+//	  cups_name       nvarchar
+//	  ...
+//	  --- samples ---
+//	  row 1: map[cups:SUP001 cups_name:可口可乐 ...]
 //
 // 拿到输出后,把字段名贴给 AI,AI 据此写 mapping.yaml。
 package main
@@ -40,6 +41,13 @@ type config struct {
 		TableCategory string `yaml:"table_category"`
 		TableSale     string `yaml:"table_sale"`
 		TableStock    string `yaml:"table_stock"`
+
+		// storage: live 的 model —— 源表名由实例 config 提供,查询时透传。
+		TableSettlement      string `yaml:"table_settlement"`
+		TableSettlementLine  string `yaml:"table_settlement_line"`
+		TablePurchaseSheet   string `yaml:"table_purchase_sheet"`
+		TablePurchaseSheetLn string `yaml:"table_purchase_sheet_line"`
+		TableSaleDay         string `yaml:"table_sale_day"`
 	} `yaml:"source"`
 }
 
@@ -104,6 +112,11 @@ func main() {
 		{"category", cfg.Source.TableCategory},
 		{"sale_detail", cfg.Source.TableSale},
 		{"stock", cfg.Source.TableStock},
+		{"settlement", cfg.Source.TableSettlement},
+		{"settlement_line", cfg.Source.TableSettlementLine},
+		{"purchase_sheet", cfg.Source.TablePurchaseSheet},
+		{"purchase_sheet_line", cfg.Source.TablePurchaseSheetLn},
+		{"sale_day", cfg.Source.TableSaleDay},
 	}
 
 	for _, tgt := range targets {

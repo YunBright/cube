@@ -1,0 +1,104 @@
+# sale_day model - 思迅家族共享 schema(销售日汇总)
+#
+# 源表:t_rm_daysum(两个 family **22 列逐列完全一致**,实测已核对)
+#
+# 为什么是这张表而不是销售流水:
+#   现有 config 配的 t_mp_saleflow(ysx)与 t_rm_order_saleflow(hbposv7)
+#   在**两个库里都是 0 行空表** —— 现有 sale_detail model 拉的是空数据。
+#   另两张明细表则单边存在:hbposv7 有 t_rm_possale/t_rm_posflow,
+#   ysx 有 t_rm_saleflow(329 万行),表名完全不同,无法进共享 schema。
+#   t_rm_daysum 是唯一两库都有、都有真实数据、列结构一致的销售表。
+#
+# 实测行数:hbposv7 598068 / ysx 1208328;两库 oper_date 都到当天。
+#
+# ⚠️ business_date 是 **char(10) 字符串** 'YYYY-MM-DD',不是 datetime。
+#   时间窗口过滤用字符串比较(YYYY-MM-DD 字典序 == 时间序),不要套 date 函数。
+name: sale_day
+sql_table: sale_day
+storage: live  # 不落 DuckDB:ysx 实测 120 万行,且销售每天都在增长(见 settlement/schema.yaml 顶部说明)
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 流水 ID
+    description: 源列 flow_id
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品 ID
+    description: 源列 item_no。char(20),hbposv7 补空格、ysx 不补
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 供货供应商 ID
+    description: 源列 supcust_no。实测两库 100% 能 join 上 t_bd_supcust_info
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no。hbposv7 恒 000001 / ysx 恒 0001,字面值不可跨库比较
+
+  - name: business_date
+    sql: business_date
+    type: time
+    char_date: true
+    title: 业务日期
+    description: 源列 oper_date,是 **char(10) 字符串 'YYYY-MM-DD' 而非 datetime**
+      (两个 family 的 mapping 都声明成 string,已交叉核对)。
+      标了 char_date 之后,时间过滤走**原列字符串比较**(可走索引),
+      不套 CAST —— 否则 120 万行全表扫描。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 记录数
+
+  - name: net_sale_quantity
+    sql: "SUM(sale_quantity - return_quantity)"
+    type: number
+    title: 净销售量
+    format: "0.00"
+    description: 售出减退回。**单位是称重重量,与采购件数的 purchase_sheet_line 实收数量不可直接相除**
+
+  - name: net_sale_amount_yuan
+    sql: "SUM(sale_amount - return_amount)"
+    type: number
+    title: 净销售额(元)
+    format: "0.00"
+
+  - name: giveaway_quantity
+    sql: "SUM(giveaway_quantity)"
+    type: number
+    title: 赠送数量
+    format: "0.00"
+    description: 源列 giv_qty。是否计入净销量取决于业务口径,默认不计入
+
+  - name: avg_cost_yuan
+    sql: "AVG(cost_price)"
+    type: number
+    title: 平均成本价(元)
+    format: "0.00"
+    description: 源列 cost_price
+
+  - name: total_cost_yuan
+    sql: "SUM(sale_quantity * cost_price)"
+    type: number
+    title: 销售成本合计(元)
+    format: "0.00"
+    description: 毛利参考。与 net_sale_amount_yuan 相减得毛利
+
+joins:
+  - name: product
+    sql: product
+    on: "{CUBE}.product_id = product.id"
+    relationship: many_to_one
+
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one

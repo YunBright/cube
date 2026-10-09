@@ -1,0 +1,80 @@
+# purchase_sheet mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_pm_sheet_master —— 采购模块单据。
+# ⚠️ 采购单**不在** t_im_sheet_master(那是库存类:KB 扣补/OO 调整/JO 报损/KO 领用)。
+# 单据类型靠 trans_no 区分,前缀释义来自思迅字典表 t_sys_sheet_no:
+#   PI 采购收货单(业务上的"采购进货单")/ RO 采购退货单 / PO 采购订单 / WP 线上采购订单
+#
+# 实测(hbposv7): PI 10571 / RO 2074 / PO 223 / WP 241,时间跨度 2024-12 ~ 2026-10
+# 实测(ysx):     PI 24377 / RO 3562 / PO 211,               时间跨度 2021-09 ~ 2026-10
+# PI 行 supcust_no 实测全部非空(hbposv7 73 个供应商 / ysx 140 个)。
+version: 1
+model: purchase_sheet
+
+mappings:
+  - source: sheet_no
+    target: id
+    type: string
+
+  - source: supcust_no
+    target: supplier_id
+    type: string
+
+  - source: trans_no
+    target: document_type
+    type: string
+
+  - source: approve_flag
+    target: approve_status
+    type: string
+
+  - source: order_status
+    target: order_status
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: pay_way
+    target: pay_way
+    type: string
+
+  - source: coin_no
+    target: currency
+    type: string
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  - source: work_date
+    target: finished_at
+    type: datetime
+
+  - source: valid_date
+    target: valid_at
+    type: datetime
+
+  - source: oper_id
+    target: operator_id
+    type: string
+
+  - source: confirm_man
+    target: confirmer
+    type: string
+
+  - source: other1
+    target: remark
+    type: string
+
+  # ---- 金额(measure 用)----
+  - source: sheet_amt
+    target: amount
+    type: decimal
+    unit: yuan
+
+  - source: order_amt
+    target: order_amount
+    type: decimal
+    unit: yuan

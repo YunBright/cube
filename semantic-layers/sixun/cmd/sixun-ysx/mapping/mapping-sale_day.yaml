@@ -1,0 +1,77 @@
+# sale_day mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_rm_daysum —— **22 列在两个 family 逐列完全一致**(已逐列核对)。
+#
+# 为什么不用现有 config 里的 t_mp_saleflow / t_rm_order_saleflow:
+#   那两张表在**两个库里都是 0 行空表**,现有 sale_detail model 拉的是空数据。
+#   另两张明细表单边存在(hbposv7: t_rm_possale/t_rm_posflow;
+#   ysx: t_rm_saleflow 329 万行),表名完全不同,无法进共享 schema。
+#
+# 实测行数:hbposv7 598068 / ysx 1208328,两库 oper_date 都到当天。
+# ⚠️ oper_date 是 **char(10) 字符串** 'YYYY-MM-DD',不是 datetime —— 映射为 string,
+#    时间窗口用字符串比较。
+version: 1
+model: sale_day
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: supcust_no
+    target: supplier_id
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: oper_date
+    target: business_date
+    type: string
+
+  # ---- 数量 / 金额(measure 用)----
+  - source: sale_qty
+    target: sale_quantity
+    type: decimal
+
+  - source: ret_qty
+    target: return_quantity
+    type: decimal
+
+  - source: giv_qty
+    target: giveaway_quantity
+    type: decimal
+
+  - source: sale_amt
+    target: sale_amount
+    type: decimal
+    unit: yuan
+
+  - source: ret_amt
+    target: return_amount
+    type: decimal
+    unit: yuan
+
+  - source: giv_amt
+    target: giveaway_amount
+    type: decimal
+    unit: yuan
+
+  - source: sale_price
+    target: sale_price
+    type: decimal
+    unit: yuan
+
+  - source: cost_price
+    target: cost_price
+    type: decimal
+    unit: yuan
+
+  - source: sup_ly_rate
+    target: consignment_rate
+    type: decimal

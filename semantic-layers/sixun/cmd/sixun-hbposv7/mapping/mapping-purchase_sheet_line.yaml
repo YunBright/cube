@@ -1,0 +1,60 @@
+# purchase_sheet_line mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_pm_sheet_detail —— 采购单明细行(两库列名逐列一致)。
+# "采购量 vs 实际销售量"判据里**采购侧的唯一数据来源**。
+#
+# ⚠️ row_id 只有 hbposv7 有(ysx 14 列 vs hbposv7 13 列,差的是 row_id),
+#    共享 schema 只映射两边都有的列,故 id 用 flow_id。
+# ⚠️ 数量单位是"件/箱",而 sale_day 的销量是称重重量,两者**不可直接相除**。
+version: 1
+model: purchase_sheet_line
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: sheet_no
+    target: sheet_id
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: valid_date
+    target: valid_at
+    type: datetime
+
+  # ---- 数量 / 金额(measure 用)----
+  - source: order_qty
+    target: order_quantity
+    type: decimal
+
+  - source: real_qty
+    target: received_quantity
+    type: decimal
+
+  - source: large_qty
+    target: large_quantity
+    type: decimal
+
+  - source: orgi_price
+    target: origin_price
+    type: decimal
+    unit: yuan
+
+  - source: valid_price
+    target: valid_price
+    type: decimal
+    unit: yuan
+
+  - source: sub_amt
+    target: amount
+    type: decimal
+    unit: yuan
+
+  - source: tax
+    target: tax_amount
+    type: decimal
+    unit: yuan

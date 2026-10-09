@@ -83,6 +83,7 @@ func main() {
 	engine.POST("/register", h.Register)
 	engine.POST("/unregister", h.Unregister)
 	engine.POST("/v1/source/:source/load", h.SourceLoad)
+	engine.GET("/v1/source/:source/meta", h.SourceMeta)
 	engine.GET("/v1/sources", h.ListSources)
 	engine.GET("/healthz", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok", "app_id": "cube-gateway"})

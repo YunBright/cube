@@ -1,0 +1,167 @@
+# settlement model - 思迅家族共享 schema(供应商结款/结算单头)
+#
+# 源表:t_fm_recpay_gx_master(两个 family **同名同表**)
+#
+# ⚠️ 这是一张多态表:同一个物理表按 trans_no 装不同业务单据。
+#   解码依据是思迅自带的字典表 t_sys_sheet_no(sheet_id = 单号前缀):
+#     DP = 供应商对帐单   ← hbposv7 门店的结款单(实测 799 张)
+#     CP = 购销返利计算   ← ysx 门店的结款单(实测 4348 张)
+#     LY = 联营帐款       (实测 hbposv7 395 / ysx 62)
+#     RP = 客户结算单     (ysx 1502 张,挂 SO/RI 批发单,与采购无关)
+#
+#   ysx 库里 DP 为 0 张,两边的结款单都靠 document_type 维度区分,
+#   BI 层无需知道是哪个门店。
+#
+# ⚠️ 金额字段在两个 family 之间**角色对调**,mapping 侧已归一为 goods_amount:
+#     hbposv7: Goods_amt  = Σ明细行(PI+RO)货款
+#     ysx:     sheet_amt  = Σ明细行(PI+RO)货款(实测 4348/4348 张吻合)
+#     hbposv7 的 sheet_amt 恒为 0,**不可用**
+#   total_amount(源列 sum_amount)是两边同名的"本期应结总额":
+#     hbposv7 实测 = Goods + Buckle_up + Expenses + Rebate + payment_advance + other_amt(798/799 张自洽)
+#     ysx 该列额外含返利等系统项,方向未确认 —— AI 核对请用 goods_amount
+#
+# 金额**不做 dimension**:pkg/cubequery 对所有维度无条件套 RTRIM,
+# 数值维度会被转成字符串。要按单据取金额请带上 dimensions: [settlement.id]
+# (GROUP BY id 后 SUM 就是该单金额),这与 stock / product 现有约定一致。
+# storage: live —— **不落 DuckDB**,查询时由 cube app 实时编译成 T-SQL 打源库。
+#   cube 不做原始数据同步;sql_table 在 live 下无意义,真正的 FROM 来自
+#   各实例 config.yaml 的 table_settlement(源表名是 family 私有事实,不写进共享 schema)。
+#   透传时 schema 里的 canonical 列名经 mapping.yaml 反查成该 family 的源列名。
+#
+# 为什么必须 live:结算单是**实时新建**的。同步只在进程启动时跑一次,
+# 落盘的话当天新建的单据在下一次重启前根本查不到,审批流程直接不可用。
+name: settlement
+sql_table: settlement
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 结算单号
+    description: 源列 sheet_no。char 定长,hbposv7 尾部补空格、ysx 不补,查询层统一 RTRIM
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 供应商 ID
+    description: 源列 sup_no,join t_bd_supcust_info.supcust_no(实测两库 100% 命中)
+
+  - name: document_type
+    sql: document_type
+    type: string
+    title: 单据类型
+    description: 源列 trans_no。结款单只取 DP / CP;枚举值不做归一化,翻译见 enum_values
+    enum_values:
+      - { value: "DP", label: 供应商对帐单 }
+      - { value: "CP", label: 购销返利计算 }
+      - { value: "LY", label: 联营帐款 }
+      - { value: "RP", label: 客户结算单 }
+
+  - name: approve_status
+    sql: approve_status
+    type: string
+    title: 审核状态
+    description: 源列 approve_flag。审批流按这个筛未审核单
+    enum_values:
+      - { value: "0", label: 未审核 }
+      - { value: "1", label: 已审核 }
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no。实测两库都只有 1 个门店且值恒为 ALL,不可当分区键
+
+  - name: pay_way
+    sql: pay_way
+    type: string
+    title: 结算方式
+
+  - name: period_start
+    sql: period_start
+    type: time
+    title: 结算期起
+
+  - name: period_end
+    sql: period_end
+    type: time
+    title: 结算期止
+
+  - name: settled_at
+    sql: settled_at
+    type: time
+    title: 结算日期
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date
+
+  - name: finished_at
+    sql: finished_at
+    type: time
+    title: 审核完成时间
+    description: 源列 work_date
+
+  - name: operator_id
+    sql: operator_id
+    type: string
+    title: 制单人
+
+  - name: confirmer
+    sql: confirmer
+    type: string
+    title: 审核人
+    description: 源列 confirm_man
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 other1。实测装的是人工说明文本(如"商云管家做单"、"根据选择时间段,按照[..]")
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 结算单数
+
+  - name: total_goods_yuan
+    sql: "SUM(goods_amount)"
+    type: number
+    title: 货款合计(元)
+    format: "0.00"
+    description: 采购收货(PI)减退货(RO)净额。两个 family 均可 100% 由结算明细行复算
+
+  - name: total_settle_yuan
+    sql: "SUM(total_amount)"
+    type: number
+    title: 本期应结合计(元)
+    format: "0.00"
+    description: 含扣款/费用(hbposv7)或返利(ysx)。**口径两边不同,AI 判异常请用 total_goods_yuan**
+
+  - name: total_deduct_yuan
+    sql: "SUM(deduct_amount)"
+    type: number
+    title: 抵扣合计(元)
+    format: "0.00"
+
+  - name: total_paid_yuan
+    sql: "SUM(paid_amount)"
+    type: number
+    title: 已付合计(元)
+    format: "0.00"
+    description: 源列 get_amt。实测两库当前均为 0,预付款功能未启用
+
+joins:
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one
+
+  - name: settlement_line
+    sql: settlement_line
+    on: "{CUBE}.id = settlement_line.settlement_id"
+    relationship: one_to_many

@@ -1,0 +1,101 @@
+# settlement_line model - 思迅家族共享 schema(结算明细行)
+#
+# 源表:t_fm_recpay_detail(两个 family 同名同表)
+#
+# 这一行 = "结算单里被结算掉的一张源单据",是**结算单与采购进货/退货的显式外键**:
+#   sheet_no   结算单号 → settlement.id
+#   voucher_no 源单据号 → purchase_sheet.id(按前缀区分单据类型)
+#
+# 实测构成(hbposv7 19760 行):
+#   KB 扣补单 11930 / PI 采购收货 3973 / RO 采购退货 2668 / FG 费用单 818 / LY 联营 329
+# 实测构成(ysx 41532 行):
+#   PI 采购收货 24074 / RO 采购退货 3474 / LY 联营 51
+#
+# ⚠️ voucher_no **不一定是单号**:实测有 42 行是"账期内无采购"这种中文自由文本
+#   (hbposv7 的 CP 单上)。取源单据必须按 source_doc_type 过滤,不能当纯 ID 用。
+#
+# ⚠️ 联营供应商的结算单只挂 LY/FG 行,**没有 PI/RO** —— hbposv7 实测
+#   Goods_amt 等于 PI+RO 明细合计的只有 443/799 张,差的 356 张是联营单据。
+#   审批"逐个拆开核对采购进货"对联营单据不适用。
+name: settlement_line
+sql_table: settlement_line
+storage: live  # 不落 DuckDB,查询时实时透传源库(见 sixun-models/settlement/schema.yaml 顶部说明)
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 结算明细行 ID
+    description: 源列 flow_id
+
+  - name: settlement_id
+    sql: settlement_id
+    type: string
+    title: 结算单号
+    description: 源列 sheet_no,join settlement.id
+
+  - name: voucher_id
+    sql: voucher_id
+    type: string
+    title: 源单据号
+    description: 源列 voucher_no。可能是单号,也可能是自由文本,见 source_doc_type
+
+  - name: source_doc_type
+    sql: "LEFT(RTRIM(voucher_id), 2)"
+    type: string
+    title: 源单据类型
+    description: 从单号前缀截取。RTRIM 是必须的 —— hbposv7 的 char 列尾部补空格
+    enum_values:
+      - { value: "PI", label: 采购收货单 }
+      - { value: "RO", label: 采购退货单 }
+      - { value: "PO", label: 采购订单 }
+      - { value: "KB", label: 扣补单 }
+      - { value: "FG", label: 费用单 }
+      - { value: "LY", label: 联营帐款 }
+      - { value: "CP", label: 购销返利计算 }
+      - { value: "DP", label: 供应商对帐单 }
+
+  - name: currency
+    sql: currency
+    type: string
+    title: 币种
+    description: 源列 coin_no
+
+segments:
+  - name: purchase_only
+    sql: "LEFT(RTRIM(voucher_id), 2) IN ('PI','RO')"
+    title: 仅采购进货/退货行
+    description: 结算明细里属于采购的单据。**审批"逐个拆开核对采购进货"必须带上它** ——
+      实测 hbposv7 的结算明细 19760 行里只有 6641 行是 PI/RO,
+      其余是 KB 扣补 / FG 费用 / LY 联营;ysx 41532 行里 PI+RO 是 27548 行。
+      不加这个过滤,拆出来的"关联采购单"会是一堆查无此单的单号。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 明细行数
+
+  - name: total_amount_yuan
+    sql: "SUM(amount)"
+    type: number
+    title: 结算金额合计(元)
+    format: "0.00"
+
+  - name: total_goods_yuan
+    sql: "SUM(CASE WHEN LEFT(RTRIM(voucher_id), 2) IN ('PI','RO') THEN amount ELSE 0 END)"
+    type: number
+    title: 采购货款净额(元)
+    format: "0.00"
+    description: 只汇总采购收货/退货行。与 settlement.total_goods_yuan 对账用
+
+joins:
+  - name: settlement
+    sql: settlement
+    on: "{CUBE}.settlement_id = settlement.id"
+    relationship: many_to_one
+
+  - name: purchase_sheet
+    sql: purchase_sheet
+    on: "{CUBE}.voucher_id = purchase_sheet.id"
+    relationship: many_to_one

@@ -60,8 +60,13 @@ measures:
     title: 总金额(元)
     format: "0.00"
 
+  # ⚠️ 这里**不能**引用 order_status:hbposv7 配的 t_rm_order_saleflow 没有这一列,
+  #   引用它会让本 measure 在 hbposv7 上查询即报 column not found
+  #   (空表也会报错 —— SQL 解析阶段就失败,与行数无关)。
+  #   改用数量正负判断,与上面 order_status 维度的兜底分支保持同一口径:
+  #   ysx 的 t_mp_saleflow.order_status 取值 S/R,退货行数量为负。
   - name: net_amount_yuan
-    sql: "SUM(CASE WHEN order_status IN ('R', 'r') THEN -unit_price * quantity ELSE unit_price * quantity END)"
+    sql: "SUM(CASE WHEN quantity < 0 THEN -unit_price * quantity ELSE unit_price * quantity END)"
     type: number
     title: 净额(销售-退货)
     format: "0.00"

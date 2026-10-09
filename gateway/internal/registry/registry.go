@@ -87,10 +87,10 @@ type AppInfo struct {
 	AppID string `json:"app_id"`
 	// DaprAppID 是 dapr sidecar 的 app-id — gateway 调 dapr 时按它寻址。
 	// 默认 = AppID(1:1 兼容);cube app 一般报 "cube-" + AppID。
-	DaprAppID string `json:"dapr_app_id"`
+	DaprAppID    string    `json:"dapr_app_id"`
 	Family       string    `json:"family"`
 	Version      string    `json:"version"`
-	Source       string    `json:"source"`        // == AppID;冗余字段,方便 /v1/sources 直接返回
+	Source       string    `json:"source"` // == AppID;冗余字段,方便 /v1/sources 直接返回
 	Models       []string  `json:"models"`
 	Capabilities []string  `json:"capabilities"`
 	HealthURL    string    `json:"health_url,omitempty"`

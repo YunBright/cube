@@ -8,22 +8,47 @@ source:
   dsn: ""
 
   # 思迅云商x 真实表名(同思迅7pro 命名)
+  # 结算审批场景新增 5 个 model(2026-10-09):
+  #   settlement          结款/结算单头(本门店单据类型 = CP 购销返利计算,DP 为 0 张)
+  #   settlement_line     结算明细行(voucher_no = 源单据号)
+  #   purchase_sheet      采购单头(PI 采购收货单 / RO 采购退货单)
+  #   purchase_sheet_line 采购单明细行
+  #   sale_day            销售日汇总(注意:table_sale 指向的 t_mp_saleflow 实测 0 行)
   table_supplier: t_bd_supcust_info
   table_product:  t_bd_item_info
   table_category: t_bd_item_cls
-  table_sale:     t_mp_saleflow    # ysx 是 t_mp_saleflow(主表),hbposv7 是 t_rm_order_saleflow,可能不同
+  table_sale:     t_mp_saleflow    # ⚠️ 实测 0 行空表,历史配置,勿依赖
   table_stock:    t_im_branch_stock
 
-  # 拉取行数上限。上限过小会**静默**丢数据(没有报错,只是部分商品查不到),
-  # 历史上 connector 曾硬编码 TOP 10000,而 hbposv10 的 t_bd_item_info 实测 27299 行,
-  # 导致 63% 的商品永远扫不出来。商品表必须给足,行数不够时先确认是否需要分页,
-  # 不要靠调小上限掩盖。
-  row_limit: 10000
+  table_settlement:          t_fm_recpay_gx_master
+  table_settlement_line:     t_fm_recpay_detail
+  table_purchase_sheet:      t_pm_sheet_master
+  table_purchase_sheet_line: t_pm_sheet_detail
+  table_sale_day:            t_rm_daysum
+
+  # 拉取行数上限,**只对 storage: duck 的 model 生效**(supplier/product/category/sale_detail)。
+  # ⚠️ fetch 用的是 `SELECT TOP N * FROM t`(无 ORDER BY),截断丢的是随机行,
+  #    而且 healthz 全绿 —— 这就是历史上 TOP 10000 让 ysx 丢 63% 商品、
+  #    hbposv7 丢 77% 的原因。**每一项都必须高于实测行数。**
+  #
+  # 括号内为 2026-10-09 实测 COUNT(*):ysx / hbposv7
+  #
+  # ⚠️ 兜底值必须 >= source.DefaultRowLimit(50000),**不要为了"看起来省事"调小**。
+  # 它是"没在 row_limits 里列出的 model"用的,平时用不上,但一旦将来新增一个
+  # duck model 忘了加进 row_limits,写小的兜底值就会立刻静默丢数据;
+  # 写 50000 最多是"多拉了点",不会错。
+  row_limit: 50000
   row_limits:
-    # 实测 t_bd_item_info 27299 行 / t_im_branch_stock 23576 行 / t_mp_saleflow 视门店规模
-    product: 200000
-    stock:   200000
-    sale:    500000
+    product:  200000   # 27299 / 44313
+    supplier: 20000    # 218 / 300
+    category: 20000    # 186 / 596
+    sale:     500000
+
+  # ⚠️ 上面这些 row_limits **不再**需要为 settlement / settlement_line /
+  #    purchase_sheet / purchase_sheet_line / sale_day / stock 配置:
+  #    它们是 storage: live,**不落 DuckDB**,查询时实时透传源库,
+  #    返回行数由查询里的 limit 控制(上限见 pkg/cubequery 的 DefaultLimit)。
+  #    上面的 table_* 是它们**必需的**源表名,漏配则该 model 不可查询。
 
 storage:
   duckdb_path: ./data/sixun-ysx.duckdb

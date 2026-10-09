@@ -1,0 +1,93 @@
+# ysx settlement mapping
+#
+# 源表 t_fm_recpay_gx_master(多态,本门店结款单是 **CP** 购销返利计算,DP 为 0 张)
+#
+# ⚠️ family 差异(与 hbposv7 的唯一实质分歧):
+#   货款列在 ysx 是 **sheet_amt**;hbposv7 是 **Goods_amt**。
+#   实测 ysx sheet_amt = Σ结算明细行,4348/4348 张全部吻合。
+#   两边都映射到同一个 target:goods_amount,BI 层无感知。
+#
+# ⚠️ sum_amount 口径两边不同:
+#   hbposv7 = 货款 + 扣款 + 费用(hbposv7 门店无返利政策)
+#   ysx     = 该列额外含返利等系统项,71% 的单据里大于货款,方向未确认
+#   → AI 判"采购量是否异常"请用 goods_amount,别用 total_amount。
+version: 1
+model: settlement
+
+mappings:
+  - source: sheet_no
+    target: id
+    type: string
+
+  - source: sup_no
+    target: supplier_id
+    type: string
+
+  - source: trans_no
+    target: document_type
+    type: string
+
+  - source: approve_flag
+    target: approve_status
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: pay_way
+    target: pay_way
+    type: string
+
+  - source: start_date
+    target: period_start
+    type: datetime
+
+  - source: end_date
+    target: period_end
+    type: datetime
+
+  - source: settle_date
+    target: settled_at
+    type: datetime
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  - source: work_date
+    target: finished_at
+    type: datetime
+
+  - source: oper_id
+    target: operator_id
+    type: string
+
+  - source: confirm_man
+    target: confirmer
+    type: string
+
+  - source: other1
+    target: remark
+    type: string
+
+  # ---- 金额(不做 dimension,只做物理列 + measure)----
+  - source: sheet_amt     # 货款 = Σ明细行(PI+RO);hbposv7 此列叫 Goods_amt
+    target: goods_amount
+    type: decimal
+    unit: yuan
+
+  - source: sum_amount    # 本期应结;含返利,口径与 hbposv7 不同
+    target: total_amount
+    type: decimal
+    unit: yuan
+
+  - source: dct_amount
+    target: deduct_amount
+    type: decimal
+    unit: yuan
+
+  - source: get_amt       # 已付;实测当前恒为 0,预付款未启用
+    target: paid_amount
+    type: decimal
+    unit: yuan

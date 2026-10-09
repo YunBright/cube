@@ -13,8 +13,8 @@ import (
 
 // Cache 是 L1 缓存。
 type Cache struct {
-	mu       sync.RWMutex
-	entries  map[string]*entry
+	mu         sync.RWMutex
+	entries    map[string]*entry
 	defaultTTL time.Duration
 }
 

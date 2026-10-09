@@ -29,8 +29,8 @@ func TestRowLimitsPerRoleOverride(t *testing.T) {
 		t.Fatalf("product override = %d, want 200000", got)
 	}
 	// 覆盖只影响指定角色,其余角色保持默认
-	if got := rl.For(RoleStock); got != 10000 {
-		t.Fatalf("stock = %d, want default 10000", got)
+	if got := rl.For(RoleCategory); got != 10000 {
+		t.Fatalf("category = %d, want default 10000", got)
 	}
 	if got := rl.For(RoleSupplier); got != 10000 {
 		t.Fatalf("supplier = %d, want default 10000", got)
@@ -87,11 +87,11 @@ func TestDefaultRowLimitCoversRealTableSizes(t *testing.T) {
 func TestRowLimitsCanRelaxEachRoleIndependently(t *testing.T) {
 	const bigTable = 44313
 	rl := NewRowLimits(DefaultRowLimit, map[string]int{
-		RoleProduct: bigTable * 4,
-		RoleStock:   bigTable * 4,
-		RoleSale:    100000, // 流水表才是该单独限流的那个
+		RoleProduct:  bigTable * 4,
+		RoleCategory: bigTable * 4,
+		RoleSale:     100000, // 流水表才是该单独限流的那个
 	})
-	for _, role := range []string{RoleProduct, RoleStock} {
+	for _, role := range []string{RoleProduct, RoleCategory} {
 		if got := rl.For(role); got < bigTable {
 			t.Fatalf("%s 上限 %d < 维表实测 %d,仍会截断", role, got, bigTable)
 		}

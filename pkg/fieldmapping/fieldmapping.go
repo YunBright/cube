@@ -21,8 +21,8 @@ package fieldmapping
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -129,6 +129,26 @@ func (m *Mapper) Targets() []string {
 	return m.targets
 }
 
+// Resolve 实现 cubequery.ColumnResolver:canonical target 名 → 源库列名。
+//
+// 透传路径必须**反向**查表 —— schema 里写的是 family 无关的 canonical 名
+// (如 goods_amount),而源库里的实际列名是 family 私有的
+// (hbposv7 = Goods_amt,ysx = sheet_amt)。
+// mapping.yaml 是这个差异唯一该出现的地方,schema 保持共享。
+//
+// 未映射的 target 返回 ok=false,调用方应保留原标识符(SQL 关键字、
+// 字面量、以及 schema 里直接写表达式常量的情况)。
+func (m *Mapper) Resolve(target string) (string, bool) {
+	if m == nil {
+		return target, false
+	}
+	def, ok := m.byTarget[target]
+	if !ok || def.Source == "" {
+		return target, false
+	}
+	return def.Source, true
+}
+
 // TargetsWithType 返回所有 target 字段及其类型(用于 DuckDB 建表)。
 func (m *Mapper) TargetsWithType() []FieldDef {
 	out := make([]FieldDef, 0, len(m.targets))
@@ -158,7 +178,7 @@ func (m *Mapper) Spec() *Spec { return m.spec }
 //
 // 用法:
 //
-//	l, err := fieldmapping.NewLoader("./mappings")
+//	l, err := fieldmapping.NewLoaderFS(mappingFS)   // go:embed 出来的 fs.FS
 //	if err != nil { ... }
 //	mapper, ok := l.Get("supplier")
 //	if !ok { ... }
@@ -167,12 +187,16 @@ type Loader struct {
 	byModel map[string]*Mapper
 }
 
-// NewLoader 加载目录下所有 mapping-*.yaml。
-func NewLoader(dir string) (*Loader, error) {
+// NewLoaderFS 加载 fsys 根目录下所有 mapping-*.yaml。
+//
+// 走 fs.FS 而不是磁盘路径,是为了让生产二进制用 go:embed 携带 mapping
+// (部署只推一个二进制),同时让测试 / 本地 dev 仍能用 os.DirFS 读仓库内的文件。
+// 两种来源共用这一份实现,不存在"嵌入版和磁盘版语义不同"的分叉。
+func NewLoaderFS(fsys fs.FS) (*Loader, error) {
 	l := &Loader{byModel: map[string]*Mapper{}}
-	entries, err := os.ReadDir(dir)
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
-		return nil, fmt.Errorf("fieldmapping: read dir %s: %w", dir, err)
+		return nil, fmt.Errorf("fieldmapping: read mappings dir: %w", err)
 	}
 	for _, e := range entries {
 		if e.IsDir() {
@@ -185,7 +209,7 @@ func NewLoader(dir string) (*Loader, error) {
 			continue
 		}
 		model := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ext)
-		data, err := os.ReadFile(filepath.Join(dir, name))
+		data, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return nil, fmt.Errorf("fieldmapping: read %s: %w", name, err)
 		}
@@ -194,6 +218,18 @@ func NewLoader(dir string) (*Loader, error) {
 			return nil, fmt.Errorf("fieldmapping: load %s: %w", name, err)
 		}
 		l.byModel[model] = mapper
+	}
+	return l, nil
+}
+
+// NewLoader 从磁盘目录加载所有 mapping-*.yaml(测试 / 本地 dev 用)。
+//
+// 生产路径请用 NewLoaderFS + go:embed:目录路径在打包机/容器/远端都可能对不上,
+// 而"路径没对上"是静默失败 —— 加载到一个 mapping 都不报错,查询时才炸。
+func NewLoader(dir string) (*Loader, error) {
+	l, err := NewLoaderFS(os.DirFS(dir))
+	if err != nil {
+		return nil, fmt.Errorf("fieldmapping: dir %s: %w", dir, err)
 	}
 	return l, nil
 }

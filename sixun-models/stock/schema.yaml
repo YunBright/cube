@@ -3,8 +3,14 @@
 # t_im_branch_stock 是 (item_no, branch_no) 复合主键:
 #   - 每行 = 某分店某商品的当前库存
 #   - stock_qty 已含所有采购/销售/调整/退货的累计结果
+#
+# storage: live —— **不落 DuckDB**(2026-10-09 改为透传):
+#   库存数量每次收货/销售都在变,落盘快照本身就是过期数据,
+#   盘点读到的账面数量会是旧值。cube 不做原始数据同步。
+#   sql_table 在 live 下无意义,真正的 FROM 来自 config.yaml 的 table_stock。
 name: stock
 sql_table: stock
+storage: live
 
 dimensions:
   - name: product_id

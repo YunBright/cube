@@ -13,25 +13,25 @@ import (
 
 // Connector 实现 source.Connector,接思迅云商x DB。
 type Connector struct {
-	db             *sql.DB
-	tableSupplier  string
-	tableProduct   string
-	tableCategory  string
-	tableSale      string
-	tableStock     string
-	rowLimits      *source.RowLimits
+	// legacyTSQL	true = 目标实例是 SQL Server 2008 及更早(见 internal/source/legacy.go)
+	legacyTSQL    bool
+	db            *sql.DB
+	tableSupplier string
+	tableProduct  string
+	tableCategory string
+	tableSale     string
+	rowLimits     *source.RowLimits
 }
 
 // Options 构造参数。
 type Options struct {
-	DSN            string
-	TableSupplier  string
-	TableProduct   string
-	TableCategory  string
-	TableSale      string
-	TableStock     string
+	DSN           string
+	TableSupplier string
+	TableProduct  string
+	TableCategory string
+	TableSale     string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
-	RowLimits      *source.RowLimits
+	RowLimits *source.RowLimits
 }
 
 // New 构造 Connector,做 ping 校验 DSN 通。
@@ -44,14 +44,22 @@ func New(opts Options) (*Connector, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("ysx: ping db: %w", err)
 	}
+
+	// 探测 SQL Server 版本:hbposv7 实测是 2008(compat 80),不支持
+	// DATEFROMPARTS / OFFSET-FETCH;ysx 是 2014,都支持。能力问数据库,
+	// 不靠配置 —— 配置迟早会被复制到另一个实例上而忘了改。
+	legacy, probeErr := source.DetectLegacyTSQL(context.Background(), db)
+	if probeErr != nil {
+		legacy = true // 探测失败保守处理:老方言在任何版本都能跑
+	}
 	return &Connector{
-		db:             db,
-		tableSupplier:  opts.TableSupplier,
-		tableProduct:   opts.TableProduct,
-		tableCategory:  opts.TableCategory,
-		tableSale:      opts.TableSale,
-		tableStock:     opts.TableStock,
-		rowLimits:      opts.RowLimits,
+		db:            db,
+		legacyTSQL:    legacy,
+		tableSupplier: opts.TableSupplier,
+		tableProduct:  opts.TableProduct,
+		tableCategory: opts.TableCategory,
+		tableSale:     opts.TableSale,
+		rowLimits:     opts.RowLimits,
 	}, nil
 }
 
@@ -87,12 +95,25 @@ func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, erro
 	return c.fetchTable(ctx, c.tableSale, source.RoleSale)
 }
 
-// FetchStock 拉库存数据。
-func (c *Connector) FetchStock(ctx context.Context) ([]map[string]any, error) {
-	if c.tableStock == "" {
-		return nil, fmt.Errorf("ysx: table_stock not configured")
+// QueryLive 把只读 SQL 直接发给源库(storage: live 的 model 用)。
+//
+// live 的 model: settlement / settlement_line / purchase_sheet /
+// purchase_sheet_line / sale_day / stock —— cube 不做原始数据同步,
+// 它们没有 Fetch* 方法,只在查询时经这条路实时打源库。
+// LegacyTSQL 报告目标实例是否为 SQL Server 2008 及更早。
+// 供编译器选择日期截断与分页写法(DATEFROMPARTS / OFFSET-FETCH 都是 2012+)。
+func (c *Connector) LegacyTSQL() bool { return c.legacyTSQL }
+
+func (c *Connector) QueryLive(ctx context.Context, query string, args ...any) ([]map[string]any, error) {
+	// 源库是生产库:只读校验放在这里,而不仅依赖"编译器不生成写语句"。
+	if err := source.AssertReadOnly(query); err != nil {
+		return nil, fmt.Errorf("ysx: %w", err)
 	}
-	return c.fetchTable(ctx, c.tableStock, source.RoleStock)
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("ysx: live query: %w", err)
+	}
+	return source.ScanRows(rows)
 }
 
 // Close 关闭连接。

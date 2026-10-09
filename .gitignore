@@ -26,6 +26,21 @@
 config.yaml
 !config.example.yaml
 !/dapr/configuration/config.yaml
+
+# 本地验证用的配置覆盖文件(装 DSN / ssh 隧道端口,绝不能进版本库)
+# 注意上面的 `config.yaml` 是精确文件名匹配,**不会**顺带匹配到本文件,
+# 所以这里必须显式列一条。漏了就等于把源库口令提交上去。
+#
+# 用途与优先级见 semantic-layers/sixun/internal/appcfg:
+#   config.local.yaml 存在时优先于 config.yaml(app + sqlcheck + sqlq 都一样)。
+#   典型场景:连真实源库跑 sqlcheck 时,把 DSN 指到本机 ssh 隧道端口,
+#   而不动那份会被 goreleaser 打进归档、部署到服务器的 config.yaml。
+#
+# 它**不会**被打包进归档(见 .goreleaser.yaml),也不该留在服务器上 ——
+# deploy-cube.ps1 -Step prune 会删掉远端的同名文件。
+config.local.yaml
+!config.local.example.yaml
+
 .env
 .env.local
 

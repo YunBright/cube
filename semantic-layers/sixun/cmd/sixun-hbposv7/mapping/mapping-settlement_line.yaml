@@ -1,0 +1,47 @@
+# settlement_line mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_fm_recpay_detail —— 结算单里被结算掉的每一张源单据。
+# 这就是"逐个拆开结算单"的落点:voucher_id 是结算单与采购进货/退货的显式外键。
+#
+# ⚠️ 实测构成:
+#   hbposv7: KB 扣补 11930 / PI 进货 3973 / RO 退货 2668 / FG 费用 818 / LY 联营 329 / 文本 42
+#   ysx:     PI 进货 24074 / RO 退货 3474 / LY 联营 51
+# ⚠️ voucher_no **可能是自由文本**(实测有 "账期内无采购"),按 source_doc_type 过滤再用。
+#
+# 两个 family 共有 14 列(hbposv7 另有 already_amt/notpaid/pay_amt/sale_amt/row_id,
+# ysx 没有,故不映射 —— 共享 schema 必须两边都有的列)。
+version: 1
+model: settlement_line
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: sheet_no
+    target: settlement_id
+    type: string
+
+  - source: voucher_no
+    target: voucher_id
+    type: string
+
+  - source: coin_no
+    target: currency
+    type: string
+
+  # ---- 金额(measure 用)----
+  - source: sheet_amt
+    target: amount
+    type: decimal
+    unit: yuan
+
+  - source: sheet_amt_native
+    target: native_amount
+    type: decimal
+    unit: yuan
+
+  - source: other_amt
+    target: other_amount
+    type: decimal
+    unit: yuan

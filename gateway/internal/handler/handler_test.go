@@ -33,11 +33,11 @@ import (
 // fakeDapr 实现 daprclient.Client,每个方法都有可注入的回调。
 // 通过 invokeFn 控制 InvokeMethod 的返回;state 用来验证 SaveState。
 type fakeDapr struct {
-	invokeFn func(ctx context.Context, target, method string, data []byte, extra map[string]string) ([]byte, error)
-	invokeCount int32 // 原子,统计 invoke 次数
-	state    map[string][]byte
-	saveErr  error
-	deleteErr error
+	invokeFn     func(ctx context.Context, target, method string, data []byte, extra map[string]string) ([]byte, error)
+	invokeCount  int32 // 原子,统计 invoke 次数
+	state        map[string][]byte
+	saveErr      error
+	deleteErr    error
 	deleteCalled atomic.Bool // 记录 DeleteState 是否被调过
 }
 
@@ -86,9 +86,9 @@ func (f *fakeDapr) Close() error { return nil }
 
 // apiErr 用于解码错误响应。
 type apiErr struct {
-	Code    apierror.Code   `json:"code"`
-	Message string          `json:"message"`
-	Details map[string]any  `json:"details"`
+	Code    apierror.Code  `json:"code"`
+	Message string         `json:"message"`
+	Details map[string]any `json:"details"`
 }
 
 func decodeError(t *testing.T, body io.Reader) apiErr {

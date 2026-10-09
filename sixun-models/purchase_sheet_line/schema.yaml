@@ -1,0 +1,85 @@
+# purchase_sheet_line model - 思迅家族共享 schema(采购单明细行)
+#
+# 源表:t_pm_sheet_detail(两个 family 同名同表,列名逐列一致)
+#
+# 这是"采购量 vs 实际销售量"判据里**采购侧**的唯一数据来源。
+# hbposv7 实测 112999 行 / ysx 侧同结构。
+#
+# ⚠️ 数量口径不可比(本次勘察最重要的一条结论):
+#   本表数量列是"件/箱"等采购单位,而 t_rm_daysum.sale_qty 实测出现
+#   2.2472 / 1.2752 这类小数 —— 门店大量称重商品,销售量单位是**重量**。
+#   两者直接相除会差一个数量级。必须先按 product.unit 与
+#   purchase_spec / shipment_spec 做规格换算,否则异常判定全是噪音。
+name: purchase_sheet_line
+sql_table: purchase_sheet_line
+storage: live  # 不落 DuckDB:明细随收货实时增加(见 settlement/schema.yaml 顶部说明)
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 明细行 ID
+    description: 源列 flow_id。两个 family 都有;hbposv7 另有 row_id 但 ysx 没有,故不映射
+
+  - name: sheet_id
+    sql: sheet_id
+    type: string
+    title: 单据号
+    description: 源列 sheet_no,join purchase_sheet.id
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品 ID
+    description: 源列 item_no。char(20),hbposv7 尾部补空格、ysx 不补
+
+  - name: valid_at
+    sql: valid_at
+    type: time
+    title: 生效日期
+    description: 源列 valid_date
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 明细行数
+
+  - name: total_amount_yuan
+    sql: "SUM(amount)"
+    type: number
+    title: 明细金额合计(元)
+    format: "0.00"
+    description: 源列 sub_amt。实测 572.4000 = 50 × 11.4480,与单价×数量自洽
+
+  - name: total_received_quantity
+    sql: "SUM(received_quantity)"
+    type: number
+    title: 实收数量合计
+    format: "0.00"
+    description: 源列 real_qty。退货单(RO)为负向冲减时该值同样为负,相减即净额
+
+  - name: total_order_quantity
+    sql: "SUM(order_quantity)"
+    type: number
+    title: 订货数量合计
+    format: "0.00"
+    description: 源列 order_qty
+
+  - name: avg_valid_price_yuan
+    sql: "AVG(valid_price)"
+    type: number
+    title: 平均有效单价(元)
+    format: "0.00"
+    description: 源列 valid_price(已含税折算),origin_price 是原始单价
+
+joins:
+  - name: purchase_sheet
+    sql: purchase_sheet
+    on: "{CUBE}.sheet_id = purchase_sheet.id"
+    relationship: many_to_one
+
+  - name: product
+    sql: product
+    on: "{CUBE}.product_id = product.id"
+    relationship: many_to_one
