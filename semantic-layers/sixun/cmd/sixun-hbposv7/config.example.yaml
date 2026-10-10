@@ -60,6 +60,40 @@ source:
 storage:
   duckdb_path: ./data/sixun-hbposv7.duckdb
 
+# 刷新策略:增量为主 + 夜间全量校准
+#
+# 实测依据(2026-10-10):
+#   t_bd_item_info  44316 行,最近 7 天改动 49 行。
+#   改造前是"每 30 分钟全量重拉 44316 行",为每天约 10 行的变化付全表扫描的代价。
+refresh:
+  # model 名 → **源库侧**的增量时间列名。
+  # 未列出的 model 自动走全量(category 无时间列;sale_detail 指向的表实测 0 行)。
+  incremental:
+    product:  modify_date
+    supplier: modify_date
+
+  # ==================== 增量回退列 ====================
+  # **本库故意不配 incremental_fallback** —— 配了也没有任何效果。
+  #
+  # 2026-10-10 真库实测:
+  #   modify_date 为 NULL 的 12607 行商品,**build_date 也全部为 NULL**
+  #   (查 `modify_date IS NULL AND build_date IS NOT NULL` 返回 0 行)。
+  #   所以 `COALESCE(modify_date, build_date)` 与只用 modify_date 结果完全一样:
+  #     30 天窗口 209 → 209 行,一行不多。
+  #   本库 61% 的商品(27151 行)build_date 就是空的。
+  #
+  # 不为零收益的配置增加复杂度 —— ysx 那边配了,那边确实多覆盖 34%。
+  #
+  # ⚠️ 无论配不配,**夜间全量校准都不可省**:那 12607 行(占全部商品 28%)
+  #    两个时间列都是 NULL,任何基于时间列的增量都永远拉不到它们。
+
+  # 夜间全量校准,6 字段 cron(秒 分 时 日 月 周)= 每天 03:00:00。
+  # ⚠️ 必须写满 6 个字段:2026-10-10 真机实测,写 5 字段("0 3 * * *")
+  #    会被 Dapr 直接拒绝(HTTP 500: expected exactly 6 fields, found 5),
+  #    而主 job 不受影响、mode 照样是 dapr-job —— 于是"夜间校准没了"
+  #    会被 healthz 的整体健康掩盖,增量漏的数据永远没有兜底。
+  full_schedule: "0 0 3 * * *"
+
 gateway:
   app_id: cube-gateway
   # 注册地址(dev:sidecar 自动解析 app_id → host:port)

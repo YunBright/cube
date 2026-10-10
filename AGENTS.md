@@ -69,6 +69,13 @@ cube/
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
 | 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.Build`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
 | 拉取行数上限 | **`DefaultRowLimit = 50000`,必须高于所有维表实测行数**;按角色在 `config.yaml` 的 `source.row_limits` 覆盖 | ❌ 设成小于实测行数的值(曾硬编码 `TOP 10000` → ysx 丢 63% 商品、hbposv7 丢 77%、**库存表丢 57%**,零报错) |
+| 刷新模式 | **方案 D:增量为主 + 夜间 3 点全量校准**。两个 dapr job:主 `cube-refresh`(`@every 30m`,增量)、校准 `cube-refresh-full`(`0 0 3 * * *`,全量)。实测 30 天变更量:ysx product 410/27304(1.5%)、hbposv7 209/44316(0.5%) | ❌ 每 30 分钟全量重拉 2.7~4.4 万行、❌ 把校准 job 失败与主 job 混成一个 mode(丢掉一层保险换另一层缺失) |
+| 增量水位 | **取源库时间 `GETDATE()`**(`SourceNow` 在 `FetchSince` **之前**读),**全程字符串**(ODBC style 121 `2006-01-02 15:04:05.000`),比较用 `>=` 且 `CAST(@p1 AS datetime)`;水位**只在 Build 成功后推进**,全量成功后也推进 | ❌ 用本地时钟取水位、❌ 用 `time.Time` 往返(无时区 datetime ±8h 偏移)、❌ 用 `>`(边界变更永久丢失)、❌ 占位符写 `?`(go-mssqldb **原样**发给 SQL Server → 报 102 语法错误)、❌ 先拉后读源库时间(把拉取耗时算进已处理区间) |
+| 增量回退列 | **`COALESCE(modify_date, build_date)`**,配在 `config.yaml` 的 `refresh.incremental_fallback`(源库列名)。语义:`modify_date IS NULL` = "**建档后从未被修改过**",那 `build_date` 就是它最后一次被写入的时间。实测 ysx 按 `build_date >= DATEADD(day,-7,GETDATE())` 筛出的 45 个近 7 天新建商品里 **36 个(80%)modify_date 是 NULL**,30 天窗口 410→549(**+34%**),多覆盖的正是最该拉到的新增商品。实测 `modify_date < build_date` 的行数为 0(两库皆然),不引入时间倒流;代价是让两列索引都失效,约 2~3 ms/次 | ❌ 把它当成夜间全量的替代品 —— hbposv7 有 **12607 行商品两个时间列同时为 NULL**(占 28%),任何基于时间列的增量都永远拉不到它们,全量校准仍是唯一兜底;❌ 给 hbposv7 也配上(实测该库 12607 行 modify_date 为 NULL 的商品 build_date **也全部为 NULL**,COALESCE 30 天窗口 209→209 零收益);❌ `COALESCE` 参数写反(写反后 SQL 照样能跑、结果看着正常,只是语义反了);❌ 只校验主列不校验回退列(回退列同样是拼进 SQL 的注入入口) |
+| 增量空结果 vs 全量空结果 | 语义**刻意相反**:增量拉回 0 行 → **不动表**;全量拉回 0 行 → **清表** | ❌ 统一成一种(增量清表 = 早上所有商品查不到,零报错) |
+| cron 表达式 | **Dapr job 的 cron 严格 6 字段(秒 分 时 日 月 周)**。2026-10-10 真机实测:`"0 3 * * *"` → HTTP 500 `expected exactly 6 fields, found 5`;`"0 0 3 * * *"` → 204 | ❌ 写 5 字段(**启动不失败、主 job 正常、mode 照样 dapr-job,只有夜间校准静默消失**,增量漏的数据永远没兜底)。`refreshschedule.validateSchedule` 在登记前拦一道 |
+| 增量开关配置位置 | 增量列在 **`config.yaml` 的 `refresh.incremental`**(源库列名),主键在 **schema.yaml 的 `primary_key`**(canonical 名)。两者职责分离,且两个 family 的 config 独立 | ❌ 写进 mapping.yaml(那只是字段映射)、❌ 两个 family 漏改一个 |
+| 启动首次加载 | **启动必须走全量**(三个理由:首次无水位、水位表可能与 `_raw` 不同步导致超前=永久跳过、部署后应立刻有完整数据);无水位时增量会**自动 bootstrap 全量**并写回水位 | ❌ 启动直接走增量(超前水位 = 永久丢数据) |
 | char 补空格 | 在**查询层**统一 `RTRIM`(SELECT 与 filter 两侧都包,GROUP BY 用裸列),已固化在 `pkg/cubequery` | ❌ 加载层 trim、❌ 调用方 LIKE/trim 兜底 |
 | 存储分层 | schema.yaml 里 `storage: live` = **透传源库不落盘**,`storage: duck` = 物化进 DuckDB。**明细/实时(settlement、settlement_line、purchase_sheet(_line)、sale_day、stock)走 live;product / supplier / category / sale_detail 留 duck** | ❌ cube 做原始数据同步、❌ 把明细灌进 DuckDB(cube 只存聚合结果 + 枚举/档案) |
 | live 表名来源 | live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
@@ -129,6 +136,18 @@ cube/
 - [ ] 共享 schema(`sixun-models/`)的改动 → **所有 family 的 mapping 都同步改了**
 - [ ] 新增 `storage: live` 的 model → **每个部署实例的 `config.yaml` 都补了 `table_<model>`**,
       并已重启验证(缺表名会在启动期报错,不是运行期静默空结果)
+- [ ] 碰过增量刷新(`refresh.incremental` / 水位 / 校准 job)→ **`go run ./cmd/incrementalcheck -family <f>`
+      在真机上跑过**(本机 libduckdb 加载失败,DuckDB 集成测试全 SKIP —— **skip 不是通过**),
+      且 **healthz 的 `jobs` 段里 `cube-refresh` 与 `cube-refresh-full` 都是 `registered: true`**
+      (校准 job 挂掉不会让 mode 变 ticker,只会在这一段里体现)
+- [ ] 碰过 `refresh.full_schedule` → **写满 6 字段**(秒 分 时 日 月 周),
+      `refreshschedule_test.go` 的 `TestDefaultFullSchedule*` 与
+      `cmd/sixun-*/config_test.go` 的 `TestDeployedFullScheduleIsSixFieldCron` 都绿
+- [ ] 碰过增量**回退列**(`refresh.incremental_fallback` / `COALESCE`)→ 写进注释的实测
+      数字都能在源库上复现(`modify_date IS NULL` 的行数、`both-NULL` 的行数、
+      `modify_date < build_date` 的行数),且 `incremental_test.go` 的
+      `TestIncrementalSelectWithFallbackUsesCoalesce` 与
+      `cmd/sixun-ysx/config_test.go` 的 `TestDeployedIncrementalFallbackCoversNewItems` 都绿
 - [ ] 改过 `pkg/cubequery` 的 SQL 构造 → **已对两个生产源库各跑一遍真实执行**
       (`go run ./cmd/sqlcheck -config <config.yaml> -family ysx|hbposv7`)。
       单测只比对 SQL 字符串,**不执行**,所以 2008 R2 语法错、JOIN 用错物理表名这类 bug

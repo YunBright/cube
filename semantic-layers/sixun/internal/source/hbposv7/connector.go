@@ -101,6 +101,43 @@ func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, erro
 	return c.fetchTable(ctx, c.tableSale, source.RoleSale)
 }
 
+// duckTarget 把 model 名映射到 (源库表名, 行数角色)。
+//
+// 与 ysx 的同名方法逐字一致 —— 两个 family 的 Connector 结构相同,
+// 增量 SQL 构造共用 source.FetchSince,这里只做 model→表 的映射。
+// 复制粘贴时若某个 family 漏了这个方法,它会变成"编译不过"而不是
+// "静默只支持全量"。
+func (c *Connector) duckTarget(model string) (table, role string, ok bool) {
+	switch model {
+	case "product":
+		return c.tableProduct, source.RoleProduct, true
+	case "supplier":
+		return c.tableSupplier, source.RoleSupplier, true
+	case "category":
+		return c.tableCategory, source.RoleCategory, true
+	case "sale_detail":
+		return c.tableSale, source.RoleSale, true
+	}
+	return "", "", false
+}
+
+// FetchSince 增量拉取(见 source.FetchSince 的时区与边界说明)。
+func (c *Connector) FetchSince(ctx context.Context, model string, cols source.IncrementalCols, since string) ([]map[string]any, error) {
+	table, role, ok := c.duckTarget(model)
+	if !ok {
+		return nil, fmt.Errorf("hbposv7: 未知 model %q,无法增量拉取", model)
+	}
+	if table == "" {
+		return nil, fmt.Errorf("hbposv7: model %s 的 table_* 未配置", model)
+	}
+	return source.FetchSince(ctx, c.db, table, cols, since, c.rowLimits.For(role))
+}
+
+// SourceNow 返回源库当前时间作为增量水位。
+func (c *Connector) SourceNow(ctx context.Context) (string, error) {
+	return source.SourceNow(ctx, c.db)
+}
+
 // FetchStock 拉库存数据。
 // QueryLive 把只读 SQL 直接发给源库(storage: live 的 model 用)。
 //

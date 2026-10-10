@@ -35,6 +35,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -93,6 +94,44 @@ type appConfig struct {
 		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
 		RowLimits map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
+
+	// Refresh 是刷新策略(增量为主 + 夜间全量校准)。
+	Refresh struct {
+		// Incremental 是 model 名 → **源库侧**的增量时间列名(如 modify_date)。
+		// 未列出的 model 自动走全量。留空 = 全部全量(安全退路)。
+		Incremental map[string]string `yaml:"incremental"`
+		// IncrementalFallback 是 model 名 → 增量时间**回退列**(如 build_date),
+		// 拼成 `COALESCE(<incremental>, <fallback>) >= 水位`。
+		//
+		// 为什么需要:modify_date 为 NULL 意味着"建档后从未被修改过",那这条
+		// 记录最后一次被写入的时间就是 build_date。
+		//
+		// 留空 = 退化成单列比较,行为与配置前完全一致。
+		// ⚠️ 它**不能替代夜间全量校准**:本库有 12607 行商品(占全部商品 28%)
+		//    的 modify_date 与 build_date **同时为 NULL**,那些行任何增量列
+		//    都拉不到 —— 夜间全量是它们唯一的兜底。
+		IncrementalFallback map[string]string `yaml:"incremental_fallback"`
+		// FullSchedule 是夜间全量校准的调度式,交给 Dapr 原样解析。
+		// 默认 "0 0 3 * * *"(6 字段 cron,每天 03:00:00)。
+		//
+		// ⚠️ 必须 6 个字段:2026-10-10 真机实测,5 字段会被 Dapr 拒绝
+		//    (HTTP 500: expected exactly 6 fields),而**启动不会因此失败**——
+		//    主 job 不受影响、mode 照样 dapr-job,只是夜间校准再也不会发生,
+		//    增量漏掉的数据永远没有兜底。refreshschedule.validateSchedule 会在
+		//    登记前拦一道,让这件事至少变成一条明确的启动日志。
+		//
+		// 为什么不用 "@every 24h":那是"从登记那一刻起每 24 小时",
+		// 进程重启就漂移,永远对不上"夜间 3 点"这个语义。
+		FullSchedule string `yaml:"full_schedule"`
+	} `yaml:"refresh"`
+}
+
+// fullSchedule 返回全量校准的调度式,未配置时给默认的每日 3 点。
+func (c appConfig) fullSchedule() string {
+	if s := strings.TrimSpace(c.Refresh.FullSchedule); s != "" {
+		return s
+	}
+	return refreshschedule.DefaultFullSchedule
 }
 
 // schemaMeta 是 dataloader.Meta 的本地别名 —— 真正的定义在共用包里,
@@ -242,10 +281,17 @@ func main() {
 	// fresh 记录每次物化的成败,喂给 /healthz。
 	// duck model 是快照,不是实时透传 —— 所以"这份数据有多旧"是必须能被外部看见的事实。
 	fresh := freshness.New(cfg.RefreshInterval())
-	reload := func() []string {
-		return dataloader.Load(ctx, db, schemas, specs, lg, fresh)
-	}
-	registeredModels := reload()
+
+	// ⚠️ 变量名不能叫 loader:本文件已有一个 fieldmapping.Loader。
+	incrCols := source.IncrColsFromConfig(appCfg.Refresh.Incremental, appCfg.Refresh.IncrementalFallback)
+	dl := dataloader.NewLoader(db, schemas, specs, conn, incrCols, lg, fresh)
+	incrementalReload := func() []string { return dl.Run(ctx, dataloader.ModeIncremental) }
+	fullReload := func() []string { return dl.Run(ctx, dataloader.ModeFull) }
+
+	// ⚠️ 启动必须走**全量**:首次运行没有水位表;水位表与 _raw 表可能不同步
+	// (水位超前 = 那段时间的变更被永久跳过);部署后应立刻拿到完整数据。
+	// 全量成功后会顺带推进水位,后续增量才是快的那个。
+	registeredModels := fullReload()
 
 	// live model 不拉数据,但必须注册:它们是可查询的 model。
 	for name, m := range schemas {
@@ -258,9 +304,29 @@ func main() {
 
 	// 定时刷新:dapr Scheduler 优先,登记失败自动回退进程内 ticker。
 	// 两种模式同时可用 —— 在途守卫保证不会重叠写 DuckDB。
-	sched := refreshschedule.Setup(ctx, cfg.SidecarHTTPURL, cfg.RefreshInterval(), reload, lg)
-	sched.Start(ctx, cfg.RefreshInterval(), lg)
-	lg.Info("refresh driver ready", "mode", string(sched.Mode()))
+	//
+	// 两个 job:主 job(增量,@every)决定 mode 与 ticker;
+	// 校准 job(夜间 cron)登记失败只影响"定期校准"这一层保险,
+	// 会在 healthz 的 jobs 段报告,不该把整个刷新退化成 ticker。
+	jobs := []refreshschedule.JobSpec{
+		{
+			Name:     refreshschedule.DefaultJobName,
+			Schedule: "@every " + cfg.RefreshInterval().String(),
+			Reload:   incrementalReload,
+			Fallback: true,
+		},
+		{
+			Name:     refreshschedule.DefaultFullJobName,
+			Schedule: appCfg.fullSchedule(),
+			Reload:   fullReload,
+		},
+	}
+	sched := refreshschedule.Setup(ctx, cfg.SidecarHTTPURL, jobs, lg)
+	sched.Start(ctx, lg)
+	lg.Info("refresh driver ready",
+		"mode", string(sched.Mode()),
+		"incremental_models", len(appCfg.Refresh.Incremental),
+		"full_schedule", appCfg.fullSchedule())
 
 	// 8. 注册到 gateway
 	go registerToGateway(cfg, registeredModels, lg)

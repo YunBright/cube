@@ -95,6 +95,42 @@ func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, erro
 	return c.fetchTable(ctx, c.tableSale, source.RoleSale)
 }
 
+// duckTarget 把 model 名映射到 (源库表名, 行数角色)。
+//
+// 增量刷新按 model 名调用,而不是让调用方传表名 —— 表名是 family 私有事实
+// (来自 config.yaml 的 table_*),调用方知道它就等于把配置泄漏进了 dataloader,
+// 而 dataloader 是两个 family 共用的。
+func (c *Connector) duckTarget(model string) (table, role string, ok bool) {
+	switch model {
+	case "product":
+		return c.tableProduct, source.RoleProduct, true
+	case "supplier":
+		return c.tableSupplier, source.RoleSupplier, true
+	case "category":
+		return c.tableCategory, source.RoleCategory, true
+	case "sale_detail":
+		return c.tableSale, source.RoleSale, true
+	}
+	return "", "", false
+}
+
+// FetchSince 增量拉取(见 source.FetchSince 的时区与边界说明)。
+func (c *Connector) FetchSince(ctx context.Context, model string, cols source.IncrementalCols, since string) ([]map[string]any, error) {
+	table, role, ok := c.duckTarget(model)
+	if !ok {
+		return nil, fmt.Errorf("ysx: 未知 model %q,无法增量拉取", model)
+	}
+	if table == "" {
+		return nil, fmt.Errorf("ysx: model %s 的 table_* 未配置", model)
+	}
+	return source.FetchSince(ctx, c.db, table, cols, since, c.rowLimits.For(role))
+}
+
+// SourceNow 返回源库当前时间作为增量水位。
+func (c *Connector) SourceNow(ctx context.Context) (string, error) {
+	return source.SourceNow(ctx, c.db)
+}
+
 // QueryLive 把只读 SQL 直接发给源库(storage: live 的 model 用)。
 //
 // live 的 model: settlement / settlement_line / purchase_sheet /

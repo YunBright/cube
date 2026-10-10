@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -83,6 +84,50 @@ type appConfig struct {
 		// 上限过小会静默丢商品,表现为"部分条码扫不出来"且无任何报错。
 		RowLimits map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
+
+	// Refresh 是刷新策略(增量为主 + 夜间全量校准)。
+	Refresh struct {
+		// Incremental 是 model 名 → **源库侧**的增量时间列名(如 modify_date)。
+		//
+		// 用源库列名而非 canonical 名,因为 WHERE 打在源库上。
+		// 未列出的 model 自动走全量(例如 category 根本没有时间列)。
+		//
+		// 留空 map = 全部走全量,等于回到改造前的行为 —— 这是一个安全的退路,
+		// 不是错误配置。
+		Incremental map[string]string `yaml:"incremental"`
+		// IncrementalFallback 是 model 名 → 增量时间**回退列**(如 build_date),
+		// 拼成 `COALESCE(<incremental>, <fallback>) >= 水位`。
+		//
+		// 为什么需要:modify_date 为 NULL 意味着"建档后从未被修改过",那这条
+		// 记录最后一次被写入的时间就是 build_date。实测 ysx 近 7 天新建的 45 个
+		// 商品里 36 个 modify_date 是 NULL —— 单靠 modify_date 会漏掉它们。
+		// 实测 modify_date < build_date 的行数为 0,所以不会引入时间倒流。
+		//
+		// 留空 = 退化成单列比较,行为与配置前完全一致。
+		// ⚠️ 它**不能替代夜间全量校准**:hbposv7 有 12607 行商品两个时间列
+		//    同时为 NULL,那些行任何增量列都拉不到。
+		IncrementalFallback map[string]string `yaml:"incremental_fallback"`
+		// FullSchedule 是夜间全量校准的调度式,交给 Dapr 原样解析。
+		// 默认 "0 0 3 * * *"(6 字段 cron,每天 03:00:00)。
+		//
+		// ⚠️ 必须 6 个字段:2026-10-10 真机实测,5 字段会被 Dapr 拒绝
+		//    (HTTP 500: expected exactly 6 fields),而**启动不会因此失败**——
+		//    主 job 不受影响、mode 照样 dapr-job,只是夜间校准再也不会发生,
+		//    增量漏掉的数据永远没有兜底。refreshschedule.validateSchedule 会在
+		//    登记前拦一道,让这件事至少变成一条明确的启动日志。
+		//
+		// 为什么不用 "@every 24h":那是"从登记那一刻起每 24 小时",
+		// 进程重启就漂移,永远对不上"夜间 3 点"这个语义。
+		FullSchedule string `yaml:"full_schedule"`
+	} `yaml:"refresh"`
+}
+
+// fullSchedule 返回全量校准的调度式,未配置时给默认的每日 3 点。
+func (c appConfig) fullSchedule() string {
+	if s := strings.TrimSpace(c.Refresh.FullSchedule); s != "" {
+		return s
+	}
+	return refreshschedule.DefaultFullSchedule
 }
 
 // schemaMeta 是 dataloader.Meta 的本地别名 —— 真正的定义在共用包里,
@@ -247,10 +292,25 @@ func main() {
 	// fresh 记录每次物化的成败,喂给 /healthz。
 	// duck model 是快照,不是实时透传 —— 所以"这份数据有多旧"是必须能被外部看见的事实。
 	fresh := freshness.New(cfg.RefreshInterval())
-	reload := func() []string {
-		return dataloader.Load(ctx, db, schemas, specs, lg, fresh)
-	}
-	registeredModels := reload()
+
+	// ⚠️ 变量名不能叫 loader:本文件已有一个 fieldmapping.Loader(从 mapping 资产
+	// 构造列映射的那个),重名会让其中一个被悄悄换掉 —— 而且它们的方法名不重叠,
+	// 编译器不会报错,只会在运行期变成"某个 Fetch 不重命名了"。
+	incrCols := source.IncrColsFromConfig(appCfg.Refresh.Incremental, appCfg.Refresh.IncrementalFallback)
+	dl := dataloader.NewLoader(db, schemas, specs, conn, incrCols, lg, fresh)
+	incrementalReload := func() []string { return dl.Run(ctx, dataloader.ModeIncremental) }
+	fullReload := func() []string { return dl.Run(ctx, dataloader.ModeFull) }
+
+	// ⚠️ 启动必须走**全量**,哪怕 DuckDB 文件里已经有数据。
+	//
+	// 理由有三个,任何一个都足够:
+	//   1. 首次运行时连水位表都没有,没有基线可增量;
+	//   2. 水位表可能与 _raw 表**不同步** —— 比如上一版代码是全量刷的,
+	//      水位却停在很久以前,增量会把几万行重拉一遍;更糟的是水位**超前**,
+	//      那段时间的变更会被永久跳过,而且没有任何报错;
+	//   3. 部署之后就应该立刻拿到完整数据,而不是"等下一次增量补齐"。
+	// 全量成功后会顺带推进水位,后续增量才是快的那个。
+	registeredModels := fullReload()
 
 	// live model 不拉数据,但必须注册:它们是可查询的 model,
 	// 漏注册会让 gateway /healthz 与 MODEL_NOT_FOUND 响应暴露成"这个 source 没有该能力"。
@@ -264,9 +324,32 @@ func main() {
 
 	// 定时刷新:dapr Scheduler 优先,登记失败自动回退进程内 ticker。
 	// 两种模式同时可用 —— 在途守卫保证不会重叠写 DuckDB。
-	sched := refreshschedule.Setup(ctx, cfg.SidecarHTTPURL, cfg.RefreshInterval(), reload, lg)
-	sched.Start(ctx, cfg.RefreshInterval(), lg)
-	lg.Info("refresh driver ready", "mode", string(sched.Mode()))
+	//
+	// 两个 job:
+	//   cube-refresh       @every <间隔>   增量,只拉水位之后的变更行
+	//   cube-refresh-full  <full_schedule>  夜间全量校准,兜住增量天然会漏的那些
+	//
+	// 只有主 job(cube-refresh)决定 mode 与 ticker:校准 job 登记失败不该让
+	// 数据停止刷新,那属于 healthz 的 jobs 段要报告的事,不是 mode 的事。
+	jobs := []refreshschedule.JobSpec{
+		{
+			Name:     refreshschedule.DefaultJobName,
+			Schedule: "@every " + cfg.RefreshInterval().String(),
+			Reload:   incrementalReload,
+			Fallback: true,
+		},
+		{
+			Name:     refreshschedule.DefaultFullJobName,
+			Schedule: appCfg.fullSchedule(),
+			Reload:   fullReload,
+		},
+	}
+	sched := refreshschedule.Setup(ctx, cfg.SidecarHTTPURL, jobs, lg)
+	sched.Start(ctx, lg)
+	lg.Info("refresh driver ready",
+		"mode", string(sched.Mode()),
+		"incremental_models", len(appCfg.Refresh.Incremental),
+		"full_schedule", appCfg.fullSchedule())
 
 	go registerToGateway(cfg, registeredModels, lg)
 	go watchShutdown(cfg, lg)

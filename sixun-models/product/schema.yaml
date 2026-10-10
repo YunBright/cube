@@ -1,6 +1,9 @@
 # product model - 思迅家族共享 schema
 name: product
 sql_table: product
+# 增量刷新按主键 upsert(见 internal/dataloader)。
+# 没有它就只能全量重建表 —— 实测每天约 10 行变更 vs 44316 行全量。
+primary_key: id
 
 dimensions:
   - name: id

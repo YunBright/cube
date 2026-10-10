@@ -16,6 +16,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	_ "github.com/fpt/go-pduckdb" // 匿名 import 注册 duckdb driver
@@ -151,7 +152,131 @@ func (e *Engine) LoadFrom(table string, cols []fieldmapping.FieldDef, rows [][]a
 		placeholders += "?"
 	}
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(table), colNames, placeholders)
+	return e.insertRows(insertSQL, rows)
+}
 
+// upsertDeleteBatch 是 DELETE ... WHERE pk IN (...) 的分批大小。
+//
+// 一次增量可能带回几千行,IN 子句过长会被 DuckDB 直接拒绝
+// ("Values were not provided for the following prepared statement parameters"
+// 或 binder 内存上限),所以必须分批。这个数字偏保守:
+// 500 × 平均主键长度远小于任何合理上限,而批数只影响语句往返次数。
+const upsertDeleteBatch = 500
+
+// UpsertInto 按主键把 rows 合并进**已存在**的表,返回被触及的主键个数。
+//
+// 用于增量刷新:源库里水位之后有变更的行覆盖同主键的旧行,新主键追加。
+// 与 LoadFrom 的区别是 LoadFrom 走 `CREATE OR REPLACE TABLE`(全量替换),
+// 增量路径**绝不能**重建表 —— 那会把没变更的行全丢掉。
+//
+// 为什么用 DELETE + INSERT 而不是 `INSERT ... ON CONFLICT DO UPDATE`:
+// 表是用 `CREATE OR REPLACE TABLE (cols...)` 建的,没有 PRIMARY KEY 约束,
+// ON CONFLICT 要求建表时声明约束 —— 那等于让"表结构"多出一份必须与
+// mapping 手工同步的声明,迟早漂移。DELETE ... WHERE pk IN (...) 对
+// "更新已有行"和"插入新行"同样正确,且不依赖任何约束。
+//
+// 边界:
+//   - 表不存在 → 先用 LoadFrom 建表再插(bootstrap:首次运行时 DuckDB 还是空的)
+//   - rows 为空 → **什么都不做**,表保持原样。
+//     这与 LoadFrom 语义相反是有意的:全量下空结果代表"源库真的空了",
+//     必须让表变空(否则就是 dataloader 注释里说的"旧数据被藏起来");
+//     增量下空结果只代表"这段时间没有变更",清表就是纯粹的数据丢失。
+func (e *Engine) UpsertInto(table, pk string, cols []fieldmapping.FieldDef, rows [][]any) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	pkIdx := -1
+	for i, c := range cols {
+		if c.Target == pk {
+			pkIdx = i
+			break
+		}
+	}
+	if pkIdx < 0 {
+		// 不能退化成 LoadFrom —— 那会静默变成全量替换,而调用方以为在做增量。
+		// 更糟的是它会"成功",于是这个 bug 只表现为"增量偶尔丢数据"。
+		return 0, fmt.Errorf("duckdb: 增量写入 %s 失败:主键列 %q 不在列清单里(有 %d 列)", table, pk, len(cols))
+	}
+
+	exists, err := e.TableExists(table)
+	if err != nil {
+		return 0, err
+	}
+	if !exists {
+		// bootstrap:表还没建。先建表再把这一批灌进去。
+		if err := e.LoadFrom(table, cols, rows); err != nil {
+			return 0, err
+		}
+		return len(rows), nil
+	}
+
+	tx, err := e.db.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("duckdb: begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	// 1) 删掉将要被覆盖的旧行(分批)。
+	for start := 0; start < len(rows); start += upsertDeleteBatch {
+		end := start + upsertDeleteBatch
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+		args := make([]any, 0, len(batch))
+		marks := make([]string, 0, len(batch))
+		for _, r := range batch {
+			if pkIdx >= len(r) {
+				return 0, fmt.Errorf("duckdb: 增量写入 %s 失败:第 %d 行列数不足", table, start)
+			}
+			args = append(args, r[pkIdx])
+			marks = append(marks, "?")
+		}
+		delSQL := fmt.Sprintf("DELETE FROM %s WHERE %s IN (%s)",
+			quoteIdent(table), quoteIdent(pk), strings.Join(marks, ","))
+		if _, err := tx.Exec(delSQL, args...); err != nil {
+			return 0, fmt.Errorf("duckdb: 增量删除 %s: %w", table, err)
+		}
+	}
+
+	// 2) 插新行(跟 LoadFrom 一样的 prepared statement 批量路径)。
+	colNames := ""
+	placeholders := ""
+	for i, c := range cols {
+		if i > 0 {
+			colNames += ", "
+			placeholders += ", "
+		}
+		colNames += quoteIdent(c.Target)
+		placeholders += "?"
+	}
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		quoteIdent(table), colNames, placeholders)
+
+	stmt, err := tx.Prepare(insertSQL)
+	if err != nil {
+		return 0, fmt.Errorf("duckdb: prepare insert: %w", err)
+	}
+	defer stmt.Close()
+	for _, row := range rows {
+		if _, err := stmt.Exec(row...); err != nil {
+			return 0, fmt.Errorf("duckdb: 增量插入 %s: %w", table, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("duckdb: commit: %w", err)
+	}
+	return len(rows), nil
+}
+
+// insertRows 在一个事务里用 prepared statement 批量插入。
+//
+// 抽出来是为了让 LoadFrom 与 UpsertInto 共用同一条插入路径 ——
+// 两条路径的列序必须一致,复制两份迟早会出现"全量对了、增量列错位"
+// 这种只在真实数据上才暴露的 bug。
+func (e *Engine) insertRows(insertSQL string, rows [][]any) error {
 	// 用事务 + prepared statement,比逐行 Exec 快 10-30x
 	tx, err := e.db.Begin()
 	if err != nil {

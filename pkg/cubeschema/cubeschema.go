@@ -130,6 +130,18 @@ type Model struct {
 	Name     string  `yaml:"name"`
 	SQLTable string  `yaml:"sql_table"`
 	Storage  Storage `yaml:"storage,omitempty"`
+
+	// PrimaryKey 是主键**维度名**(指向 Dimensions 里某一项的 name)。
+	//
+	// 只有走增量的 duck model 需要它(见 dataloader 的增量刷新)。
+	// 留空表示"不支持增量",调用方必须回落到全量 —— 不允许"没声明主键
+	// 但仍然尝试 upsert",那会退化成不可控的行重复。
+	//
+	// ⚠️ 名字与 SQL 各指一侧,别混用:
+	//     dim.Name → **DuckDB `_raw` 表的列名**(canonical,即 mapping 的 target)
+	//     dim.SQL → **源库侧的表达式**(可能是列名,也可能是 RTRIM(x) 这类函数)
+	PrimaryKey string `yaml:"primary_key,omitempty"`
+
 	// SourceTable 是 live model 的**源库表名**。
 	//
 	// schema.sql_table 对 live model 无意义(它指的是 DuckDB 侧表名),
@@ -191,6 +203,16 @@ func Load(yamlBytes []byte) (*Model, error) {
 			return nil, fmt.Errorf("cubeschema: model %q: duplicate measure %q", m.Name, ms.Name)
 		}
 		seenMeas[ms.Name] = true
+	}
+	// primary_key 必须指向一个真实存在的 dimension。
+	// 拼错名在这里就炸,而不是等到增量刷新时才发现 —— 后者的症状是
+	// "UpsertInto 报主键列不在列清单里",离真正的原因(primary_key 写错)很远。
+	if m.PrimaryKey != "" {
+		if _, ok := m.FindDimension(m.PrimaryKey); !ok {
+			return nil, fmt.Errorf(
+				"cubeschema: model %q: primary_key %q 不是任何 dimension 的名字",
+				m.Name, m.PrimaryKey)
+		}
 	}
 	// segment 校验:名字唯一 + SQL 非空 + **不得含占位符**。
 	//
@@ -259,6 +281,18 @@ func (m *Model) FindDimension(name string) (*Dimension, bool) {
 		}
 	}
 	return nil, false
+}
+
+// PrimaryKeyDimension 返回主键维度。
+//
+// 没声明 primary_key 的 model 返回 (nil, false),调用方据此回落到全量刷新。
+// 这不是"可选优化",而是正确性前提:没有主键就无法安全 upsert,
+// 而静默地按全量做会让人以为自己在跑增量。
+func (m *Model) PrimaryKeyDimension() (*Dimension, bool) {
+	if m.PrimaryKey == "" {
+		return nil, false
+	}
+	return m.FindDimension(m.PrimaryKey)
 }
 
 // FindMeasure 按名查度量。

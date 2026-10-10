@@ -53,6 +53,58 @@ source:
 storage:
   duckdb_path: ./data/sixun-ysx.duckdb
 
+# 刷新策略:增量为主 + 夜间全量校准
+#
+# 实测依据(2026-10-10):
+#   t_bd_item_info  27304 行,但最近 1 天改动 **0 行**、7 天 70 行、30 天 410 行。
+#   改造前是"每 30 分钟全量重拉 27304 行",为约 10 行的日变化付全表扫描的代价。
+#
+# 这里的"增量"只影响 storage: duck 的 model;live 的 model 查询时透传,不参与。
+refresh:
+  # model 名 → **源库侧**的增量时间列名(不是 canonical 名,因为 WHERE 打在源库上)。
+  #
+  # 未列出的 model 自动走全量,这是**正常**的:
+  #   - category(t_bd_item_cls)实测没有任何时间列,只能全量 —— 才 596 行,无所谓
+  #   - sale_detail 指向的表实测 0 行,全量成本为零
+  #
+  # 前提:schema.yaml 里对应 model 声明了 primary_key(否则无法安全 upsert,
+  # 会自动回落到全量并在日志/healthz 里说明原因)。
+  incremental:
+    product:  modify_date
+    supplier: modify_date
+
+  # ==================== 增量回退列 ====================
+  # 拼成 COALESCE(modify_date, build_date) >= 水位。留空则退化成单列比较。
+  #
+  # 为什么需要(2026-10-10 真库实测):
+  #   modify_date 为 NULL 的语义是"**建档后从未被修改过**",那这条记录最后一次
+  #   被写入的时间就是 build_date。
+  #   按 `build_date >= DATEADD(day,-7,GETDATE())` 筛出的 45 个近 7 天新建商品里,
+  #   **36 个(80%)modify_date 是 NULL** —— 单靠 modify_date 会漏掉它们,
+  #   而它们恰恰是最该被拉到的(旧数据早就被上一次全量带进 DuckDB 了)。
+  #   实测 modify_date < build_date 的行数为 0,所以 COALESCE 不会时间倒流。
+  #   收益:30 天窗口 410 → 549 行(+139),多覆盖 34% 的新增商品。
+  #   代价:COALESCE 让两列索引都失效,实测每次查询多 2~3 ms,可忽略。
+  #
+  # ⚠️ 它**不能替代夜间全量校准**:本库仍有 31 行商品两个时间列同时为 NULL,
+  #    且"客户端写入时不更新 build_date"这类情况只有全量能兜住。
+  #
+  # supplier 故意不配:源表 t_bd_supcust_info 没有 build_date(实测只有
+  # modify_date / check_out_date),而它只有 218 行、30 天才变 2~9 行。
+  incremental_fallback:
+    product: build_date
+
+  # 夜间全量校准的调度式,原样交给 Dapr 解析(6 字段 cron:秒 分 时 日 月 周)。
+  #
+  # ⚠️ 必须写满 6 个字段:2026-10-10 真机实测,写 5 字段("0 3 * * *")
+  #    会被 Dapr 直接拒绝(HTTP 500: expected exactly 6 fields, found 5),
+  #    而主 job 不受影响、mode 照样是 dapr-job —— 于是"夜间校准没了"
+  #    会被 healthz 的整体健康掩盖,增量漏的数据永远没有兜底。
+  #
+  # 为什么不用 "@every 24h":那是"从登记那一刻起每 24 小时",进程重启就漂移,
+  # 永远对不上"夜间 3 点"这个语义。
+  full_schedule: "0 0 3 * * *"
+
 gateway:
   app_id: cube-gateway
   register_method: /register

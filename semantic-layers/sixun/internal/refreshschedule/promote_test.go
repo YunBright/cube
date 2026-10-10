@@ -2,9 +2,6 @@ package refreshschedule
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,30 +26,17 @@ import (
 // 刷新频率翻倍,而且 healthz 会说 "mode=ticker" 而 job 其实一直在触发 ——
 // 那个字段开始说谎。
 
-func newTickerController(t *testing.T, interval time.Duration, calls *atomic.Int64) *Controller {
+// tickerController 构造一个主 job 为 ticker 模式的 Controller
+// (sidecarAddr 传空 = 模拟"登记失败/没有 sidecar"这条路径)。
+func tickerController(t *testing.T, interval time.Duration, calls *atomic.Int64) *Controller {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	// sidecarAddr 传空 = 模拟"登记失败/没有 sidecar"这条路径,直接进 ticker。
-	c := Setup(context.Background(), "", interval,
-		func() []string {
-			calls.Add(1)
-			return nil
-		}, log.New("test"))
-	return c
-}
-
-func postJob(c *Controller, name string) {
-	engine := gin.New()
-	engine.POST("/job/:jobName", c.JobHandler())
-	srv := httptest.NewServer(engine)
-	defer srv.Close()
-
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/job/"+name, strings.NewReader(""))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		panic(err)
-	}
-	resp.Body.Close()
+	return Setup(context.Background(), "", []JobSpec{{
+		Name:     DefaultJobName,
+		Schedule: "@every " + interval.String(),
+		Reload:   func() []string { calls.Add(1); return nil },
+		Fallback: true,
+	}}, log.New("test"))
 }
 
 // TestTickerModePromotesToDaprJobOnTrigger 是本次改动的核心回归锁。
@@ -61,20 +45,38 @@ func postJob(c *Controller, name string) {
 // Scheduler 恢复后也不会切回去,于是旧 job 回来投递 → 双刷 + healthz 说谎。
 func TestTickerModePromotesToDaprJobOnTrigger(t *testing.T) {
 	var calls atomic.Int64
-	c := newTickerController(t, 50*time.Millisecond, &calls)
-	c.Start(context.Background(), 50*time.Millisecond, log.New("test"))
+	c := tickerController(t, 50*time.Millisecond, &calls)
+	c.Start(context.Background(), log.New("test"))
 
 	if got := c.Mode(); got != ModeTicker {
 		t.Fatalf("起始 mode = %q, want %q", got, ModeTicker)
 	}
 
-	postJob(c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
 
 	if got := c.Mode(); got != ModeDaprJob {
 		t.Errorf("收到 job 触发后 mode = %q, want %q —— 收到触发即证明 Scheduler 已恢复", got, ModeDaprJob)
 	}
 	if calls.Load() == 0 {
 		t.Error("job 触发本身应该执行一次 reload")
+	}
+}
+
+// TestFullJobTriggerDoesNotPromote 锁一个容易漏的边界:
+// **只有主 job 的触发**能判定 Scheduler 恢复。
+//
+// 校准 job 可能压根没登记上(它的触发只可能来自上一次成功登记留下的旧记录),
+// 拿它当恢复信号会让主 job 的 ticker 在校准 job 真正恢复之前就停掉。
+func TestFullJobTriggerDoesNotPromote(t *testing.T) {
+	var calls atomic.Int64
+	c := tickerController(t, time.Hour, &calls)
+	// 手动挂一个校准 job(不经登记,模拟"etcd 里还留着旧记录")。
+	c.jobs[DefaultFullJobName] = &jobRuntime{spec: fullJob(func() []string { return nil })}
+
+	doJob(t, c, DefaultFullJobName)
+
+	if got := c.Mode(); got != ModeTicker {
+		t.Errorf("校准 job 的触发不应改变 mode,实际 %q —— 主 job 可能还没恢复", got)
 	}
 }
 
@@ -85,7 +87,7 @@ func TestTickerModePromotesToDaprJobOnTrigger(t *testing.T) {
 // 看的人只能自己猜哪个是真的。
 func TestScheduleErrClearedOnPromote(t *testing.T) {
 	var calls atomic.Int64
-	c := newTickerController(t, time.Hour, &calls)
+	c := tickerController(t, time.Hour, &calls)
 
 	// 手工塞一个"登记失败"的状态,模拟 Setup 里 ScheduleJob 返回 error 的路径。
 	c.setMode(ModeTicker, "dial tcp 127.0.0.1:50006: connect: connection refused")
@@ -93,7 +95,7 @@ func TestScheduleErrClearedOnPromote(t *testing.T) {
 		t.Fatal("前置条件失败:scheduleErr 应当有值")
 	}
 
-	postJob(c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
 
 	st := c.Stats()
 	if st.Mode != ModeDaprJob {
@@ -113,8 +115,8 @@ func TestScheduleErrClearedOnPromote(t *testing.T) {
 func TestTickerStopsAfterPromote(t *testing.T) {
 	const interval = 50 * time.Millisecond
 	var calls atomic.Int64
-	c := newTickerController(t, interval, &calls)
-	c.Start(context.Background(), interval, log.New("test"))
+	c := tickerController(t, interval, &calls)
+	c.Start(context.Background(), log.New("test"))
 
 	// 先确认 ticker 真的在跑(否则"停了"是因为从没启动过,测试就没意义了)。
 	time.Sleep(6 * interval)
@@ -122,7 +124,7 @@ func TestTickerStopsAfterPromote(t *testing.T) {
 		t.Fatal("前置条件失败:ticker 应当已经触发过 reload")
 	}
 
-	postJob(c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
 	after := calls.Load()
 
 	// 5 个周期内不应再有增长(ticker 没停的话这里会涨约 5 次)。
@@ -141,11 +143,11 @@ func TestTickerStopsAfterPromote(t *testing.T) {
 // 打日志,长时间运行会积累误导性的日志,并且掩盖"谁真正触发了切换"。
 func TestPromoteIsIdempotent(t *testing.T) {
 	var calls atomic.Int64
-	c := newTickerController(t, time.Hour, &calls)
+	c := tickerController(t, time.Hour, &calls)
 	c.setMode(ModeDaprJob, "")
 
-	postJob(c, DefaultJobName)
-	postJob(c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
 
 	if got := c.Mode(); got != ModeDaprJob {
 		t.Errorf("mode = %q, want %q", got, ModeDaprJob)
@@ -155,7 +157,7 @@ func TestPromoteIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestPromoteStopsUnknownTickerGuard 验证顺序:先切模式再干活。
+// TestPromoteHappensBeforeReload 验证顺序:先切模式再干活。
 //
 // 如果顺序反过来(reload 完才切),ticker 在 reload 期间到点会被在途守卫跳过,
 // 白丢一次刷新且日志只留"跳过"。本测试不构造那个时序,但锁住一个可观察的副产物:
@@ -163,17 +165,17 @@ func TestPromoteIsIdempotent(t *testing.T) {
 func TestPromoteHappensBeforeReload(t *testing.T) {
 	var calls atomic.Int64
 	var modeDuringReload Mode
-	c := newTickerController(t, time.Hour, &calls)
+	c := tickerController(t, time.Hour, &calls)
 
 	// 换成能观察 mode 的 reload:包一层记录"reload 执行瞬间的 mode"。
-	c.reload = func() []string {
+	c.jobs[DefaultJobName].spec.Reload = func() []string {
 		calls.Add(1)
 		modeDuringReload = c.Mode()
 		return nil
 	}
 	c.setMode(ModeTicker, "boom")
 
-	postJob(c, DefaultJobName)
+	doJob(t, c, DefaultJobName)
 
 	if modeDuringReload != ModeDaprJob {
 		t.Errorf("reload 执行时的 mode = %q, want %q —— 切换必须发生在干活之前,"+
@@ -181,12 +183,12 @@ func TestPromoteHappensBeforeReload(t *testing.T) {
 	}
 }
 
-// TestStartDoesNothingWhenNotTicker 守住 disabled 模式不会被 ticker 意外复活。
+// TestStartDoesNothingWhenNotTicker 守住 dapr-job 模式不会被 ticker 意外复活。
 func TestStartDoesNothingWhenNotTicker(t *testing.T) {
 	var calls atomic.Int64
-	c := newTickerController(t, 20*time.Millisecond, &calls)
+	c := tickerController(t, 20*time.Millisecond, &calls)
 	c.setMode(ModeDaprJob, "")
-	c.Start(context.Background(), 20*time.Millisecond, log.New("test"))
+	c.Start(context.Background(), log.New("test"))
 
 	time.Sleep(120 * time.Millisecond)
 	if got := calls.Load(); got != 0 {

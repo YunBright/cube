@@ -27,6 +27,19 @@ type Connector interface {
 	FetchCategory(ctx context.Context) ([]map[string]any, error)
 	// FetchSaleDetail 拉销售明细(含销售退货)。
 	FetchSaleDetail(ctx context.Context) ([]map[string]any, error)
+
+	// FetchSince 拉取该 model 中增量时间窗口内的行(增量刷新)。
+	//
+	// model 传的是 **model 名**(如 "product"),不是表名 —— 表名是 family 私有
+	// 事实(config.yaml 的 table_*),调用方不该也不需要知道它。
+	// cols 给出增量时间列(主列 + 可选回退列),见 IncrementalCols。
+	// 未给该 model 配增量列时,Connector 必须返回错误而不是静默返回全量:
+	// 调用方会据此回落到全量刷新,而"静默返回全量"会让它以为自己在跑增量。
+	FetchSince(ctx context.Context, model string, cols IncrementalCols, since string) ([]map[string]any, error)
+
+	// SourceNow 返回源库当前时间(SQLServerTimeLayout 格式),
+	// 作为下一次增量刷新的水位。**不能用本地时钟代替**,理由见 incremental.go。
+	SourceNow(ctx context.Context) (string, error)
 	// QueryLive 把一条**只读** SQL 直接发给源库并返回行切片。
 	//
 	// 供 storage: live 的 model 使用:它们不落 DuckDB,查询时实时打源库。
