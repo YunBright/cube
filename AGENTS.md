@@ -67,6 +67,8 @@ cube/
 | HTTP 框架 | **`gin-gonic/gin v1.10.x`**(所有 dapr app 入口端点统一用) | ❌ 直接 `net/http`、`❌ chi/echo/fiber` 等其它 web 框架 |
 | Source 在线判定 | **被动验证**:handler 不前置 IsOnline 检查,任何已注册 source 都直接 `dapr.InvokeMethod`,真实 `SOURCE_OFFLINE` 由 dapr 真实调用失败(`ErrConnFailure`)触发;`/v1/sources` 视图 status 字段恒为 "online"(信息性,不代表实际可达),LastSeen 仅作运维排查信号 | ❌ 时间窗口式离线判定(冷启动源 90s 后假 offline),❌ 主动探活(复杂、对 middleware.http.bearer 链路脆弱),❌ 直连 app / kube 健康度(直连 `DAPR_APP_CHANNEL_ADDRESS`,k8s pod IP 飘移即失效) |
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
+| segment(预定义过滤) | schema 里写一段静态 SQL 谓词,调用方只传名字(`"segments":["purchase_return"]`),编译进 WHERE。**SQL 里只能用 canonical 名**(mapping 的 target),由 mapping 在查询时重写成该 family 的源列名 | ❌ 写源库列名(两个 family 源列名一致时恰好能跑,不一致时才炸)、❌ 含 `?`(segment 不带参数,占位符变成无人绑定的位置)、❌ 含子查询(列名重写是标识符盲替换,会误伤)、❌ 跨 model 引用别的 model 的 segment(编译期报 `segment not found`) |
+| 采购退货单 | **不是独立 model**:pm 模块实测只有 `t_pm_sheet_master` / `t_pm_sheet_detail` / `t_pm_process_yh` 三张表,RO 就是 master 里的行。用 `purchase_sheet` 的 segment `purchase_return` / `purchase_receipt`。⚠️ **两侧金额符号相反**:采购侧 RO 是**正数**(ysx +175.2 万 / hbposv7 +130.5 万),结算侧 RO 是**负数**(ysx -171.7 万 / hbposv7 -174.4 万) | ❌ 为它单开一个 model(同一张表的维度定义要维护两份,必然分叉),❌ 用 `total_amount_yuan` 不带 segment 直接聚合(退货被再加一遍,实测多算 350 万/261 万),❌ 拿采购侧 RO 与结算侧 RO 直接比(差一个符号、约 346 万) —— 必须用 `total_net_amount_yuan`(RO 取负) |
 | 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.Build`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
 | 拉取行数上限 | **`DefaultRowLimit = 50000`,必须高于所有维表实测行数**;按角色在 `config.yaml` 的 `source.row_limits` 覆盖 | ❌ 设成小于实测行数的值(曾硬编码 `TOP 10000` → ysx 丢 63% 商品、hbposv7 丢 77%、**库存表丢 57%**,零报错) |
 | 刷新模式 | **方案 D:增量为主 + 夜间 3 点全量校准**。两个 dapr job:主 `cube-refresh`(`@every 30m`,增量)、校准 `cube-refresh-full`(`0 0 3 * * *`,全量)。实测 30 天变更量:ysx product 410/27304(1.5%)、hbposv7 209/44316(0.5%) | ❌ 每 30 分钟全量重拉 2.7~4.4 万行、❌ 把校准 job 失败与主 job 混成一个 mode(丢掉一层保险换另一层缺失) |
@@ -148,6 +150,9 @@ cube/
       `modify_date < build_date` 的行数),且 `incremental_test.go` 的
       `TestIncrementalSelectWithFallbackUsesCoalesce` 与
       `cmd/sixun-ysx/config_test.go` 的 `TestDeployedIncrementalFallbackCoversNewItems` 都绿
+- [ ] 改了 segment / measure 的 SQL → **`go run ./cmd/sqlcheck -family ysx|hbposv7 -only segment`
+      在真机上跑过**(单测只比对字符串,不执行;2008 R2 方言错、列名没被 rewrite
+      这类 bug 只有真库抓得到),且注释里的金额符号/正负数字能在源库上复现
 - [ ] 改过 `pkg/cubequery` 的 SQL 构造 → **已对两个生产源库各跑一遍真实执行**
       (`go run ./cmd/sqlcheck -config <config.yaml> -family ysx|hbposv7`)。
       单测只比对 SQL 字符串,**不执行**,所以 2008 R2 语法错、JOIN 用错物理表名这类 bug

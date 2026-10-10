@@ -145,3 +145,89 @@ data/
 RTRIM 规则也固化在共用包里:char 定长列的补空格在**查询层**统一处理,
 SELECT 表达式与 filter **两侧**都包,GROUP BY 用裸列名。
 详见 [手册 §4.3 / §5](data-source-mapping-playbook.md)。
+
+## Segment:可复用的判定口径(结算审批用)
+
+`segment` 是写在 schema 里的一段静态 SQL 谓词,调用方只传名字
+(`"segments": ["purchase_return"]`),由 `pkg/cubequery` 编译进 WHERE。
+
+它存在的理由是**判定条件要复用**:审批机器人、BI 报表、回归脚本判断
+"这是不是一张采购退货单"时,不该各写一份 `WHERE trans_no='RO'` ——
+写散了就会在某处变成 `'RO '`(char 补空格)或漏了 RTRIM,且两边都不报错。
+
+加载期就有校验(`pkg/cubeschema`):名字唯一、SQL 非空、
+**不得含 `?`**(segment 不带参数,占位符会变成无人绑定的位置)、
+**不得含子查询**(列名重写是标识符级的盲替换,子查询会误伤)。
+
+> ⚠️ segment / measure 的 SQL 里**只能用 canonical 名**(即 mapping 的 target),
+> 由 mapping 在查询时重写成该 family 的源列名。`mapping_parity_test.go` 对
+> measure 与 segment 都查这一条 —— segment 曾经漏查,写源库列名时
+> 恰好在源列名一致的两个 family 上能跑,不一致时才炸。
+
+### 现有 segment
+
+| model | segment | 含义 |
+|---|---|---|
+| `settlement_line` | `purchase_only` | 结算明细里属于采购的行(`voucher_id` 前缀 PI/RO) |
+| `purchase_sheet` | `purchase_receipt` | 仅采购收货单(PI) |
+| `purchase_sheet` | `purchase_return` | 仅采购退货单(RO) |
+
+### 采购退货单:数据在哪、金额符号怎么算
+
+**先回答一个常见误解:pm 模块没有独立的退货单表。**
+实测两库 `t_pm%` 只有三张:`t_pm_sheet_master` / `t_pm_sheet_detail` /
+`t_pm_process_yh`。采购退货单就是 `t_pm_sheet_master` 里 `trans_no='RO'` 的行 ——
+所以要退货单用 `segments: ["purchase_return"]`,**不要**为它单开一个 model
+(那会让同一张表的维度定义维护两份,必然分叉)。
+
+**金额符号在两侧相反,这是审批对账最容易踩的坑**(实测 2026-10-10):
+
+| | 采购侧 `t_pm_sheet_master` 的 RO | 结算侧 `t_fm_recpay_detail` 的 RO |
+|---|---|---|
+| ysx | **+175.2 万**(3565 张) | **-171.7 万**(3474 行) |
+| hbposv7 | **+130.5 万**(2081 张) | **-174.4 万**(2668 行) |
+
+也就是说,采购侧的退货金额是**正数**。直接用 `total_amount_yuan`(`SUM(sheet_amt)`)
+聚合而不带 segment,结果是"进货 **+** 退货",**实测多算 350 万(ysx)/
+261 万(hbposv7)** —— 数字偏大、且没有任何报错。
+
+对账请用 `purchase_sheet.total_net_amount_yuan`
+(`SUM(CASE WHEN document_type='RO' THEN -amount ELSE amount END)`),
+它已把 RO 取负,与 `settlement_line.total_goods_yuan`(本身就是净额)同口径:
+
+```jsonc
+// 进货额(正)
+{"model": "purchase_sheet", "measures": ["total_net_amount_yuan"],
+ "segments": ["purchase_receipt"]}
+// 退货额(负)—— 与结算侧同号,可直接相加
+{"model": "purchase_sheet", "measures": ["total_net_amount_yuan"],
+ "segments": ["purchase_return"]}
+// 全口径净额:进货减退货
+{"model": "purchase_sheet", "measures": ["total_net_amount_yuan"]}
+```
+
+⚠️ `purchase_sheet_line` **没有 `trans_no` 列**(实测两库只有 `sheet_no`),
+所以退货**明细**不能用 segment 直接过滤,必须 join `purchase_sheet`;
+净额一律从 `purchase_sheet` 侧聚合 —— 明细表刻意没有造一个"净额"measure,
+因为没有 `trans_no` 就分不出 RO,硬造只会给出错误数字。
+
+### segment 绑定到 model,不能跨 model 用
+
+`"segments": ["purchase_return"]` 只在 **base model 自己声明了该 segment** 时有效。
+想用别的 model 的 segment,编译期直接报 `segment not found: purchase_return
+(available: )` —— 这一点是 `pkg/cubequery` 的显式失败,不是静默忽略。
+
+所以明细侧要按单据类型筛,正确写法是 **join + filter**,而不是 segment:
+
+```jsonc
+{
+  "model": "purchase_sheet_line",
+  "measures": ["purchase_sheet_line.total_amount_yuan"],
+  "dimensions": ["purchase_sheet.document_type"],
+  "filters": [{"member": "purchase_sheet.document_type",
+               "operator": "equals", "values": ["RO"]}]
+}
+```
+
+> 顺带一句:即便明细侧能筛出 RO,它的金额**也仍是正数**(实测与头表一致:
+> ysx +175.2 万 / hbposv7 +130.5 万),所以净额永远要从头表那侧算。

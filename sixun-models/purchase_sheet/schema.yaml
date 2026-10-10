@@ -10,8 +10,23 @@
 #     PO 采购订单 / WP 线上采购订单 / RT 采购退货通知单 / XJ 询价单 / YX 永续订单
 #   前缀释义来自思迅字典表 t_sys_sheet_no,不是猜的。
 #
-# 实测已审核(approve_flag='1'):hbposv7 PI 10569 / RO 2074;ysx PI 24376 / RO 3561
+# 实测已审核(approve_flag='1'):hbposv7 PI 10592 / RO 2081;ysx PI 24406 / RO 3564
 # 结算单通过 settlement_line.voucher_id 关联本表。
+#
+# ⚠️ pm 模块**没有独立的退货单表**(实测两库 t_pm% 只有 t_pm_sheet_master /
+#   t_pm_sheet_detail / t_pm_process_yh),采购退货单就是本表的 RO 行。
+#   要退货单请用 segment `purchase_return`,不要为它单开一个 model ——
+#   那会让同一张表的维度定义维护两份,必然分叉(与 settlement/purchase_sheet
+#   各自独立单据表的情形不同)。
+#
+# ⚠️ 金额符号在**两侧相反**,这是审批对账最容易踩的坑(实测 2026-10-10):
+#     采购侧 t_pm_sheet_master 的 RO 是**正数**:ysx 3565 张合计 +175.2 万、
+#                                  hbposv7 2081 张合计 +130.5 万
+#     结算侧 t_fm_recpay_detail 的 RO 是**负数**:ysx 3474 行合计 -171.7 万、
+#                                 hbposv7 2668 行合计 -174.4 万
+#   直接把采购侧退货额与结算侧退货额相比会**差一个符号、约 346 万**。
+#   本 model 的 total_net_amount_yuan 已把 RO 取负,可与
+#   settlement_line.total_goods_yuan 直接对账。
 #
 # 金额不做 dimension(理由同 settlement):带 dimensions: [purchase_sheet.id] 取单据金额。
 name: purchase_sheet
@@ -122,7 +137,23 @@ measures:
     type: number
     title: 单据金额合计(元)
     format: "0.00"
-    description: 源列 sheet_amt。实测 hbposv7 PI 合计 1131.5 万 / ysx 2986.4 万
+    description: 源列 sheet_amt。实测(2026-10-10)hbposv7 PI 合计 1133.9 万 / ysx 2989.5 万。
+      ⚠️ **退货单(RO)在本表里是正数**(实测 ysx RO 3565 张合计 +175.2 万,
+      hbposv7 2081 张合计 +130.5 万,明细行 sub_amt 负数计数均为 0),
+      所以这个 measure 不加 segment 直接聚合 = 进货 + 退货,**实测多算 261 万
+      (hbposv7,1117.2→1378.2)/ 350 万(ysx,2867.6→3218.0)**。算净额请用 total_net_amount_yuan
+
+  - name: total_net_amount_yuan
+    sql: "SUM(CASE WHEN document_type = 'RO' THEN -amount ELSE amount END)"
+    type: number
+    title: 单据净额合计(元)
+    format: "0.00"
+    description: 退货单取负,与 settlement_line.total_goods_yuan 同口径。
+      不带 segment = 进货减退货的净额;带 purchase_return segment = 负的退货额
+      (实测 ysx -175.2 万 / hbposv7 -130.5 万);带 purchase_receipt segment =
+      正的进货额。**审批对账请用这个 measure**,而不是 total_amount_yuan。
+      SQL 里用 canonical 名 document_type / amount,由 mapping 在查询时重写成
+      该 family 的源列名(实测两库源列都是 trans_no / sheet_amt)
 
   - name: total_order_amount_yuan
     sql: "SUM(order_amount)"
@@ -130,6 +161,22 @@ measures:
     title: 订货金额合计(元)
     format: "0.00"
     description: 源列 order_amt
+
+segments:
+  - name: purchase_receipt
+    sql: "document_type = 'PI'"
+    title: 仅采购收货单
+    description: 业务上的"采购进货单"。算进货金额必须带上它 —— 同表里还装着 RO 退货、
+      PO 采购订单、WP 线上采购订单(实测 hbposv7 PI 10593 / RO 2081 / PO 224 / WP 242;
+      ysx PI 24407 / RO 3565 / PO 211)
+
+  - name: purchase_return
+    sql: "document_type = 'RO'"
+    title: 仅采购退货单
+    description: 退货单。结算明细里同样有 RO(实测 hbposv7 2668 行 / ysx 3474 行),
+      审批"逐单核对采购与结算"时用它定位源单据。
+      ⚠️ 本表 RO 金额是**正数**,而结算侧 RO 是负数 —— 两边直接相加/对比会差一个符号。
+      对账请用 total_net_amount_yuan(退货已取负)与 settlement_line.total_goods_yuan 对齐
 
 joins:
   - name: supplier

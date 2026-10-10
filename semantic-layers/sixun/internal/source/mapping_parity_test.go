@@ -136,19 +136,36 @@ func TestSchemaMeasureColumnsAreMapped(t *testing.T) {
 			continue
 		}
 		for _, ms := range model.Measures {
-			sql := stringLitRE.ReplaceAllString(ms.SQL, "''")
-			for _, ident := range identRE.FindAllString(sql, -1) {
-				if sqlKeywords[strings.ToUpper(ident)] || targets[ident] {
-					continue
-				}
-				t.Errorf("model %q 的 measure %q 引用了未映射的列 %q(只在查询那一刻报 column not found)",
-					model.Name, ms.Name, ident)
-			}
+			checkSQLColumns(t, model.Name, "measure "+ms.Name, ms.SQL, targets, stringLitRE, identRE, sqlKeywords)
+		}
+		// segment 的 SQL 同样会被原样内联进 WHERE,并且同样要经过列名重写
+		// (见 pkg/cubequery/tsql.go 的 expandSegments 调用),所以它和 measure
+		// 有**完全相同**的约束:只能用 canonical 名。
+		//
+		// 之前这里只查 measure,于是"segment 里写了源库列名"没人拦 —— 而它
+		// 恰好在两个 family 源列名一致时能跑,不一致时才炸(2026-10-10).
+		for _, sg := range model.Segments {
+			checkSQLColumns(t, model.Name, "segment "+sg.Name, sg.SQL, targets, stringLitRE, identRE, sqlKeywords)
 		}
 		checked++
 	}
 	if checked == 0 {
 		t.Fatal("一个 schema.yaml 都没校验到,检查 models dir 路径")
+	}
+}
+
+// checkSQLColumns 断言 sql 里的每个标识符要么是 SQL 关键字,要么是 mapping
+// 白名单里的 canonical 名。
+func checkSQLColumns(t *testing.T, model, where, sqlText string, targets map[string]bool,
+	stringLitRE, identRE *regexp.Regexp, keywords map[string]bool) {
+	t.Helper()
+	sql := stringLitRE.ReplaceAllString(sqlText, "''")
+	for _, ident := range identRE.FindAllString(sql, -1) {
+		if keywords[strings.ToUpper(ident)] || targets[ident] {
+			continue
+		}
+		t.Errorf("model %q 的 %s 引用了未映射的列 %q(只在查询那一刻报 column not found)",
+			model, where, ident)
 	}
 }
 

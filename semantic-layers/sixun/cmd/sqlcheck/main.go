@@ -309,6 +309,45 @@ func buildCases() []checkCase {
 			},
 		},
 		{
+			name: "segment-采购退货单(负数口径)", base: "purchase_sheet",
+			desc: "采购侧 RO 是正数,total_net_amount_yuan 取负后与结算侧同号",
+			query: &cubequery.Query{
+				Measures: []string{"purchase_sheet.total_net_amount_yuan"},
+				Segments: []string{"purchase_return"},
+				Limit:    lim(1),
+			},
+		},
+		{
+			name: "segment-采购收货单", base: "purchase_sheet",
+			desc: "只取 PI。segment 的 document_type 会被 rewrite 成源库列名 trans_no",
+			query: &cubequery.Query{
+				Measures: []string{"purchase_sheet.total_net_amount_yuan"},
+				Segments: []string{"purchase_receipt"},
+				Limit:    lim(1),
+			},
+		},
+		{
+			name: "segment-结算采购行", base: "settlement_line",
+			desc: "既有 segment 回归:purchase_only 只留 PI/RO 行",
+			query: &cubequery.Query{
+				Measures: []string{"settlement_line.total_goods_yuan"},
+				Segments: []string{"purchase_only"},
+				Limit:    lim(1),
+			},
+		},
+		{
+			name: "退货明细经 join", base: "purchase_sheet_line",
+			desc: "segment 绑定到 model 不能跨用 → 明细侧必须 join 头表并用 filter",
+			query: &cubequery.Query{
+				Measures:   []string{"purchase_sheet_line.total_amount_yuan"},
+				Dimensions: []string{"purchase_sheet.document_type"},
+				Filters: []cubequery.Filter{
+					{Member: "purchase_sheet.document_type", Operator: "equals", Values: []any{"RO"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
 			name: "order-desc", base: "settlement",
 			desc: "按 SELECT 别名排序",
 			query: &cubequery.Query{

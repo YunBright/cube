@@ -10,6 +10,13 @@
 #   2.2472 / 1.2752 这类小数 —— 门店大量称重商品,销售量单位是**重量**。
 #   两者直接相除会差一个数量级。必须先按 product.unit 与
 #   purchase_spec / shipment_spec 做规格换算,否则异常判定全是噪音。
+#
+# ⚠️ 本表**没有 trans_no 列**(实测两库:只有 sheet_no / ysx 另有 nstep_sheet_no),
+#   所以退货明细(RO)**不能**像 purchase_sheet 那样用 segment 直接过滤 ——
+#   要按单据类型筛必须 join purchase_sheet,再用它的 purchase_return segment:
+#     维度写 `purchase_sheet.document_type`,或 segments: ["purchase_return"]
+#   这里刻意**不**加"净额"measure:没有 trans_no 就无法在本表内区分 RO,
+#   硬造一个口径只会给出错误数字。净额一律从 purchase_sheet 侧聚合。
 name: purchase_sheet_line
 sql_table: purchase_sheet_line
 storage: live  # 不落 DuckDB:明细随收货实时增加(见 settlement/schema.yaml 顶部说明)
@@ -50,7 +57,9 @@ measures:
     type: number
     title: 明细金额合计(元)
     format: "0.00"
-    description: 源列 sub_amt。实测 572.4000 = 50 × 11.4480,与单价×数量自洽
+    description: 源列 sub_amt。实测 572.4000 = 50 × 11.4480,与单价×数量自洽。
+      ⚠️ 退货(RO)行在这里同样是**正数**(实测两库负数计数均为 0),
+      与 settlement_line 的负数口径相反 —— 算净额请从 purchase_sheet 侧聚合
 
   - name: total_received_quantity
     sql: "SUM(received_quantity)"
