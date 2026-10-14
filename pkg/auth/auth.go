@@ -8,7 +8,7 @@ package auth
 
 // Principal 代表调用方身份。
 type Principal struct {
-	ID    string   // 用户/服务 ID
+	ID     string   // 用户/服务 ID
 	Tenant string   // 租户(多租户隔离)
 	Roles  []string // 角色(RBAC)
 	Scopes []string // scope(BI 工具授权)

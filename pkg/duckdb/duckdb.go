@@ -28,7 +28,7 @@ import (
 type Engine struct {
 	db   *sql.DB
 	path string
-	mu    sync.Mutex // DuckDB 单 writer 锁
+	mu   sync.Mutex // DuckDB 单 writer 锁
 }
 
 // Open 打开(或创建)一个 .duckdb 文件。

@@ -1,10 +1,10 @@
 // Command cube-compiler 是固定 dapr app id 的编译守护进程。
 //
 // 职责(P0):
-//   1. git pull 本项目仓库
-//   2. 扫描 semantic-layers/ 下所有 cube app
-//   3. 检测文件变化 → go build → 重新启动
-//   4. 通过 pubsub 通知 cube-gateway 刷新注册表
+//  1. git pull 本项目仓库
+//  2. 扫描 semantic-layers/ 下所有 cube app
+//  3. 检测文件变化 → go build → 重新启动
+//  4. 通过 pubsub 通知 cube-gateway 刷新注册表
 //
 // 部署:
 //   - 本地 dev:直接 go run ./cmd/compiler,用 dapr run 包一层

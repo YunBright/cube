@@ -25,7 +25,7 @@ type Config struct {
 // Manager 持有进程表。
 type Manager struct {
 	cfg    Config
-	logger  *log.Logger
+	logger *log.Logger
 	procs  map[string]*proc // app_id → proc
 	mu     sync.Mutex
 }
