@@ -1,0 +1,32 @@
+# item mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_bd_item_info —— 与 mapping-product.yaml 同一张表,
+# 但 canonical 名按 sales_report 链路上的写法另起一份(见 mapping-sales_report.yaml 顶部说明)。
+#
+# ⚠️ item_no 是 char(20),两个 family 的补空格规则不一致
+#   (hbposv7 补空格、ysx 不补)。这里只声明映射,不做 RTRIM ——
+#   RTRIM 的时机由 schema 的 dimension sql 决定(现有约定是 SELECT 阶段 RTRIM、
+#   JOIN 条件不 RTRIM,实测两者都 RTRIM 会差 17 倍执行时间)。
+version: 1
+model: item
+
+mappings:
+  - source: item_no
+    target: id
+    type: string
+
+  - source: item_name
+    target: name
+    type: string
+
+  - source: item_clsno
+    target: clsno
+    type: string
+
+  - source: item_brandname
+    target: brand_name
+    type: string
+
+  - source: unit_no
+    target: unit
+    type: string

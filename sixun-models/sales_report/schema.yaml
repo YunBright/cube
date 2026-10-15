@@ -1,0 +1,114 @@
+# sales_report model - 思迅家族共享 schema(销售报表聚合)
+#
+# 源表:t_rm_daysum(销售日结,与 sale_day 同一张表)
+#
+# # 为什么不复用 sale_day
+#
+# sale_day 只有一个 `branch_id` 维度,**拿不到类别**。要按类别出报表就得
+# join 商品主表与类别字典,而:
+#   - `product` / `category` 是 storage: duck,joins 两侧都必须是 live
+#     (pkg/cubequery/join.go 的 checkStorage),live→duck 会被明确拒绝;
+#   - 所以这里另起一个**以日结表为基表**的 live model,顺着
+#     item → item_cls → item_cls_parent 一路 JOIN 到父类别。
+#
+# # storage: live —— 绝不落 DuckDB
+#
+# ✅ 实测 hbposepro t_rm_daysum 598068 行 / ysx 1208328 行,且**每天都在增长**。
+# DuckDB 只放"常用且更新不频繁的基础/聚合数据"(见 sale_day 顶部同款说明),
+# 把销售流水静默同步进去就是最大的坑:一次全量拉取就是百万行级写放大,
+# 而症状只是"启动慢了一点"。
+#
+# # 门店区域刻意**不**作为维度
+#
+# 源表 t_rm_daysum.branch_no 是**门店区域** —— 门店(X-Branch-ID)的下一层,
+# 与门店是两个无关编码。业务 2026-10-15 明确要求「忽略数据源的门店」,
+# 所以本 model 根本不暴露 branch_no 维度:
+# 门店隔离由 X-Branch-ID 路由链负责(branch → cube-router → 该门店专属实例),
+# 源库 branch_no 全程不进 WHERE。
+# ⚠️ 不要"顺手"把它加回来 —— 它一旦成为可分组维度,用户选的是门店、
+#   报表却按区域拆行,两份"销售报表"对不上数而没人说得清哪份对。
+name: sales_report
+sql_table: sales_report
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 日结流水 ID
+    description: 源列 flow_id。✅ 实测是严格连续全局序列,每天不重叠
+
+  - name: item_no
+    sql: item_no
+    type: string
+    title: 商品编码
+
+  - name: oper_date
+    sql: oper_date
+    type: time
+    char_date: true
+    title: 营业日期
+    description: 源列 oper_date,是 **char(10) 字符串 'YYYY-MM-DD' 而非 datetime**。
+      标了 char_date 后时间过滤走原列字符串比较(可走 i_rm_daysum_1),
+      不套 CAST —— 否则百万行全表扫描
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 日结行数
+
+  - name: total_net_amount
+    sql: "SUM(sale_amt - ret_amt)"
+    type: number
+    title: 净销售额(元)
+    format: "0.00"
+    # ⚠️ 用块标量而不是续行:续行里出现行尾冒号("……一致:")会被 YAML
+    #   当成 mapping key,报 "mapping values are not allowed in this context"。
+    #   而且这个错只在**加载到这一个 model** 时才冒出来,前面 20 条用例全绿。
+    description: |
+      口径 sale_amt - ret_amt(售出减退回)。
+      ✅ 实测 hbposepro 2026-10-10 与既有报表系统逐分对账一致 ——
+      全店 18896.38 / 生鲜联营 4994.70 / 百货联营 2340.70
+
+  - name: total_net_qty
+    sql: "SUM(sale_qty - ret_qty)"
+    type: number
+    title: 净销量
+    format: "0.00"
+    description: ⚠️ 单位是**称重重量**(生鲜按 kg),不是件数。
+      ✅ 同日实测 3573.85,与既有报表系统逐分一致
+
+  - name: total_ref_cost
+    sql: "SUM(CASE WHEN cost_price > sale_amt THEN sale_amt ELSE cost_price END)"
+    type: number
+    title: 参考成本(元)
+    format: "0.00"
+    description: |
+      **收窄**后的行成本额。cost_price > sale_amt 的行是亏本销售
+      (实测 hbposepro 2026-10-10 有 112/749 行,如「浩香园叉烧」
+      qty=17 amt=42.50 cost=114.22),不收窄会把总成本抬高 443.25 元(2.6%);
+      收窄后 17340.06 vs 图片口径隐含的 17216.62,仅差 0.7%。
+      ⚠️ 这是**估算值**:hbposepro 的 cost_price 覆盖率 100%,
+        但 hbposv10 的 base_price 全表为 0、base_price1 仅 308/27312 ≈ 1.1%。
+        毛利因此必须当"参考值"展示,并配合 costed_rows 判断可信度。
+
+  - name: costed_rows
+    sql: "SUM(CASE WHEN cost_price > 0 THEN 1 ELSE 0 END)"
+    type: number
+    title: 有成本数据的行数
+    description: |
+      ⚠️ 不要删(看起来像个多余的计数,其实不是):
+      收窄后的成本仍可能是 0(该行本来就没有成本数据)。若直接用
+      cost=0 算毛利率会显示"毛利率 100%" —— ✅ 实测 hbposv10 当日
+      64 个类别组里多组是这种假数。
+      调用方用 costed_rows / count 的比值当"成本覆盖率",低于阈值就不展示毛利。
+
+joins:
+  # many_to_one → LEFT JOIN(pkg/cubequery/join.go joinClauseKind)。
+  # 刻意用 LEFT 而不是 INNER:无档案的行必须留在结果里,否则
+  # "今天卖了多少"会因为一条商品档案缺失而凭空少一块。
+  - name: item
+    sql: item
+    on: "{CUBE}.item_no = item.id"
+    relationship: many_to_one

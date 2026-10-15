@@ -44,6 +44,18 @@ type joinEdge struct {
 	From, To     string // 相邻的两个 model
 	Relationship string // 从 From 看过去的方向
 	On           string // schema 里写的 ON 条件
+	// depth 是这条边在 BFS 里的发现层数(base 自身为 0,base 的邻居为 1)。
+	//
+	// ⚠️ 边必须按 depth 递增输出,不能按 From->To 字典序:
+	//   T-SQL 的 FROM 子句是**从左到右**求值的,一条 JOIN 的 ON 里只能引用
+	//   它**左侧已经出现过**的别名。字典序会把子节点排到父节点前面 ——
+	//   实测 sales_report→item→item_cls→item_cls_parent 这条链,
+	//   字典序给出 ["item->item_cls" < "item_cls->item_cls_parent" < "sales_report->item"],
+	//   于是生成的 SQL 是
+	//     FROM t_rm_daysum AS t0 LEFT JOIN t_bd_item_cls AS t1 ON t3.item_clsno = ...
+	//   t3 到那一刻还没出现,源库回 "无法绑定由多个部分组成的标识符 t3.item_clsno"。
+	//   两跳以内的既有用例全绿 —— 因为只有一条边时字典序与拓扑序恰好一致。
+	depth int
 }
 
 // joinPlan 是一次查询实际用到的 join 集合。
@@ -103,6 +115,9 @@ func planJoins(base *cubeschema.Model, referenced map[string]bool, reg ModelRegi
 	// 用最短路径而不是"全部可达边":多连一张没人用的表就是白白拖慢源库查询。
 	parentOf := map[string]joinEdge{}
 	visited := map[string]bool{base.Name: true}
+	// depthOf 只用于给边定层;BFS 的出队顺序本身是确定的(声明顺序),
+	// 所以同样输入永远得到同一份边序列 —— 别名分配才可复现。
+	depthOf := map[string]int{base.Name: 0}
 	queue := []string{base.Name}
 	for len(queue) > 0 {
 		cur := queue[0]
@@ -129,7 +144,9 @@ func planJoins(base *cubeschema.Model, referenced map[string]bool, reg ModelRegi
 				continue
 			}
 			visited[j.Name] = true
-			parentOf[j.Name] = joinEdge{From: cur, To: j.Name, Relationship: j.Relationship, On: j.On}
+			depthOf[j.Name] = depthOf[cur] + 1
+			parentOf[j.Name] = joinEdge{From: cur, To: j.Name,
+				Relationship: j.Relationship, On: j.On, depth: depthOf[j.Name]}
 			queue = append(queue, j.Name)
 		}
 	}
@@ -153,14 +170,29 @@ func planJoins(base *cubeschema.Model, referenced map[string]bool, reg ModelRegi
 		}
 	}
 
-	// 别名按 (From, To) 排序后依次分配 —— 序号而非 model 名:
-	//   零注入风险(别名不含任何 schema 字符),且两个 model 映射到同一张物理表时
-	// 不会撞车(用 model 名做别名就会)。
+	// ⚠️ 别名必须按**拓扑深度**分配,不能按 From->To 字典序:
+	//   T-SQL 的 FROM 子句从左到右求值,一条 JOIN 的 ON 里只能引用它**左侧**
+	//   已经出现的别名。字典序会把子节点排到父节点前面 ——
+	//   实测 sales_report→item→item_cls→item_cls_parent 这条链,字典序给出
+	//   ["item->item_cls" < "item_cls->item_cls_parent" < "sales_report->item"],
+	//   于是 FROM t_rm_daysum AS t0 LEFT JOIN t_bd_item_cls AS t1 ON t3.item_clsno = ...
+	//   t3 那一刻还没出现,源库回"无法绑定由多个部分组成的标识符 t3.item_clsno"。
+	//   既有两条边以内的用例全绿 —— 因为单边时字典序与拓扑序恰好一致。
+	//
+	//   序号而非 model 名做别名:零注入风险,且两个 model 映射到同一张物理表
+	//   时不会撞车(用 model 名就会)。同深度之间按 From->To 排,只为让同样输入
+	//   永远得到同一份 SQL。
 	keys := make([]string, 0, len(keep))
 	for k := range keep {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keep[keys[i]], keep[keys[j]]
+		if a.depth != b.depth {
+			return a.depth < b.depth
+		}
+		return keys[i] < keys[j]
+	})
 	plan.Aliases[base.Name] = "t0"
 	for i, k := range keys {
 		e := keep[k]

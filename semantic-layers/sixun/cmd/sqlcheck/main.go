@@ -70,6 +70,12 @@ type config struct {
 		TablePurchaseSheet string `yaml:"table_purchase_sheet"`
 		TablePurchaseLn    string `yaml:"table_purchase_sheet_line"`
 		TableSaleDay       string `yaml:"table_sale_day"`
+		// 销售报表四件套。与 cmd/sixun-<family>/main.go 的 liveTables 是
+		// **同一个集合的三份拷贝之一** —— 见 loadSchemas 里 srcTables 的注释。
+		TableSalesReport   string `yaml:"table_sales_report"`
+		TableItem          string `yaml:"table_item"`
+		TableItemCls       string `yaml:"table_item_cls"`
+		TableItemClsParent string `yaml:"table_item_cls_parent"`
 	} `yaml:"source"`
 }
 
@@ -485,6 +491,71 @@ func buildCases() []checkCase {
 				Limit:      lim(5),
 			},
 		},
+		// ====== 销售报表(2026-10-15)======
+		// 基准日 2026-10-10,与既有报表系统逐分对账过:
+		//   总额 18896.38 / 数量 3573.85;
+		//   按父类别 → 生鲜联营 4994.70、百货联营 2340.70。
+		{
+			name: "销售报表-单日总额", base: "sales_report",
+			desc: "金额/数量/参考成本/成本覆盖率一起取,净销售额=减退货",
+			query: &cubequery.Query{
+				Measures: []string{
+					"sales_report.total_net_amount",
+					"sales_report.total_net_qty",
+					"sales_report.total_ref_cost",
+					"sales_report.costed_rows",
+					"sales_report.count",
+				},
+				Filters: []cubequery.Filter{
+					{Member: "sales_report.oper_date", Operator: "gte", Values: []any{"2026-10-10"}},
+					{Member: "sales_report.oper_date", Operator: "lte", Values: []any{"2026-10-10"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "销售报表-按父类别(三段join)", base: "sales_report",
+			desc: "sales_report→item→item_cls→item_cls_parent,类别取**父**类别",
+			query: &cubequery.Query{
+				Measures:   []string{"sales_report.total_net_amount", "sales_report.total_net_qty"},
+				Dimensions: []string{"item_cls_parent.id", "item_cls_parent.name"},
+				Filters: []cubequery.Filter{
+					{Member: "sales_report.oper_date", Operator: "gte", Values: []any{"2026-10-10"}},
+					{Member: "sales_report.oper_date", Operator: "lte", Values: []any{"2026-10-10"}},
+				},
+				// 500 是为了让**全部分组**都出来:类别组数量在两位数到几十之间,
+				// limit 给小了就只能看到任意前 N 组,而"生鲜联营 4994.70"这种
+				// 逐分对账的结论就会因运气而成立或失效。
+				Limit: lim(500),
+			},
+		},
+		{
+			name: "销售报表-按商品", base: "sales_report",
+			desc: "编码取流水侧 item_no(缺档案也不丢行),名称/单位取 item 侧",
+			query: &cubequery.Query{
+				Measures: []string{"sales_report.total_net_amount", "sales_report.total_net_qty"},
+				Dimensions: []string{
+					"sales_report.item_no",
+					"item.name",
+					"item.unit",
+				},
+				Filters: []cubequery.Filter{
+					{Member: "sales_report.oper_date", Operator: "gte", Values: []any{"2026-10-10"}},
+					{Member: "sales_report.oper_date", Operator: "lte", Values: []any{"2026-10-10"}},
+				},
+				Limit: lim(10),
+			},
+		},
+		{
+			name: "销售报表-错前缀应被拒", base: "sales_report", wantErr: true,
+			desc: "item_cls_parent 的成员不能用 sales_report. 前缀:" +
+				"用错前缀不会返回空行,而是让父类别聚成 unnamed 的一坨",
+			query: &cubequery.Query{
+				Measures:   []string{"sales_report.total_net_amount"},
+				Dimensions: []string{"sales_report.item_cls_parent"},
+				Limit:      lim(5),
+			},
+		},
 		{
 			name: "未声明join-应被拒", base: "settlement_line", wantErr: true,
 			errMatch: "no join chain",
@@ -510,6 +581,12 @@ func loadSchemas(mappingDir string, cfg *config) (
 	mappers := map[string]*fieldmapping.Mapper{}
 
 	// live model 的源表名来自实例 config(表名是 family 私有事实,不进 schema)。
+	//
+	// ⚠️ 这是同一集合的**第三份拷贝**(另两份在 cmd/sixun-<family>/main.go)。
+	//   三份必然漂移,而漂移的后果最阴:漏配只打一行 WARN 然后该 model
+	//   静默从 live 集合消失 —— sqlcheck 照样打印 "N passed" ,看上去验过了。
+	//   少一个 model,验证的覆盖面就少一块而**不会有任何红**。
+	//   → TestLiveModelsHaveSourceTableEverywhere 锁住这三份与 schema 的 storage 声明一致。
 	srcTables := map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLn,
@@ -517,6 +594,10 @@ func loadSchemas(mappingDir string, cfg *config) (
 		"purchase_sheet_line": cfg.Source.TablePurchaseLn,
 		"sale_day":            cfg.Source.TableSaleDay,
 		"stock":               cfg.Source.TableStock,
+		"sales_report":        cfg.Source.TableSalesReport,
+		"item":                cfg.Source.TableItem,
+		"item_cls":            cfg.Source.TableItemCls,
+		"item_cls_parent":     cfg.Source.TableItemClsParent,
 	}
 
 	names, err := models.ModelNames()

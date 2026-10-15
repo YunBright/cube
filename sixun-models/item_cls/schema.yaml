@@ -1,0 +1,66 @@
+# item_cls model - 销售报表的**末级类别**节点(自关联的一跳)
+#
+# 源表:t_bd_item_cls(类别字典,自关联)
+#
+# # 为什么它和 item_cls_parent 是两个模型、却指向同一张表
+#
+# 报表要的是**父类别**(cls_parent 指向的那一层的名称),而 cls_parent
+# 只存在于 t_bd_item_cls 自己这张表上,所以必须"先落到末级行、
+# 再从末级行跳到父级行"两跳。
+#
+# ⚠️ 但 pkg/cubequery/join.go 的 planJoins 用 `visited` 去重:
+# **同一个 model 名只能被 join 一次**,第二次声明同名 join 会被
+# `if visited[j.Name] { continue }` 静默跳过 —— 于是"自连接同一张表两次"
+# 根本走不通,而且**不报错**(只是父类别名悄悄变成空)。
+#
+# ✅ 同一个文件的别名分配处已经写明了正解:
+#   "别名按 (From, To) 排序后依次分配 —— 序号而非 model 名:
+#    两个 model 映射到同一张物理表时不会撞车"
+# 所以做法是:**两个不同的 model 名,映射到同一张物理表**,
+# 它们在 join registry 里是两个独立条目、拿两个不同别名。
+#
+# ✅ 实测唯一性(决定 LEFT JOIN 会不会扇出):
+#   hbposepro t_bd_item_cls 596 行 / 596 个不同 RTRIM(item_clsno) —— 唯一。
+#   ✅ 13 行 cls_parent 为空(无父级),0 行自指 → 这 13 行 LEFT JOIN 后
+#   父类别名为空,**行本身不丢**,这与既有报表把 210.00 元归到
+#   「联营·其它」的口径一致。
+name: item_cls
+sql_table: item_cls
+storage: live
+
+primary_key: id
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 类别编码
+
+  - name: name
+    sql: name
+    type: string
+    title: 类别名称
+    description: |
+      ⚠️ **不要**把它当报表主维度。✅ 实测 hbposepro 2026-10-10 按末级
+      聚合得到的是「佳乐超市猪肉部」「谢志威床上用品」这类**商品/供应商级**
+      分类,与既有报表系统的经营口径完全不同(那边按 cls_parent 聚合,
+      生鲜联营 4994.70 / 百货联营 2340.70 逐分对得上)。
+      它只用于下钻。
+
+  - name: parent_no
+    sql: parent_no
+    type: string
+    title: 父类别编码
+    description: 源列 cls_parent。varchar(12);✅ 实测 13 行为空
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 行数
+
+joins:
+  - name: item_cls_parent
+    sql: item_cls_parent
+    on: "{CUBE}.parent_no = item_cls_parent.id"
+    relationship: many_to_one

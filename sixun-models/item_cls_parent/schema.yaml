@@ -1,0 +1,50 @@
+# item_cls_parent model - 销售报表的**父类别**节点(报表主维度)
+#
+# 源表:t_bd_item_cls(与 item_cls **同一张物理表**,不同 model 名)
+#
+# # 为什么必须单列一个 model
+#
+# pkg/cubequery/join.go 的 planJoins 用 `visited` 去重,同一个 model 名
+# 只能被 join 一次 —— 自连接同一张表两次走不通,而且是**静默**的
+# (`if visited[j.Name] { continue }`),症状是父类别名全空而查询照常 200。
+#
+# 同一文件的别名分配注释已给出正解:"两个 model 映射到同一张物理表时
+# 不会撞车"。本 model 就是那个"另一个 model 名"。
+# 详见 item_cls/schema.yaml 的完整说明。
+#
+# # 这里是报表的主维度
+#
+# ✅ 实测 hbposepro 2026-10-10 与既有报表系统**逐分对账**:
+#   按 cls_parent 聚合 → 生鲜联营 4994.70 / 874.44、百货联营 2340.70 / 108.00,
+#   与对方报表分毫不差;
+#   按末级 item_clsname 聚合 → 「佳乐超市猪肉部」这类商品名,完全是另一套。
+#
+# ⚠️ 调用方(supertrade internal/salesagg/service/query.go 的 dimSpecs)
+#   只 select 这两个成员。cube 的 dimensions 全部进 GROUP BY,
+#   多带一个 item_cls.name 就会把一个父类别按末级裂成十几行,汇总数失真。
+name: item_cls_parent
+sql_table: item_cls_parent
+storage: live
+
+primary_key: id
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 父类别编码
+
+  - name: name
+    sql: name
+    type: string
+    title: 父类别名称
+    description: |
+      如「生鲜联营」「百货联营」。这一层才是既有报表展示的口径。
+      ✅ 13 个末级类别没有父级,LEFT JOIN 后这里为空 —— 那些行仍然
+      留在结果里(金额计入),只是归到一个空名称分组。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 行数

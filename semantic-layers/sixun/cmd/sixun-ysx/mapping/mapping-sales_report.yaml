@@ -1,0 +1,54 @@
+# sales_report mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_rm_daysum —— 与 mapping-sale_day.yaml 同一张表。
+#
+# ⚠️ 为什么不复用 mapping-sale_day.yaml:
+#   那份把 item_no 映射成 canonical 名 `product_id`、oper_date → business_date,
+#   是按 sale_day 的 schema 写的。canonical 名必须与 schema.yaml 的
+#   dimension/measure 名逐字一致(rewriteFor 靠它把 schema 名换成物理列),
+#   两份不同 schema 共用一份 mapping 必然有一边对不上。
+#
+# ⚠️ oper_date 是 char(10) 字符串,映射为 string —— 套 datetime 会让
+#   时间窗口过滤走 CAST,百万行全表扫描。
+version: 1
+model: sales_report
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: item_no
+    target: item_no
+    type: string
+
+  - source: oper_date
+    target: oper_date
+    type: string
+
+  # ---- 金额 / 数量(measure 用)----
+  - source: sale_amt
+    target: sale_amt
+    type: decimal
+    unit: yuan
+
+  - source: ret_amt
+    target: ret_amt
+    type: decimal
+    unit: yuan
+
+  - source: sale_qty
+    target: sale_qty
+    type: decimal
+
+  - source: ret_qty
+    target: ret_qty
+    type: decimal
+
+  - source: cost_price
+    target: cost_price
+    type: decimal
+    unit: yuan
+
+  # ⚠️ branch_no **故意不映射**:数据源的门店区域已被业务要求忽略,
+  #   schema 里也没有对应维度,映射它只会诱使后来者"顺手加回来"。

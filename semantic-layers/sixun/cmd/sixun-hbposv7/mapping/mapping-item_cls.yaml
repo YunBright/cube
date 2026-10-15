@@ -1,0 +1,25 @@
+# item_cls mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_bd_item_cls(类别字典,自关联)。
+#
+# ⚠️ 不与 mapping-category.yaml 共用:那份的 canonical 名是按 category
+#   schema 写的,rewriteFor 靠 canonical 名把 schema 成员换成物理列,
+#   两份 schema 共用一份 mapping 必然有一边对不上。
+#
+# ✅ 实测唯一性:hbposepro 596 行 / 596 个不同 RTRIM(item_clsno)。
+#   这是 many_to_one LEFT JOIN 不扇出的前提。
+version: 1
+model: item_cls
+
+mappings:
+  - source: item_clsno
+    target: id
+    type: string
+
+  - source: item_clsname
+    target: name
+    type: string
+
+  - source: cls_parent
+    target: parent_no
+    type: string

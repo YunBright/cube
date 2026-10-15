@@ -89,6 +89,17 @@ type appConfig struct {
 		TablePurchaseSheet   string `yaml:"table_purchase_sheet"`
 		TablePurchaseSheetLn string `yaml:"table_purchase_sheet_line"`
 		TableSaleDay         string `yaml:"table_sale_day"`
+		// 销售报表(2026-10-15)。日汇总流水 + 商品档案 + 类别字典。
+		//
+		// ⚠️ TableItemClsParent 与 TableItemCls 指向**同一张物理表**(t_bd_item_cls),
+		//   靠自关联的 cls_parent 取父类别。同表两个 model 是 pkg/cubequery/join.go
+		//   明确给出的机制(planJoins 的 visited 不允许自连接同一 model 名)。
+		// ⚠️ 数据源的门店区域(branch_no)刻意不接进来:业务口径已确认忽略门店区域,
+		//   接入它等于让"按门店过滤"重新变成一条没人验证过 WHERE。
+		TableSalesReport   string `yaml:"table_sales_report"`
+		TableItem          string `yaml:"table_item"`
+		TableItemCls       string `yaml:"table_item_cls"`
+		TableItemClsParent string `yaml:"table_item_cls_parent"`
 		// RowLimit 所有角色共用的拉取行数上限;<=0 回落到 source.DefaultRowLimit。
 		RowLimit int `yaml:"row_limit"`
 		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
@@ -564,6 +575,12 @@ func liveTables(cfg *appConfig) map[string]string {
 		"purchase_sheet_line": cfg.Source.TablePurchaseSheetLn,
 		"sale_day":            cfg.Source.TableSaleDay,
 		"stock":               cfg.Source.TableStock,
+		// 销售报表四件套。item / item_cls / item_cls_parent 同理各要一张表名:
+		// 少配一个,对应 model 会在 main() 里被跳过并只留一行日志。
+		"sales_report":    cfg.Source.TableSalesReport,
+		"item":            cfg.Source.TableItem,
+		"item_cls":        cfg.Source.TableItemCls,
+		"item_cls_parent": cfg.Source.TableItemClsParent,
 	}
 }
 

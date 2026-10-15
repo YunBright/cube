@@ -1,0 +1,21 @@
+# item_cls_parent mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_bd_item_cls —— 与 item_cls **同一张物理表**,但 canonical 名独立。
+#
+# 为什么必须独立:canonical 名必须与 schema.yaml 的成员名逐字一致
+# (rewriteFor 靠它把 schema 名换成物理列)。两个 model 共用一份 mapping
+# 就有一边对不上,而症状是"查得通但列全空"。
+#
+# 这也正是"两个 model 名映射到同一张表"这条路径成立的前提 ——
+# 详见 pkg/cubequery/join.go 里别名分配处的注释。
+version: 1
+model: item_cls_parent
+
+mappings:
+  - source: item_clsno
+    target: id
+    type: string
+
+  - source: item_clsname
+    target: name
+    type: string
