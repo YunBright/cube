@@ -1,0 +1,47 @@
+# hbposv7 promotion mapping(与 ysx 内容一致 —— 2026-10-15 两库实测同表同列)
+#
+# ⚠️ 本库 t_pub_plan_flow 实测 0 行:表结构在、查询不报错,但永远查不到促销。
+#   映射仍然配齐 —— 业务方哪天启用了促销模块,不需要改 cube 就能直接生效。
+#
+# ⚠️ 只有两个列名需要翻译,且都是**语义反转**的:
+#   sale_price → orig_price  (源列是原价)
+#   price      → promo_price (源列是促销价)
+version: 1
+model: promotion
+
+mappings:
+  - source: item_no
+    target: item_no
+    type: string
+
+  - source: plan_no
+    target: plan_no
+    type: string
+
+  - source: plan_name
+    target: plan_name
+    type: string
+
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  # ⚠️ sale_price = **原价**(不是促销价),命名反直觉,见 schema 注释。
+  - source: sale_price
+    target: orig_price
+    type: decimal
+    unit: yuan
+
+  # ⚠️ price = **促销价**(不是原价),命名反直觉,见 schema 注释。
+  - source: price
+    target: promo_price
+    type: decimal
+    unit: yuan
+
+  - source: begin_date
+    target: begin_date
+    type: datetime
+
+  - source: end_date
+    target: end_date
+    type: datetime

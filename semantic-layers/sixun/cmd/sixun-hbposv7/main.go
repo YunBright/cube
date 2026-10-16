@@ -100,6 +100,9 @@ type appConfig struct {
 		TableItem          string `yaml:"table_item"`
 		TableItemCls       string `yaml:"table_item_cls"`
 		TableItemClsParent string `yaml:"table_item_cls_parent"`
+		// 促销(2026-10-15)。POP 价签打印要"当前生效特价",时效性极强,
+		// 所以 promotion 是 live model(不落 DuckDB),漏配表名该 model 直接不可查。
+		TablePromotion string `yaml:"table_promotion"`
 		// RowLimit 所有角色共用的拉取行数上限;<=0 回落到 source.DefaultRowLimit。
 		RowLimit int `yaml:"row_limit"`
 		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
@@ -581,6 +584,7 @@ func liveTables(cfg *appConfig) map[string]string {
 		"item":            cfg.Source.TableItem,
 		"item_cls":        cfg.Source.TableItemCls,
 		"item_cls_parent": cfg.Source.TableItemClsParent,
+		"promotion":       cfg.Source.TablePromotion,
 	}
 }
 

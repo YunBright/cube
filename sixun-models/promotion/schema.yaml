@@ -1,0 +1,149 @@
+# promotion model - 思迅促销(特价)当前生效价
+#
+# 源表:t_pub_plan_flow
+#   2026-10-15 两库真库 introspect 实测,列完全一致(25 列),命名一致。
+#   本文件用**两个 family 共用的 canonical 名**,源库列名由各 family 的
+#   mapping-promotion.yaml 负责翻译(见文件末尾「命名反直觉」一节)。
+#
+# # 为什么是 storage: live
+#
+# 促销单是**时效数据**:begin_date/end_date 一到就失效,而且随时会有新单录入。
+# 落 DuckDB 快照等于把"当前生效价"变成"某次刷新时刻的生效价",
+# 而 POP 价签打印要的是**按下打印那一刻**的价 —— 快照必然过期。
+# 与 stock 同理:cube 不做原始数据同步,查询时透传源库。
+#
+# # 没有 primary_key
+#
+# 主键只对走增量的 duck model 有意义(见 cubeschema.Model.PrimaryKey 注释)。
+# live model 不落盘、不 upsert,声明了反而是误导 —— stock / settlement 同样不声明。
+#
+# # RTRIM:item_no / plan_no / branch_no 都是 char/varchar 补空格
+#
+# 思迅补空格规则在不同库不一致(hbposv7 补、ysx 不补)。
+# 等值过滤**两侧**都必须是 RTRIM 后的值:dim.SQL 是源库侧表达式,
+# 所以把 RTRIM 写在这里,过滤条件就自动变成 `RTRIM(item_no) = @p1`,
+# 上游传不带空格的条码即可命中。**只在 SELECT 侧 RTRIM 是不够的** ——
+# 那样 WHERE 比的是补空格的原值,等值过滤会静默全部落空(0 行,不报错)。
+name: promotion
+sql_table: promotion
+storage: live
+
+dimensions:
+  # 商品编号 = 商品条码。supertrade 侧按 item_no 精确查(与 product.id 同一套编码)。
+  # 全仓约定:t_bd_item_info.item_no 就是条码(实测 6957583900828 / 6922255400104 形态),
+  # t_bd_item_info.item_subno 在本栈的 mapping 里**不存在**,不要按它 join。
+  - name: item_no
+    sql: RTRIM(item_no)
+    type: string
+    title: 商品条码
+
+  - name: plan_no
+    sql: RTRIM(plan_no)
+    type: string
+    title: 促销单号
+
+  - name: plan_name
+    sql: RTRIM(plan_name)
+    type: string
+    title: 促销单名称
+
+  # 门店号。'00|' = 全部门店 —— 实测本栈所有生效促销都是 '00|',
+  # 所以**不接门店过滤**(与 stock.branch_id 同理:编码两套,且不许猜)。
+  - name: branch_no
+    sql: RTRIM(branch_no)
+    type: string
+    title: 门店号(00 = 全部门店)
+
+  # 原价。canonical 名是 orig_price,源列是 sale_price(mapping 翻译)。
+  - name: orig_price
+    sql: orig_price
+    type: number
+    title: 原价(元)
+
+  # 促销价。canonical 名是 promo_price,源列是 price(mapping 翻译)。
+  - name: promo_price
+    sql: promo_price
+    type: number
+    title: 促销价(元)
+
+  - name: begin_date
+    sql: begin_date
+    type: time
+    title: 活动起始
+
+  - name: end_date
+    sql: end_date
+    type: time
+    title: 活动截止
+
+  # ---- 给"只要日期"的消费方用的两个派生维度 ----
+  #
+  # 为什么需要:begin_date / end_date 是真 datetime,而 cube 会给**维度列**
+  # 统一包 RTRIM(为了治 char 列补空格),于是它们从 JSON 里是以**字符串**
+  # 回来的,且格式是 SQL Server 当前语言下的显示格式:
+  #     "Jul  1 2026 12:00AM"
+  # 解析这种串要依赖 DB 的 SET LANGUAGE,换个实例就挂 ——
+  # 所以**不要**在消费方解析 begin_date / end_date,改用下面两个。
+  #
+  # CONVERT(..., 23) 是 yyyy-mm-dd 的**固定** ISO 写法,SQL Server 2008 起可用,
+  # 不随 language / dateformat 变化。两个 family 的源库都是 2008 R2(实测)。
+  - name: begin_day
+    sql: "CONVERT(varchar(10), begin_date, 23)"
+    type: string
+    title: 活动起始日(ISO)
+
+  - name: end_day
+    sql: "CONVERT(varchar(10), end_date, 23)"
+    type: string
+    title: 活动截止日(ISO)
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 促销记录数
+
+  # 同一 item 可能被多个促销单覆盖。调用方取 min = 用户实际能买到的最低价。
+  # ⚠️ 表达式里的 promo_price 是 **canonical** 名,同样经 mapping 翻成 price。
+  - name: min_promo_price
+    sql: "MIN(ISNULL(promo_price, 0))"
+    type: number
+    title: 最低促销价(元)
+    format: "0.00"
+
+  - name: max_promo_price
+    sql: "MAX(ISNULL(promo_price, 0))"
+    type: number
+    title: 最高促销价(元)
+    format: "0.00"
+
+  # 用来在多促销单之间定位"具体是哪个单",再取回该单的 plan_no / 起止日期。
+  - name: avg_promo_price
+    sql: "AVG(ISNULL(promo_price, 0))"
+    type: number
+    title: 平均促销价(元)
+    format: "0.00"
+
+# ============================================================
+# 命名反直觉 —— 源列名与语义**相反**(2026-10-15 两库实测确认)
+#
+#   t_pub_plan_flow.sale_price = **原价**
+#   t_pub_plan_flow.price      = **促销价**
+#
+# 直觉会写成 `sale_price → promo_price`,于是价签印出
+# 「原价 ¥3.50 / 促销价 ¥9.90」,而且**全程不报错**。
+# → 靠 mapping 强制改名:源 sale_price → canonical orig_price,
+#   源 price → canonical promo_price。canonical 名在这里是**唯一**的语义锚点,
+#   任何直接读源列名的新代码都会立刻显得可疑。
+# ============================================================
+#
+# ⚠️ 消费方必须知道:cube 会给**维度列**统一包一层 RTRIM
+#    (pkg/cubequery.TrimExpr,思迅 char 列补空格的老问题)。
+#    后果是**数字/日期维度也从 JSON 里以字符串回来**:
+#      promotion.orig_price  → "59.60"        (不是 number)
+#      promotion.end_date    → "Jul  1 2026 12:00AM"
+#    度量**不会**被包(否则破坏 AVG/COUNT),所以:
+#      promotion.min_promo_price → 10.80      (是 number)
+#    → **要数值就走 measure**(min_promo_price),别把 orig_price 当数字用。
+#      supertrade 侧对 orig_price 做了宽松解析(json.Number / string 都收)。
+# ============================================================

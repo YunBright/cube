@@ -33,6 +33,14 @@ source:
   table_purchase_sheet_line: t_pm_sheet_detail
   table_sale_day:            t_rm_daysum
 
+  # promotion(POP 价签"当前生效特价",2026-10-15)
+  # ⚠️ 本库 t_pub_plan_flow 实测 **0 行**(2026-10-15 逐表 COUNT)。
+  #   同库 t_pub_plan_master / t_cbo_plan_info / t_wx_promotion 也都是 0 行 ——
+  #   思迅 7pro 这套促销模块在本门店**从未启用**,不是"暂时没录单"。
+  #   → 配了不会报错,但 pricing 服务查 promotion 会稳定返回"无生效促销"。
+  #   同一张表在 ysx(hbposv10)有 31355 行 / 731 行当前生效,数据是齐的。
+  table_promotion: t_pub_plan_flow
+
   # 拉取行数上限,**只对 storage: duck 的 model 生效**(supplier/product/category/sale_detail)。
   # ⚠️ fetch 用的是 `SELECT TOP N * FROM t`(无 ORDER BY),截断丢的是随机行,
   #    而且 healthz 全绿 —— 这就是历史上 TOP 10000 让 hbposv7 丢 77% 商品的原因。

@@ -26,6 +26,16 @@ source:
   table_purchase_sheet_line: t_pm_sheet_detail
   table_sale_day:            t_rm_daysum
 
+  # promotion(POP 价签"当前生效特价",2026-10-15)
+  # ✅ 本库是促销数据**真正在用**的那一个:2026-10-15 实测
+  #    t_pub_plan_flow 共 31355 行,其中 731 行当前生效
+  #    (begin_date <= today <= end_date 且 price > 0),
+  #    且这 731 行**全部**能在 t_bd_item_info 里按 item_no 匹配到商品。
+  #    item_no = 13 位 EAN-13 条码,branch_no = '00|' 表示全部门店。
+  # ⚠️ 命名反直觉:源列 sale_price 是**原价**,price 才是**促销价**。
+  #    schema 里已映射成 orig_price / promo_price,别在 SQL 里直接用 price 当原价。
+  table_promotion: t_pub_plan_flow
+
   # 拉取行数上限,**只对 storage: duck 的 model 生效**(supplier/product/category/sale_detail)。
   # ⚠️ fetch 用的是 `SELECT TOP N * FROM t`(无 ORDER BY),截断丢的是随机行,
   #    而且 healthz 全绿 —— 这就是历史上 TOP 10000 让 ysx 丢 63% 商品、

@@ -76,6 +76,7 @@ type config struct {
 		TableItem          string `yaml:"table_item"`
 		TableItemCls       string `yaml:"table_item_cls"`
 		TableItemClsParent string `yaml:"table_item_cls_parent"`
+		TablePromotion     string `yaml:"table_promotion"`
 	} `yaml:"source"`
 }
 
@@ -566,6 +567,77 @@ func buildCases() []checkCase {
 				Limit:      lim(5),
 			},
 		},
+		// ====== 促销(2026-10-15)======
+		// 验证的是**整条链**:canonical 名 → mapping 翻译 → 真实列名。
+		// 单测断言不了"ISNULL(promo_price) 里的 promo_price 有没有被翻成 price"，
+		// 而漏翻的症状是 SQL 报"列名无效"或 promo_price 恒为 0。
+		{
+			name: "促销-当前生效按商品", base: "promotion",
+			desc: "按 item_no 分组取最低促销价 + 原价 + 单号 + 起止。" +
+				"⚠️ 时间窗**必须用 inDateRange 而不是 gte/lte**:begin_date/end_date 是真 datetime," +
+				"而 gte/lte 编译成 RTRIM(col) >= ? —— 对 datetime 做**字符串比较**," +
+				"结果是恒不匹配且不报错(2026-10-15 实测 gte/lte 返回 0 行、inDateRange 返回 731)。" +
+				"inDateRange 会把列 CAST 成 DATE 再比。",
+			query: &cubequery.Query{
+				Measures: []string{"promotion.count", "promotion.min_promo_price"},
+				Dimensions: []string{
+					"promotion.item_no", "promotion.orig_price",
+					"promotion.plan_no", "promotion.begin_date", "promotion.end_date",
+				},
+				Filters: []cubequery.Filter{
+					// begin_date <= 今天:下界取最小 ISO 日期
+					{Member: "promotion.begin_date", Operator: "inDateRange",
+						Values: []any{"1900-01-01", "2026-10-15"}},
+					// end_date >= 今天:上界取 DATE 能表示的最大日
+					{Member: "promotion.end_date", Operator: "inDateRange",
+						Values: []any{"2026-10-15", "2999-12-31"}},
+				},
+				Limit: lim(10),
+			},
+		},
+		{
+			// RTRIM 的真正价值在这一条:上游传**不带尾随空格**的条码。
+			// 若 RTRIM 没落到 WHERE 上,hbposv7 那种补空格的库会返回 0 行且不报错。
+			name: "促销-按条码精确查(验证 RTRIM 落到 WHERE)", base: "promotion",
+			desc: "用 ysx 实测存在的条码查;命中即证明 RTRIM 在过滤侧生效",
+			query: &cubequery.Query{
+				Measures: []string{"promotion.min_promo_price"},
+				Dimensions: []string{
+					"promotion.item_no", "promotion.orig_price", "promotion.end_date",
+				},
+				Filters: []cubequery.Filter{
+					{Member: "promotion.item_no", Operator: "equals",
+						Values: []any{"6922255400104"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// BEGIN/END_DAY 是给消费方(eslint 不,是 supertrade / 前端)用的:
+			// 验证 CONVERT(...,23) 真的产出 ISO,且不被 RTRIM 包(它不是简单列名)。
+			// 若这层坏了,下游只能拿到 "Jul  1 2026 12:00AM" 这种依赖 DB language 的串。
+			name: "促销-ISO日期维度", base: "promotion",
+			desc: "begin_day/end_day 必须形如 2026-10-20,且 SQL 里不能出现 RTRIM(CONVERT",
+			query: &cubequery.Query{
+				Measures:   []string{"promotion.min_promo_price"},
+				Dimensions: []string{"promotion.item_no", "promotion.begin_day", "promotion.end_day"},
+				Filters: []cubequery.Filter{
+					{Member: "promotion.item_no", Operator: "equals",
+						Values: []any{"6922255400104"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// 负向:wrong member prefix 必须被拒,而不是静默返回 unnamed 的一坨。
+			name: "促销-错前缀应被拒", base: "promotion", wantErr: true,
+			desc:     "product.id 不是 promotion 的成员",
+			query: &cubequery.Query{
+				Measures:   []string{"promotion.count"},
+				Dimensions: []string{"product.id"},
+				Limit:      lim(5),
+			},
+		},
 	}
 }
 
@@ -598,6 +670,7 @@ func loadSchemas(mappingDir string, cfg *config) (
 		"item":                cfg.Source.TableItem,
 		"item_cls":            cfg.Source.TableItemCls,
 		"item_cls_parent":     cfg.Source.TableItemClsParent,
+		"promotion":           cfg.Source.TablePromotion,
 	}
 
 	names, err := models.ModelNames()

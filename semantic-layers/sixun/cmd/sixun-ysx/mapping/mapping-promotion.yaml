@@ -1,0 +1,47 @@
+# ysx promotion mapping(与 hbposv7 内容一致 —— 2026-10-15 两库实测同表同列)
+#
+# ⚠️ 只有两个列名需要翻译,且都是**语义反转**的:
+#   sale_price → orig_price  (源列是原价)
+#   price      → promo_price (源列是促销价)
+# 其余列两库同名,走 identity 映射 —— 显式列出而不是省略,
+# 是为了让"这张表到底用了哪些列"在 mapping 里一眼可见,
+# 也让 live model 的契约测试能验证维度齐全。
+version: 1
+model: promotion
+
+mappings:
+  - source: item_no
+    target: item_no
+    type: string
+
+  - source: plan_no
+    target: plan_no
+    type: string
+
+  - source: plan_name
+    target: plan_name
+    type: string
+
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  # ⚠️ sale_price = **原价**(不是促销价),命名反直觉,见 schema 注释。
+  - source: sale_price
+    target: orig_price
+    type: decimal
+    unit: yuan
+
+  # ⚠️ price = **促销价**(不是原价),命名反直觉,见 schema 注释。
+  - source: price
+    target: promo_price
+    type: decimal
+    unit: yuan
+
+  - source: begin_date
+    target: begin_date
+    type: datetime
+
+  - source: end_date
+    target: end_date
+    type: datetime
