@@ -548,6 +548,31 @@ func buildCases() []checkCase {
 			},
 		},
 		{
+			// 2026-10-16 新增:AI 销售分析的供应商维度。
+			//
+			// 验证的是**两件单测结构上不可能发现的事**:
+			//   1. canonical 名 sales_report.supcust_no 能被 mapping 翻成
+			//      源列 t_rm_daysum.supcust_no(翻错会变成"列不存在"或全空);
+			//   2. 该列在真实数据里**非空**(若为空则 supplier 维度分析整条链路
+			//      静默失效 —— 报表照出,供应商永远是"未知")。
+			//      ✅ 实测 2026-10-09~16 每行都有值,日 70~80 个不同供应商。
+			name: "销售报表-按供应商(流水侧归属)", base: "sales_report",
+			desc: "supcust_no 取自流水 = 这笔钱实际是谁赚的," +
+				"比商品档案的 main_supcust 更可靠(换供应商后档案会错)",
+			query: &cubequery.Query{
+				Measures: []string{"sales_report.total_net_amount", "sales_report.total_net_qty"},
+				Dimensions: []string{
+					"sales_report.supcust_no",
+					"sales_report.item_no",
+				},
+				Filters: []cubequery.Filter{
+					{Member: "sales_report.oper_date", Operator: "gte", Values: []any{"2026-10-16"}},
+					{Member: "sales_report.oper_date", Operator: "lte", Values: []any{"2026-10-16"}},
+				},
+				Limit: lim(20),
+			},
+		},
+		{
 			name: "销售报表-错前缀应被拒", base: "sales_report", wantErr: true,
 			desc: "item_cls_parent 的成员不能用 sales_report. 前缀:" +
 				"用错前缀不会返回空行,而是让父类别聚成 unnamed 的一坨",

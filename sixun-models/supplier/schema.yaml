@@ -22,9 +22,50 @@ dimensions:
     sql: type
     type: string
     title: 类型
+    # ⚠️ 这里的 enum 曾是**反的**:{0:供应商, 1:客户}。
+    # ✅ 2026-10-16 实测 ysx/hbposv10 的 t_bd_supcust_info.sup_type:
+    #     1 → 214 条(正常外部供应商,如「岑溪市泰鼎粮油食品有限公司」)
+    #     5 → 4 条(自用/直供:乐园公司、内蒙古伊利集团、新龙净菜、自产)
+    #     xx → 1 条(「special/内部周转」异常值)
+    # 所以 `1` 是**供应商**,不是客户。写反了会让上层把自用供应商
+    # 当成正常供应商排进"谁的单品更好"的榜单 —— 那正是需求要避免的。
     enum_values:
-      - { value: "0", label: 供应商 }
-      - { value: "1", label: 客户 }
+      - { value: "1", label: 供应商 }
+      - { value: "5", label: 自用/直供 }
+      - { value: "xx", label: 未定义(异常值) }
+
+  # 2026-10-16 新增:区分"供应商(S)"与"客户(C)"。
+  #
+  # ✅ 实测 supcust_flag: S=165(供应商) / C=49(客户)。
+  #   C 这一类包含 运营部、手袋厂、中铁五局搅拌站、银海物业管理处 …
+  #   —— 它们是**零售的 B 端客户,不是供货方**。
+  #   把它们当供应商排名,等于把团购/单位采购混进零售供应商榜单。
+  - name: cust_flag
+    sql: cust_flag
+    type: string
+    title: 供应商/客户标识
+    enum_values:
+      - { value: "S", label: 供应商 }
+      - { value: "C", label: 客户 }
+      - { value: "A", label: 其他 }
+    description: |
+      源列 supcust_flag。**判断"是不是供应商"的第一道闸**,
+      比 type 更可靠:type='1' 里既有真供应商也有被误用的记录,
+      而 cust_flag='C' 是确定无疑的客户。
+      ⚠️ 取值分布随门店而变,这里的 enum 是 ysx 实测值;
+        未知取值应当当作"待判定"而不是默认供应商。
+
+  # 2026-10-16 新增:供货方式。
+  #
+  # ✅ 实测 sale_way 取值 B/C/E/D/A。
+  #   它是**辅助**判据:自用的几条 sale_way 各不相同
+  #   (乐园=B、伊利=C、新龙=E、自产=D),说明这个字段在
+  #   思迅里表达的是各自定义的供货方式,**不能**用它单独识别自用。
+  #   保留它是为了让上层能展示"这个供应商怎么供货",不做判定主依据。
+  - name: supply_way
+    sql: supply_way
+    type: string
+    title: 供货方式
 
   - name: contact
     sql: contact

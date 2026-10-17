@@ -50,5 +50,13 @@ mappings:
     type: decimal
     unit: yuan
 
+  # ---- 供应商(2026-10-16 新增,AI 销售分析的供应商维度靠它)----
+  # ✅ 实测 ysx/hbposv10 的 t_rm_daysum.supcust_no **100% 非空**
+  #   (2026-10-09~16 日 637~864 行全有值,每日 70~80 个不同供应商)。
+  #   它是**这笔销售实际从谁进货**,比商品档案上的 main_supcust 更可靠。
+  - source: supcust_no
+    target: supcust_no
+    type: string
+
   # ⚠️ branch_no **故意不映射**:数据源的门店区域已被业务要求忽略,
   #   schema 里也没有对应维度,映射它只会诱使后来者"顺手加回来"。

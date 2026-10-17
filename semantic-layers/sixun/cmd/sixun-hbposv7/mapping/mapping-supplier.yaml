@@ -13,8 +13,20 @@ mappings:
     target: name
     type: string
 
-  - source: sup_type            # 供应商类型 char(0=供应商,1=客户,2=两者)
+  - source: sup_type            # 供应商类型 char(1=供应商,5=自用/直供)
     target: type
+    type: string
+
+  # 2026-10-16 新增:供应商/客户标识(AI 分析排除自用的第一道闸)。
+  # ✅ 实测 S=供应商 / C=客户(运营部、中铁五局搅拌站…不是供货方)。
+  - source: supcust_flag
+    target: cust_flag
+    type: string
+
+  # 2026-10-16 新增:供货方式(展示用,不做自用判定主依据)。
+  # ✅ 实测自用四条各不相同(B/C/E/D),说明该字段是各店自定义语义。
+  - source: sale_way
+    target: supply_way
     type: string
 
   - source: sup_man             # 联系人 varchar

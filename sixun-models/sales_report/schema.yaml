@@ -52,6 +52,24 @@ dimensions:
       标了 char_date 后时间过滤走原列字符串比较(可走 i_rm_daysum_1),
       不套 CAST —— 否则百万行全表扫描
 
+  # ---- 供应商(2026-10-16 新增,供 AI 销售分析做"哪个供应商单品更好")----
+  #
+  # ⚠️ 取**流水上的** supcust_no,而不是从商品档案 main_supcust 反推:
+  #   ✅ 实测 ysx t_rm_daysum 的 supcust_no **100% 非空**(日 637~864 行全有值,
+  #     每日 70~80 个不同供应商),它记录的是这笔销售**实际**从谁那里进的货。
+  #   反推 main_supcust 拿到的是"档案上写的供应商",商品中途换供应商后
+  #   历史销售的归属会错 —— 对"谁的单品更好"这种结论,错一次就会误导订货。
+  - name: supcust_no
+    sql: supcust_no
+    type: string
+    title: 供应商编码(取自销售流水)
+    description: |
+      源列 t_rm_daysum.supcust_no,**实测 100% 非空**。
+      它与 t_bd_item_info.main_supcust(商品档案上的主供应商)是两回事:
+      本维度回答"这笔钱是谁赚的",档案回答"这个品名义上属于谁"。
+      ⚠️ 没有商品-供应商关联表(实测无 t_bd_item_supply / t_bd_supply),
+        所以本维度是供应商维度分析的唯一可靠来源。
+
 measures:
   - name: count
     sql: "COUNT(*)"
@@ -112,3 +130,21 @@ joins:
     sql: item
     on: "{CUBE}.item_no = item.id"
     relationship: many_to_one
+
+  # 供应商字典:**刻意不声明 join**,原因写在这里(2026-10-16 实测)。
+  #
+  # supplier 是 **storage: duck** 的模型,而 sales_report 是 **live**。
+  # pkg/cubequery/join.go 的 checkStorage 只允许 live→live,
+  # live→duck 会在**查询构造期**直接被拒绝 —— 不是运行时才失败。
+  #
+  # 所以供应商名称不能在同一个 cube query 里 join 出来。实际做法(上层两步):
+  #   1. 按 sales_report.supcust_no 聚合,拿 Top-N 供应商编码
+  #   2. 另发一次 supplier 查询,按这批 id 批量补名称与自用标记
+  # 一次 Top-N 聚合 + 一次按主键批量补,比强行跨 storage join 便宜且稳定。
+  #
+  # ⚠️ 不要"顺手"把这条 join 加上:supplier 字典是 duck 快照(非实时),
+  #   而销售流水是 live,两者时间点不一致,join 出来的名称可能是几分钟前的。
+  #   对"哪个供应商单品更好"这种结论,宁可显式两步查,也不要静默拿到过期名称。
+  #
+  #   若将来确实要单查询 join,前提是 supplier 也改成 live 并接受
+  #   「每次查都打源库」的代价 —— 那是一个需要重新权衡的决定,不是顺手的事。
