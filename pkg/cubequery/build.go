@@ -100,7 +100,7 @@ func Build(q *Query, schema *cubeschema.Model) (*Result, error) {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter dimension not found: " + ref}
 		}
-		expr, args, err := buildFilter(d.SQL, d.CharDate, f.Operator, f.Values, duckTime)
+		expr, args, err := buildFilter(d.SQL, d.CharDate, d.Type == cubeschema.TypeTime, f.Operator, f.Values, duckTime)
 		if err != nil {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter: " + err.Error()}
@@ -290,12 +290,27 @@ func expandSegments(q *Query, schema *cubeschema.Model, expr func(string) string
 // sixun-ysx/main.go,抽到共用包时最容易出的错就是顺手"优化"语义:
 //   - contains = **两侧**通配 `%v%`(不是前缀!ysx 另有 startsWith 才是前缀)
 //   - 少写一个 operator 会让 supertrade 的查询静默变成 400,而不是给出错答案
-func buildFilter(columnSQL string, charDate bool, op string, values []any, td timeDialect) (string, []any, error) {
+func buildFilter(columnSQL string, charDate, isTime bool, op string, values []any, td timeDialect) (string, []any, error) {
 	col := TrimExpr(columnSQL)
 	// 时间比较用的目标表达式,与 time.go 的 timeColumn 同义。
 	target := col
 	if !charDate {
 		target = td.toDate(col)
+	}
+	// cmp 是**大小比较**(gt/gte/lt/lte)用的表达式。
+	//
+	// ⚠️ 日期列必须走 target(CAST 成 DATETIME),不能用 col:
+	// col 是 RTRIM 之后的**文本**表达式,拿它跟 ISO 字面量比大小是没有意义的 ——
+	// MSSQL 会把 datetime 隐式转成 "09  1 2026 12:00AM" 这种串再比,
+	// 结果取决于 SET LANGUAGE,实测恒返 0 行(见 dateop_test.go 的反证)。
+	//
+	// isTime 来自维度声明的 type: time,所以:
+	//   - char_date 列(源列是 char 存 ISO)→ target 就是 col,行为不变;
+	//   - 真 datetime 列 → 转成日期再比,这才是调用方的本意;
+	//   - 非日期列(条码/金额)→ 一律用 col,完全不碰。
+	cmp := col
+	if isTime {
+		cmp = target
 	}
 	one := func(name string) error {
 		if len(values) != 1 {
@@ -343,22 +358,22 @@ func buildFilter(columnSQL string, charDate bool, op string, values []any, td ti
 		if err := one(op); err != nil {
 			return "", nil, err
 		}
-		return col + " > ?", values, nil
+		return cmp + " > ?", values, nil
 	case "gte":
 		if err := one(op); err != nil {
 			return "", nil, err
 		}
-		return col + " >= ?", values, nil
+		return cmp + " >= ?", values, nil
 	case "lt":
 		if err := one(op); err != nil {
 			return "", nil, err
 		}
-		return col + " < ?", values, nil
+		return cmp + " < ?", values, nil
 	case "lte":
 		if err := one(op); err != nil {
 			return "", nil, err
 		}
-		return col + " <= ?", values, nil
+		return cmp + " <= ?", values, nil
 	case "inDateRange", "notInDateRange":
 		if len(values) != 2 {
 			return "", nil, fmt.Errorf("%s needs 2 values (start, end), got %d", op, len(values))

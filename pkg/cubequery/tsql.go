@@ -197,7 +197,7 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter dimension not found: " + ref + " (on model " + mn + ")"}
 		}
-		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate, f.Operator, f.Values, tsqlTime)
+		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate, d.Type == cubeschema.TypeTime, f.Operator, f.Values, tsqlTime)
 		if err != nil {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter: " + err.Error()}
