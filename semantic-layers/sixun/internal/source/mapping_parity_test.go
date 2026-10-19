@@ -103,6 +103,23 @@ func TestSchemaMeasureColumnsAreMapped(t *testing.T) {
 		"COUNT": true, "MIN": true, "MAX": true, "CASE": true, "WHEN": true,
 		"THEN": true, "ELSE": true, "END": true, "AND": true, "OR": true,
 		"IN": true, "AS": true, "NULL": true, "LEFT": true, "RTRIM": true,
+		// **标量函数**与关键字同性质:它们不是列。
+		//
+		// 2026-10-19 之前漏了 ISNULL,于是 promotion 的
+		// `MIN(ISNULL(promo_price, 0))` 被判成"引用了未映射的列 ISNULL",
+		// 这条用例从那时起一直红。核过之后确认是**误报**:
+		// pkg/cubequery 的 rewriteColumns 只替换 mapping 里**声明过的 target**,
+		// ISNULL 不在任何 mapping 的 target 集合里,原样透传,生成的
+		// T-SQL 完全合法。真实缺陷长得完全不一样 —— 它是 canonical 名漏映射,
+		// 症状是查询那一刻的 column not found。
+		//
+		// 判据:**函数名漏进白名单,症状是一条红测试;列名漏映射,症状是线上报错。**
+		// 这条用例要抓的是后者,所以宁可多列几个函数名。
+		"ISNULL": true, "COALESCE": true, "ABS": true, "ROUND": true,
+		"CONVERT": true, "CAST": true, "DATEDIFF": true, "DATEADD": true,
+		"ISNUMERIC": true, "DISTINCT": true, "TOP": true, "BY": true,
+		"ORDER": true, "GROUP": true, "DESC": true, "ASC": true, "OFFSET": true,
+		"FETCH": true, "OVER": true, "PARTITION": true, "UNION": true,
 	}
 
 	entries, err := os.ReadDir(modelsDir)
