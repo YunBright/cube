@@ -42,7 +42,9 @@ import (
 
 	models "github.com/YunBright/cube/sixun-models"
 	categorymodel "github.com/YunBright/cube/sixun-models/category"
+	custtypemodel "github.com/YunBright/cube/sixun-models/cust_type"
 	productmodel "github.com/YunBright/cube/sixun-models/product"
+	salewaymodel "github.com/YunBright/cube/sixun-models/sale_way"
 	salemodel "github.com/YunBright/cube/sixun-models/sale_detail"
 	suppliermodel "github.com/YunBright/cube/sixun-models/supplier"
 
@@ -67,6 +69,13 @@ type appConfig struct {
 		TableSupplier string `yaml:"table_supplier"`
 		TableProduct  string `yaml:"table_product"`
 		TableCategory string `yaml:"table_category"`
+		// TableCustType 是供应商/客户类别字典表(t_bd_cust_type)。
+		// supplier.cust_clsno 指向它;实测 ysx 4 行 / hbposv7 0 行。
+		TableCustType string `yaml:"table_cust_type"`
+		// TableSaleWay 是「销售方式」字典表(t_bd_base_code)。
+		// supplier.supply_way(源列 sale_way)指向它;
+		// 实测两个库的供应商全部有值(ysx 219 / hbposv7 300)。
+		TableSaleWay  string `yaml:"table_sale_way"`
 		TableSale     string `yaml:"table_sale"`
 		TableStock    string `yaml:"table_stock"`
 		// 结算审批场景(2026-10-09)。表名在两个 family 同名同表,
@@ -278,6 +287,8 @@ func main() {
 		TableSupplier: appCfg.Source.TableSupplier,
 		TableProduct:  appCfg.Source.TableProduct,
 		TableCategory: appCfg.Source.TableCategory,
+		TableCustType: appCfg.Source.TableCustType,
+		TableSaleWay:  appCfg.Source.TableSaleWay,
 		TableSale:     appCfg.Source.TableSale,
 		RowLimits:     source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
 	})
@@ -308,6 +319,8 @@ func main() {
 		{Name: "supplier", Fetch: conn.FetchSupplier, Build: suppliermodel.Build},
 		{Name: "product", Fetch: conn.FetchProduct, Build: productmodel.Build},
 		{Name: "category", Fetch: conn.FetchCategory, Build: categorymodel.Build},
+		{Name: "cust_type", Fetch: conn.FetchCustType, Build: custtypemodel.Build},
+		{Name: "sale_way", Fetch: conn.FetchSaleWay, Build: salewaymodel.Build},
 		{Name: "sale_detail", Fetch: conn.FetchSaleDetail, Build: salemodel.Build},
 	}
 	// fresh 记录每次物化的成败,喂给 /healthz。

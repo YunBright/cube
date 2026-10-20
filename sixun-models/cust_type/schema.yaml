@@ -1,0 +1,34 @@
+# cust_type model - 思迅家族 供应商/客户类别字典(t_bd_cust_type)
+#
+# # 它是什么
+#
+# `t_bd_supcust_info.cust_clsno`(供应商的"类别号")指向本表 `type_id`,
+# 本表 `type_name` 是类别的**名字**。
+#
+# 实测(2026-10-20):
+#
+#   ysx(门店 00): 4 行 —— 内部领用 / 批发 / 批发1 / 批发2
+#                  219 个供应商里只有 49 个填了 cust_clsno,其余 170 个是 NULL
+#   hbposv7(门店 01): **0 行**(字典表是空的)⇒ 全部供应商都只能进"未分类"
+#
+# ⇒ 上层(商品选择控件)必须能处理"字典表为空"与"大量供应商未归类"两种情况,
+#   不能假设每个供应商都有一个类别。
+name: cust_type
+sql_table: cust_type
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 类别 ID
+
+  - name: name
+    sql: name
+    type: string
+    title: 类别名称
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 类别数

@@ -1,0 +1,54 @@
+# sale_way model - 思迅家族「销售方式」字典(t_bd_base_code 中 type_no='SW' 的行)
+#
+# # 它是什么
+#
+# `t_bd_supcust_info.sale_way` 是供应商的**销售方式**代码(单字符),
+# 指向本表的 `code_id`;本表 `code_name` 是这个代码的**名字**。
+#
+# 实测(2026-10-20,两个生产库):
+#
+#   ysx(门店 00,hbposv10):   sale_way A=188 C=25 B=4 D=1 E=1(共 219 个供应商,**全部有值**)
+#   hbposv7(门店 01,hbposepro): sale_way A=201 C=95 B=3 F=1(共 300 个供应商,**全部有值**)
+#
+#   字典(SW 子集,两个库内容一致):
+#     A=购销  B=代销  C=联营  D=租赁  E=自产  F=扣率代销
+#
+# # 为什么是"销售方式"而不是"客户类别"
+#
+# 思迅里有**两个**容易混的字段,选错的症状是"下拉框里全是看不懂的名字":
+#
+#   - `cust_clsno` → `t_bd_cust_type`(内部领用 / 批发 / 批发1 / 批发2)
+#     这是**客户类别**。实测 219 个供应商里 170 个是 NULL ——
+#     也就是说这个字典**覆盖不了大部分供应商**,当"供应商类别"用会让
+#     大部分供应商落进"未分类"。
+#   - `sale_way` → `t_bd_base_code` type_no='SW'(购销 / 联营 / 代销 / …)
+#     这是**销售方式**,两个库的供应商**全部有值**。
+#
+# ⇒ 商品选择控件的"供应商第一级"用的是**本模型**(sale_way)。
+# `supplier.cust_clsno` 那个维度仍在 schema 里(它是合法的思迅字段),
+# 但它**不是** App 的"供应商类别"。
+name: sale_way
+sql_table: sale_way
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 销售方式 ID
+    description: |
+      源列 code_id(思迅 t_bd_base_code.code_id),单字符代码:A/B/C/D/E/F。
+      supplier.supply_way 指向它。
+
+  - name: name
+    sql: name
+    type: string
+    title: 销售方式名称
+    description: |
+      源列 code_name(思迅 t_bd_base_code.code_name),中文名:
+      购销 / 代销 / 联营 / 租赁 / 自产 / 扣率代销。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 销售方式数

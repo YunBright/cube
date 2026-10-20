@@ -290,6 +290,10 @@ func expandSegments(q *Query, schema *cubeschema.Model, expr func(string) string
 // sixun-ysx/main.go,抽到共用包时最容易出的错就是顺手"优化"语义:
 //   - contains = **两侧**通配 `%v%`(不是前缀!ysx 另有 startsWith 才是前缀)
 //   - 少写一个 operator 会让 supertrade 的查询静默变成 400,而不是给出错答案
+//
+// 例外:containsCI 是 2026-10-20 **新增**的算子(大小写无关的 contains),
+// 它没有"上线前实现"可对齐 —— 但它同样遵守上面两条铁律:
+// 两侧通配 + 值走参数绑定。
 func buildFilter(columnSQL string, charDate, isTime bool, op string, values []any, td timeDialect) (string, []any, error) {
 	col := TrimExpr(columnSQL)
 	// 时间比较用的目标表达式,与 time.go 的 timeColumn 同义。
@@ -334,6 +338,32 @@ func buildFilter(columnSQL string, charDate, isTime bool, op string, values []an
 			return "", nil, err
 		}
 		return col + " LIKE ?", []any{"%" + likeEscape(fmt.Sprint(values[0])) + "%"}, nil
+	case "containsCI":
+		// 大小写无关的子串匹配。
+		//
+		// # 为什么需要它(而不是让调用方自己去 lower)
+		//
+		// `contains` 编译成 `RTRIM(col) LIKE '%v%'`,而 DuckDB 的 LIKE **大小写敏感**
+		// (实测 "Face" 命中、"face" 不命中;"Z005" 命中、"z00" 不命中)。
+		// 思迅商品名里混着拉丁品牌名(洁柔Face / C&S / H01-04),用户在小键盘或
+		// 中文输入法下打出小写是常事 —— 搜不到就等于功能坏掉。
+		//
+		// 之前的绕法是"再查一次 UPPER(q)",那既多一次 cube 查询,又只覆盖
+		// **全大写**这一种形态("z005" 仍然搜不到 "Z005-69")。
+		//
+		// # 为什么模式侧在 Go 里 lower,而不是写 SQL 的 LOWER(?)
+		//
+		// 「值永远不被拼进 SQL 文本」是这套编译器的铁律(见 buildFilter 的注释),
+		// 值唯一的入参通道是**参数绑定**。写成 `LOWER(?) LIKE ...` 就把值变成了
+		// SQL 表达式的一部分,那条铁律就破了 —— 于是这里在 Go 侧把模式 lower 掉,
+		// 列侧用 SQL 的 LOWER(col)。
+		//
+		// ⚠️ lower 只影响 ASCII 字母;中文与数字原样通过(实测符合预期)。
+		if err := one(op); err != nil {
+			return "", nil, err
+		}
+		pattern := likeEscape(strings.ToLower(fmt.Sprint(values[0])))
+		return "LOWER(" + col + ") LIKE ?", []any{"%" + pattern + "%"}, nil
 	case "notContains":
 		if err := one(op); err != nil {
 			return "", nil, err

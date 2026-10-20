@@ -195,6 +195,24 @@ DuckDB 与 T-SQL 两条路径共用同一份编译逻辑,语义逐字一致。
 **日期类 filter operator**:`inDateRange` / `notInDateRange` / `onTheDate` /
 `beforeDate` / `afterDate`(排他)。值必须是 `YYYY-MM-DD`,否则 400。
 
+**大小写无关的子串匹配**:`containsCI`(2026-10-20 新增)。
+`contains` 编译成 `RTRIM(col) LIKE '%v%'`,而 DuckDB 的 LIKE **大小写敏感**
+(实测 `Face` 命中、`face` 不命中)。思迅商品名里混着拉丁品牌名
+(洁柔Face / C&S / H01-04),用户打出小写就搜不到。
+
+`containsCI` 把**列**与**模式**都转小写再比:
+
+```sql
+LOWER(RTRIM(name)) LIKE '%face%'   -- 模式在编译期 lower,仍走参数绑定
+```
+
+- 模式侧在**编译期** lower(不是 SQL 的 `LOWER(?)`)——「值永远不被拼进 SQL 文本」
+  是这套编译器的铁律,值唯一的入参通道是参数绑定。
+- 两侧通配,与 `contains` 一致;`%` `_` `[` `]` `\` 照常转义。
+- lower 只影响 ASCII 字母,中文与数字原样通过。
+- `contains` 本身**语义不变**(仍大小写敏感)—— 既有调用方(supplier / promotion 等)
+  的查询范围不能被悄悄放宽。
+
 **`segments`**:schema 里预定义的过滤片段,调用方只写名字。
 名字不存在时 400,并在错误里列出可用名字。
 

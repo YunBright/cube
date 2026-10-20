@@ -1,0 +1,13 @@
+# ysx cust_type mapping: 思迅 云商x t_bd_cust_type → 统一 cust_type
+# 与 hbposv7 同 schema(同 source),因为思迅表结构一致。
+version: 1
+model: cust_type
+
+mappings:
+  - source: type_id
+    target: id
+    type: string
+
+  - source: type_name
+    target: name
+    type: string

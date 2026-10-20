@@ -175,6 +175,65 @@ func TestBuild_ContainsEscapesWildcards(t *testing.T) {
 	}
 }
 
+// containsCI:列侧 LOWER(col)、模式侧小写,两侧通配。
+//
+// 为什么要有这条:DuckDB 的 LIKE **大小写敏感** —— 思迅商品名里混着拉丁品牌名
+// (洁柔Face / C&S),用户打出小写 "face" 就搜不到 "Face"。
+// 之前的绕法是"再查一次 UPPER(q)",只覆盖全大写这一种形态。
+func TestBuild_ContainsCIIsCaseInsensitive(t *testing.T) {
+	q := &Query{
+		Measures: []string{"product.count"},
+		Filters:  []Filter{{Member: "product.name", Operator: "containsCI", Values: []any{"FaCe"}}},
+	}
+	res := mustBuild(t, q)
+
+	arg, _ := res.Args[0].(string)
+	if arg != "%face%" {
+		t.Fatalf("containsCI 的模式应转小写并两侧通配,got %q", arg)
+	}
+	if !strings.Contains(res.SQL, "LOWER(") {
+		t.Fatalf("containsCI 的列侧必须包 LOWER,实际: %s", res.SQL)
+	}
+	if !strings.Contains(res.SQL, "LIKE ?") {
+		t.Fatalf("containsCI 应编译成 LIKE,实际: %s", res.SQL)
+	}
+	// 值必须走参数绑定,不能被拼进 SQL 文本。
+	if strings.Contains(res.SQL, "face") {
+		t.Fatalf("值不得出现在 SQL 文本里(必须参数绑定),实际: %s", res.SQL)
+	}
+}
+
+// containsCI 的通配符转义与 contains 一致(lower 之后仍要转义)。
+func TestBuild_ContainsCIEscapesWildcards(t *testing.T) {
+	q := &Query{
+		Measures: []string{"product.count"},
+		Filters:  []Filter{{Member: "product.name", Operator: "containsCI", Values: []any{"50%_X"}}},
+	}
+	arg, _ := mustBuild(t, q).Args[0].(string)
+	if !strings.HasPrefix(arg, `%50\%\_x%`) {
+		t.Fatalf("containsCI 的 LIKE 通配符必须转义,got %q", arg)
+	}
+}
+
+// containsCI 与 contains 是**两个算子**,不是一个的别名。
+//
+// 这条钉的是"别把 contains 的语义改掉":contains 必须仍然是大小写敏感的,
+// 否则老调用方(supplier / promotion 等)的查询结果会静默变宽。
+func TestBuild_ContainsRemainsCaseSensitive(t *testing.T) {
+	q := &Query{
+		Measures: []string{"product.count"},
+		Filters:  []Filter{{Member: "product.name", Operator: "contains", Values: []any{"FaCe"}}},
+	}
+	res := mustBuild(t, q)
+	arg, _ := res.Args[0].(string)
+	if arg != "%FaCe%" {
+		t.Fatalf("contains 必须保持原样(大小写敏感),got %q", arg)
+	}
+	if strings.Contains(res.SQL, "LOWER(") {
+		t.Fatalf("contains 的列侧不得包 LOWER,实际: %s", res.SQL)
+	}
+}
+
 // 无 measure / 无 model / 未知 member 都必须显式报错。
 func TestBuild_RejectsInvalidQueries(t *testing.T) {
 	cases := []struct {

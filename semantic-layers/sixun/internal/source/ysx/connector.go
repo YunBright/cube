@@ -19,6 +19,8 @@ type Connector struct {
 	tableSupplier string
 	tableProduct  string
 	tableCategory string
+	tableCustType string
+	tableSaleWay  string
 	tableSale     string
 	rowLimits     *source.RowLimits
 }
@@ -29,6 +31,15 @@ type Options struct {
 	TableSupplier string
 	TableProduct  string
 	TableCategory string
+	// TableCustType 是供应商/客户类别字典表(t_bd_cust_type)。
+	// 行数极小(实测 ysx 4 行 / hbposv7 0 行),但字典表被截断
+	// = 某些供应商查不到自己的类别。
+	TableCustType string
+	// TableSaleWay 是「销售方式」字典表(t_bd_base_code)。
+	//
+	// ⚠️ 这张表是**通用**基础代码字典,含职称/民族/学历/企业类型/品牌/单位/
+	// 销售方式… 共 30+ 行;只取 type_no='SW' 的子集(见 FetchSaleWay)。
+	TableSaleWay string
 	TableSale     string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
 	RowLimits *source.RowLimits
@@ -58,6 +69,8 @@ func New(opts Options) (*Connector, error) {
 		tableSupplier: opts.TableSupplier,
 		tableProduct:  opts.TableProduct,
 		tableCategory: opts.TableCategory,
+		tableCustType: opts.TableCustType,
+		tableSaleWay:  opts.TableSaleWay,
 		tableSale:     opts.TableSale,
 		rowLimits:     opts.RowLimits,
 	}, nil
@@ -87,6 +100,38 @@ func (c *Connector) FetchCategory(ctx context.Context) ([]map[string]any, error)
 	return c.fetchTable(ctx, c.tableCategory, source.RoleCategory)
 }
 
+// FetchCustType 拉供应商/客户类别字典(t_bd_cust_type)。
+//
+// 行数极小(实测 ysx 4 行),但它**独立于 supplier 表**:
+// supplier.cust_clsno 指向的是本表的 type_id,两张表都要拉。
+func (c *Connector) FetchCustType(ctx context.Context) ([]map[string]any, error) {
+	if c.tableCustType == "" {
+		return nil, fmt.Errorf("ysx: table_cust_type not configured")
+	}
+	return c.fetchTable(ctx, c.tableCustType, source.RoleCustType)
+}
+
+// FetchSaleWay 拉「销售方式」字典(t_bd_base_code 中 type_no='SW' 的行)。
+//
+// ⚠️ **必须过滤**:t_bd_base_code 是通用基础代码字典(职称/民族/学历/企业类型/
+// 品牌/单位/销售方式…共 30+ 行),而 code_id 在不同 type_no 下**会重复**
+// ('1' 在职称/民族/学历里都有)。整张表灌进 sale_way model,primary_key 撞车
+// ⇒ 某些行被静默吞掉,查出来的 code_id→code_name 对应关系是错的。
+//
+// 过滤放在这里而不是 mapping:mapping 只做列名重写,不做行过滤;
+// 而 fetchTable 只能 `SELECT TOP n * FROM <表>`,没有 WHERE。
+func (c *Connector) FetchSaleWay(ctx context.Context) ([]map[string]any, error) {
+	if c.tableSaleWay == "" {
+		return nil, fmt.Errorf("ysx: table_sale_way not configured")
+	}
+	rows, err := c.fetchTable(ctx, c.tableSaleWay, source.RoleSaleWay)
+	if err != nil {
+		return nil, err
+	}
+	return source.RequireRows(source.RoleSaleWay,
+		source.FilterRowsByColumn(rows, "type_no", "SW"))
+}
+
 // FetchSaleDetail 拉销售明细(含销售退货)。
 func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, error) {
 	if c.tableSale == "" {
@@ -108,6 +153,10 @@ func (c *Connector) duckTarget(model string) (table, role string, ok bool) {
 		return c.tableSupplier, source.RoleSupplier, true
 	case "category":
 		return c.tableCategory, source.RoleCategory, true
+	case "cust_type":
+		return c.tableCustType, source.RoleCustType, true
+	case "sale_way":
+		return c.tableSaleWay, source.RoleSaleWay, true
 	case "sale_detail":
 		return c.tableSale, source.RoleSale, true
 	}

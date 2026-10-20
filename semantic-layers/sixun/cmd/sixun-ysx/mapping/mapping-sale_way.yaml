@@ -1,0 +1,17 @@
+# ysx sale_way mapping: 思迅 云商x t_bd_base_code(type_no='SW')→ 统一 sale_way
+# 与 hbposv7 同 schema(同 source),因为思迅表结构一致。
+#
+# ⚠️ 取的是 t_bd_base_code 里 **type_no='SW' 的子集**(销售方式),
+#   不是整张基础代码字典(那里面还有职称/民族/学历/企业类型/品牌/单位…)。
+#   过滤在 connector 的 FetchSaleWay 里做,理由见该函数注释。
+version: 1
+model: sale_way
+
+mappings:
+  - source: code_id
+    target: id
+    type: string
+
+  - source: code_name
+    target: name
+    type: string

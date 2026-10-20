@@ -23,6 +23,12 @@ mappings:
     target: cust_flag
     type: string
 
+  # 2026-10-20 新增:供应商类别(指向 cust_type.id)。
+  # ⚠️ 219 个里 170 个是 NULL —— 上层要能显示"未分类"。
+  - source: cust_clsno
+    target: cust_clsno
+    type: string
+
   # 2026-10-16 新增:供货方式(展示用,不做自用判定主依据)。
   # ✅ 实测自用四条各不相同(B/C/E/D),说明该字段是各店自定义语义。
   - source: sale_way

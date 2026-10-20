@@ -55,17 +55,58 @@ dimensions:
       ⚠️ 取值分布随门店而变,这里的 enum 是 ysx 实测值;
         未知取值应当当作"待判定"而不是默认供应商。
 
-  # 2026-10-16 新增:供货方式。
+  # ⚠️ 供应商的**客户类别**(指向 cust_type.id)。
   #
-  # ✅ 实测 sale_way 取值 B/C/E/D/A。
-  #   它是**辅助**判据:自用的几条 sale_way 各不相同
+  # ✅ 实测 cust_clsno 取值 01/02/03/04,与 t_bd_cust_type.type_id 对得上;
+  #    但 219 个供应商里 170 个是 NULL —— 「大部分供应商没归类」是常态,
+  #    上层必须能显示"未分类"而不是把供应商丢掉。
+  #
+  # ⚠️⚠️ **它不是"供应商类别"** —— App 的供应商第一级用的是下面的
+  #    `supply_way`(销售方式:购销/联营/代销/租赁/自产/扣率代销)。
+  #    两者都叫"类别",但覆盖度天差地别:
+  #      cust_clsno → 客户类别:219 个供应商里 170 个是 NULL(78% 没归类)
+  #      supply_way → 销售方式:**两个库的供应商全部有值**
+  #    选错的下游症状:下拉框里大部分供应商挤在"未分类"里。
+  - name: cust_clsno
+    sql: cust_clsno
+    type: string
+    title: 客户类别 ID
+    description: |
+      源列 cust_clsno,指向 cust_type.id(= t_bd_cust_type.type_id)。
+      拿类别**名字**要 join cust_type model —— cube 的 duck 模型之间不能 join,
+      所以名字由上层(supertrade catalog)用 Go 侧 join 补。
+      ⚠️ 这是**客户类别**,不是 App 用的"供应商类别"(那一个是 supply_way)。
+
+  # 2026-10-16 新增:供货方式(源列 sale_way)。
+  #
+  # ✅ 实测 sale_way 取值 B/C/E/D/A;两个库的供应商**全部有值**
+  #   (ysx 219 / hbposv7 300),不像 cust_clsno 有 78% 是 NULL。
+  #
+  # 📌 **这就是 App 的"供应商类别"**(2026-10-20 定):
+  #   业务要的「购销 / 联营 / 代销 / 租赁 / 自产 / 扣率代销」
+  #   就是 t_bd_base_code 里 type_no='SW' 的那几行 ——
+  #   见 sale_way model。名字由上层(supertrade catalog)用 Go 侧 join 补。
+  #
+  # ⚠️ 它**不是**"自用判定"的主依据:自用的几条 sale_way 各不相同
   #   (乐园=B、伊利=C、新龙=E、自产=D),说明这个字段在
-  #   思迅里表达的是各自定义的供货方式,**不能**用它单独识别自用。
-  #   保留它是为了让上层能展示"这个供应商怎么供货",不做判定主依据。
+  #   思迅里表达的是各家自定义的供货方式,**不能**用它单独识别自用。
+  #   自用判定仍走 cust_flag + type(见上面的两个维度)。
   - name: supply_way
     sql: supply_way
     type: string
-    title: 供货方式
+    title: 销售方式
+    enum_values:
+      - { value: "A", label: 购销 }
+      - { value: "B", label: 代销 }
+      - { value: "C", label: 联营 }
+      - { value: "D", label: 租赁 }
+      - { value: "E", label: 自产 }
+      - { value: "F", label: 扣率代销 }
+    description: |
+      源列 sale_way(思迅 t_bd_supcust_info.sale_way),单字符代码,
+      指向 sale_way model 的 id(= t_bd_base_code.code_name,type_no='SW')。
+      ⚠️ enum 只是给 BI 工具看的;**程序要名字请查 sale_way model**,
+      不要把这里的 label 复制到代码里 —— 那是第二份真相。
 
   - name: contact
     sql: contact

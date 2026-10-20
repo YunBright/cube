@@ -9,6 +9,8 @@ package source
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 )
 
 // Connector 是数据源连接器接口。
@@ -92,7 +94,69 @@ const (
 	RoleProduct  = "product"
 	RoleCategory = "category"
 	RoleSale     = "sale"
+	// RoleCustType 是供应商/客户类别字典(t_bd_cust_type)。
+	//
+	// 行数极小(实测 ysx 4 行 / hbposv7 0 行),但**仍然要一个独立角色**:
+	// 它和 supplier 不是同一张表,行数上限的语义也不同(字典表永远不该被截断,
+	// 而截断了就等于"某些供应商查不到自己的类别")。
+	RoleCustType = "cust_type"
+	// RoleSaleWay 是「销售方式」字典(t_bd_base_code 中 type_no='SW' 的行)。
+	//
+	// 实测两个库的供应商**全部有 sale_way**(ysx 219 / hbposv7 300),
+	// 而客户类别(cust_clsno)有 170/219 是 NULL —— 后者覆盖不了大部分供应商,
+	// 当"供应商类别"用会让大部分供应商落进"未分类"。
+	//
+	// ⚠️ 底层表 t_bd_base_code 是**通用**基础代码字典(职称/民族/学历/企业类型/
+	// 品牌/单位/销售方式…),共 30+ 行。整张表灌进 model 会让 id(code_id)跨类型
+	// 重复('1' 在职称/民族/学历里都有),primary_key 撞车 ⇒ 行被静默吞掉。
+	// 所以过滤必须发生在**入 model 之前**:connector 的 FetchSaleWay 只取
+	// type_no='SW' 的子集(见 source.FilterRowsByColumn)。
+	RoleSaleWay = "sale_way"
 )
+
+// FilterRowsByColumn 按某一列的值过滤原始行(大小写不敏感,两侧去空格)。
+//
+// 为什么需要它:fetchTable 只能 `SELECT TOP n * FROM <表>` —— **没有 WHERE**,
+// 而 mapping 只做列名重写,不做行过滤。所以"只取字典的一个子集"
+// (比如 t_bd_base_code 里 type_no='SW' 的那几行)只能在 Go 侧做。
+//
+// 为什么要放在共享包而不是各 connector 各写一份:两个 family 的
+// 思迅表结构一致,过滤规则必须一致;各写一份的话迟早会漂。
+//
+// 语义是**严格的相等**:列缺失或为 NULL 的行**不保留** ——
+// "type_no 为空的行"不是 SW 行。留着的后果是空 id 混进字典表,
+// 查出来的 id→name 对应关系里多出一堆没有名字的条目。
+func FilterRowsByColumn(rows []map[string]any, col, want string) []map[string]any {
+	target := strings.ToLower(strings.TrimSpace(want))
+	out := make([]map[string]any, 0, len(rows))
+	for _, r := range rows {
+		v, ok := r[col]
+		if !ok || v == nil {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(fmt.Sprint(v))) == target {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// RequireRows 断言过滤后**还有行**,否则返回错误。
+//
+// 为什么需要它:过滤条件写错(列名拼错 / type_no 变了 / 源表结构变了)
+// 会让结果**静默变成空集**。而空字典表的症状是
+// "App 里所有供应商都落进未分类" —— 看起来像数据问题,
+// 实际上是取数逻辑错了,排查方向会被带偏。
+//
+// ⇒ 宁可导入失败(healthz 的 fresh 状态变红、日志里有明确原因),
+// 也不要一个**看起来正常**的空字典。
+func RequireRows(role string, rows []map[string]any) ([]map[string]any, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("source: %s 过滤后没有任何数据"+
+			"(过滤条件写错了?源表结构变了?)", role)
+	}
+	return rows, nil
+}
 
 // DefaultRowLimit 是未显式配置时的行数上限兜底值。
 //
