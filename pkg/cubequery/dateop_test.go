@@ -45,12 +45,18 @@ func TestDateOp_OnTheDateCharVsDatetime(t *testing.T) {
 	schema := saleDaySchema()
 	schema.Dimensions[1].CharDate = false
 	dtSQL := mustBuildWith(t, q, schema).SQL
-	hasLower := strings.Contains(dtSQL, "CAST(RTRIM(oper_date) AS DATE) >= ?")
+	// ⚠️ 2026-10-21 修正:**真 datetime 列不包 RTRIM**（DuckDB 的 RTRIM 只接受
+	// VARCHAR，对 TIMESTAMP 直接报错 ⇒ 整个查询 500；实测会员模型的时间维度
+	// 就是这么把查询打挂的）。char 定长日期列仍然包（它本来就是字符列）。
+	hasLower := strings.Contains(dtSQL, "CAST(oper_date AS DATE) >= ?")
 	// 上界是"次日 0 点",两个方言平移写法不同。
 	hasUpper := strings.Contains(dtSQL, "< ? + INTERVAL 1 DAY") ||
 		strings.Contains(dtSQL, "< DATEADD(day, 1, ?)")
 	if !hasLower || !hasUpper {
 		t.Errorf("datetime 列 onTheDate 应是半开区间 [当天, 次日),实际: %s", dtSQL)
+	}
+	if strings.Contains(dtSQL, "RTRIM(oper_date)") {
+		t.Errorf("真 datetime 列不该带 RTRIM(DuckDB 会直接报错),实际: %s", dtSQL)
 	}
 }
 

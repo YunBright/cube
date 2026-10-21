@@ -164,10 +164,23 @@ func TestCmp_NonDateColumnUntouched(t *testing.T) {
 //
 // 列名是 canonical 名 `period_end` 而非 `end_date`:Build 不做 mapping 重写
 // (那是 BuildTSQL 才做的),所以这一条锁的是"表达式形态",不是最终源列名。
+//
+// ⚠️ 2026-10-21 修正:**真 datetime 列不再包 RTRIM**。
+//
+//	DuckDB 的 RTRIM 只接受 VARCHAR，对 TIMESTAMP 直接报
+//	"No function matches RTRIM(TIMESTAMP)" ⇒ 整个查询 500
+//	（实测：会员模型 member 的 birthday / valid_from 等时间维度
+//	 一进 SELECT 就把查询打挂）。
+//
+//	⇒ DuckDB 侧 = CAST(period_end AS DATE)；T-SQL 侧仍带 RTRIM
+//	（MSSQL 会隐式转文本，那条路径没这个问题，也**不动它**）。
 func TestCmp_DuckDBCastsToo(t *testing.T) {
 	where := cmpWhere(t, "settlement.period_end", "gte", []any{"2026-09-01"}, "duck")
-	if !strings.Contains(where, "CAST(RTRIM(period_end) AS DATE) >= ?") {
-		t.Errorf("DuckDB 侧真 datetime 列也应按日期比较,实际: %s", where)
+	if !strings.Contains(where, "CAST(period_end AS DATE) >= ?") {
+		t.Errorf("DuckDB 侧真 datetime 列应按日期比较且**不包 RTRIM**(RTRIM 只接受 VARCHAR),实际: %s", where)
+	}
+	if strings.Contains(where, "RTRIM") {
+		t.Errorf("DuckDB 侧不应出现 RTRIM(对 TIMESTAMP 会直接报错),实际: %s", where)
 	}
 }
 

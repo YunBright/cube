@@ -75,8 +75,9 @@ func Build(q *Query, schema *cubeschema.Model) (*Result, error) {
 			return nil, &BuildError{Kind: "dimension", Ref: ref,
 				Msg: "dimension not found: " + ref}
 		}
-		selectList = append(selectList, fmt.Sprintf("%s AS %q", TrimExpr(d.SQL), modelName+"."+ref))
-		// GROUP BY 用原列:SQL 允许 GROUP BY id 配 SELECT RTRIM(id)。
+		selectList = append(selectList,
+			fmt.Sprintf("%s AS %q", trimForType(d.SQL, d.Type, d.CharDate), modelName+"."+ref))
+		// GROUP BY 用原列:SQL 允许 GROUP BY id 而 SELECT RTRIM(id)。
 		groupBy = append(groupBy, d.SQL)
 		res.DimRefs = append(res.DimRefs, ref)
 	}
@@ -100,7 +101,9 @@ func Build(q *Query, schema *cubeschema.Model) (*Result, error) {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter dimension not found: " + ref}
 		}
-		expr, args, err := buildFilter(d.SQL, d.CharDate, d.Type == cubeschema.TypeTime, f.Operator, f.Values, duckTime)
+		expr, args, err := buildFilter(d.SQL, d.CharDate,
+			d.Type == cubeschema.TypeTime, trimAsString(d.Type, d.CharDate),
+			f.Operator, f.Values, duckTime)
 		if err != nil {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter: " + err.Error()}
@@ -294,8 +297,16 @@ func expandSegments(q *Query, schema *cubeschema.Model, expr func(string) string
 // 例外:containsCI 是 2026-10-20 **新增**的算子(大小写无关的 contains),
 // 它没有"上线前实现"可对齐 —— 但它同样遵守上面两条铁律:
 // 两侧通配 + 值走参数绑定。
-func buildFilter(columnSQL string, charDate, isTime bool, op string, values []any, td timeDialect) (string, []any, error) {
-	col := TrimExpr(columnSQL)
+func buildFilter(columnSQL string, charDate, isTime, trimAsString bool, op string, values []any, td timeDialect) (string, []any, error) {
+	// ⚠️ trimAsString 决定要不要包 RTRIM。
+	//
+	//	DuckDB 路径只对 **string 维度**包（RTRIM 只接受 VARCHAR）；
+	//	T-SQL 路径保持"一律包"（MSSQL 会把数字隐式转文本，今天就是好的，
+	//	改了会让 live 模型的返回类型从字符串变成数字）。
+	col := columnSQL
+	if trimAsString {
+		col = TrimExpr(columnSQL)
+	}
 	// 时间比较用的目标表达式,与 time.go 的 timeColumn 同义。
 	target := col
 	if !charDate {
@@ -509,6 +520,49 @@ func TrimExpr(expr string) string {
 		return "RTRIM(" + expr + ")"
 	}
 	return expr
+}
+
+// trimForType 按维度类型决定是否包 RTRIM(**DuckDB 路径专用**)。
+//
+// # 为什么需要它
+//
+//	DuckDB 的 `RTRIM` **只接受 VARCHAR**:对 DECIMAL / INTEGER / TIMESTAMP
+//	一律报 "No function matches RTRIM(INTEGER)" ⇒ 整个查询 500。
+//	（2026-10-21 生产实测：会员模型 `member` / `member_type` 是 **duck** 模型，
+//	数值维度 use_num / discount_rate 一进 SELECT 就把查询打挂。）
+//
+//	而 MSSQL 侧的 `RTRIM` 会把数字**隐式转文本** ⇒ T-SQL 路径一直是对的
+//	（`pkg/cubequery/tsql.go` 保持原样，不受本函数影响）。
+//
+// # 判据
+//
+//	思迅的 char 定长列普遍补空格 —— 那才是 RTRIM 要解决的问题；
+//	数值列没有"尾部空格"这回事，包它只会打挂查询。
+//
+//	⇒ **string 列**包 RTRIM；**char 定长日期列**（`char_date: true`）
+//	也包（它本来就是字符列，尾部有空格）；
+//	**number / time(真 datetime) / boolean** 一律不包。
+func trimForType(sql string, t cubeschema.DataType, charDate bool) string {
+	if t == cubeschema.TypeString {
+		return TrimExpr(sql)
+	}
+	// char 定长日期列：它就是字符列（带尾部空格）⇒ 与 string 同待遇。
+	if t == cubeschema.TypeTime && charDate {
+		return TrimExpr(sql)
+	}
+	return sql
+}
+
+// trimAsString 是 trimForType 的**布尔版**（filter 路径用）。
+//
+// ⚠️ filter 路径的列比较还要考虑时间语义（char 列直接字符串比较、
+// 真 datetime 列 CAST 成 DATE），所以 filter 内部拿到的必须是
+// "已经决定要不要 RTRIM" 的列表达式 ⇒ 这里只回答"要不要"。
+func trimAsString(t cubeschema.DataType, charDate bool) bool {
+	if t == cubeschema.TypeString {
+		return true
+	}
+	return t == cubeschema.TypeTime && charDate
 }
 
 func isSimpleColumn(expr string) bool {

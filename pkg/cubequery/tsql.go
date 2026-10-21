@@ -197,7 +197,12 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter dimension not found: " + ref + " (on model " + mn + ")"}
 		}
-		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate, d.Type == cubeschema.TypeTime, f.Operator, f.Values, tsqlTime)
+		// ⚠️ trimAsString=true：T-SQL 路径**保持今天的行为**（一律包 RTRIM）。
+		//
+		//	MSSQL 的 RTRIM 会把数字隐式转文本，所以 live 模型的数值维度
+		//	返回的是字符串 —— 改了会让下游的返回类型从字符串变成数字。
+		//	（只有 DuckDB 路径需要按类型区分，见 build.go 的 trimForType。）
+		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate, d.Type == cubeschema.TypeTime, true, f.Operator, f.Values, tsqlTime)
 		if err != nil {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter: " + err.Error()}

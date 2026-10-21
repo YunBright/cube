@@ -104,6 +104,71 @@ func TestBuild_TrimsSimpleColumnsOnBothSides(t *testing.T) {
 	}
 }
 
+// TestBuild_NumericDimensionNotTrimmed 锁"DuckDB 侧数值维度**不包 RTRIM**"。
+//
+// ⚠️ 2026-10-21 生产实测挖出来的：会员模型 member / member_type 是 **duck** 模型，
+// 数值维度（use_num / discount_rate / points_*）一进 SELECT，DuckDB 就报
+// "No function matches RTRIM(INTEGER)" ⇒ 整个查询 500，导出全挂。
+//
+//	（RTRIM 只接受 VARCHAR；MSSQL 会隐式把数字转文本，所以 T-SQL 路径不受影响。）
+func TestBuild_NumericDimensionNotTrimmed(t *testing.T) {
+	schema := &cubeschema.Model{
+		Name: "member",
+		Dimensions: []cubeschema.Dimension{
+			{Name: "id", SQL: "id", Type: cubeschema.TypeString},
+			{Name: "limited_use_count", SQL: "limited_use_count", Type: cubeschema.TypeNumber},
+			{Name: "operated_at", SQL: "operated_at", Type: cubeschema.TypeTime},
+		},
+		Measures: []cubeschema.Measure{{Name: "count", SQL: "COUNT(*)"}},
+	}
+	q := &Query{
+		Measures:   []string{"member.count"},
+		Dimensions: []string{"member.id", "member.limited_use_count", "member.operated_at"},
+	}
+	res, err := Build(q, schema)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(res.SQL, `RTRIM(id) AS "member.id"`) {
+		t.Errorf("string 维度必须 RTRIM(思迅 char 列补空格),实际: %s", res.SQL)
+	}
+	if strings.Contains(res.SQL, "RTRIM(limited_use_count)") {
+		t.Errorf("数值维度不得包 RTRIM(DuckDB 会对 INTEGER/DECIMAL 直接报错),实际: %s", res.SQL)
+	}
+	if strings.Contains(res.SQL, "RTRIM(operated_at)") {
+		t.Errorf("真 datetime 维度不得包 RTRIM(DuckDB 会对 TIMESTAMP 直接报错),实际: %s", res.SQL)
+	}
+}
+
+// TestBuild_CharDateDimensionStillTrimmed 锁"char 定长日期列**仍然**包 RTRIM"。
+//
+// ⚠️ 它就是字符列（尾部有空格）⇒ 与 string 同待遇；
+// 而真 datetime 列（char_date: false）才不包（见上一条）。
+func TestBuild_CharDateDimensionStillTrimmed(t *testing.T) {
+	schema := &cubeschema.Model{
+		Name: "sale_day",
+		Dimensions: []cubeschema.Dimension{
+			{Name: "oper_date", SQL: "oper_date", Type: cubeschema.TypeTime, CharDate: true},
+		},
+		Measures: []cubeschema.Measure{{Name: "count", SQL: "COUNT(*)"}},
+	}
+	q := &Query{
+		Measures: []string{"sale_day.count"},
+		Filters: []Filter{{
+			Member:   "sale_day.oper_date",
+			Operator: "inDateRange",
+			Values:   []any{"2026-01-01", "2026-01-31"},
+		}},
+	}
+	res, err := Build(q, schema)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(res.SQL, "RTRIM(oper_date) >= ?") {
+		t.Errorf("char 定长日期列必须 RTRIM(它是字符列,尾部有空格),实际: %s", res.SQL)
+	}
+}
+
 // 聚合表达式绝不能被 RTRIM 包住(会破坏 AVG/COUNT 语义)。
 func TestBuild_DoesNotTrimExpressions(t *testing.T) {
 	q := &Query{Measures: []string{"product.avg_price_yuan"}, Dimensions: []string{"product.id"}}
