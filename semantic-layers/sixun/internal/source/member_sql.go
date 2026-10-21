@@ -1,0 +1,156 @@
+package source
+
+import (
+	"fmt"
+	"strings"
+)
+
+// MemberTables 是 member 模型取数时要用到的四张表(family 私有事实)。
+//
+// ⚠️ 表名**只能**来自各 family 的 config.yaml(source.table_member*)，
+// 不能写死在这里 —— 思迅不同版本(v10 / v7)的会员表名可能不同，
+// 而这个包是两个 family 共用的。
+type MemberTables struct {
+	// Member 是会员档案主表(思迅 V10: t_rm_vip_info)。
+	Member string
+	// Consume 是会员消费汇总表(t_rm_vip_consume):
+	// 累计消费金额(vip_cons_amount)与消费次数(cons_count)只在这里,
+	// 主表的 consum_amt / consum_count 实测**几乎全空**
+	// (ysx: consum_amt 大量 0.0000 / consum_count 大量 NULL)。
+	Consume string
+	// Paylist 是储值卡支付流水(t_rm_card_paylist):
+	// 储值支付流水 + 每笔之后的**卡内余额**(residual_amt,这里是 numeric)。
+	Paylist string
+	// SavingPlus 是储值充值记录(t_rm_saving_plus_record):
+	// plus_count = 充值金额。
+	SavingPlus string
+	// StoredPayType 是 paylist.card_type 里表示"**储值支付**"的那个取值。
+	//
+	// ⚠️ paylist 里**不全是储值支付**:
+	// 实测 ysx 会员卡(card_type='0')的 245212 行全是 card_type='1',
+	// 那是"刷卡消费/积分抵扣"记录(金额合计 908 万),**与储值余额无关**;
+	// 只有 card_type='2' 的行是储值支付(其 residual_amt = 该笔之后的卡内余额)。
+	// 不区分就��把 会员卡的消费额 当成"储值消费"扣掉 ⇒ 余额算成负数
+	// (实测 2521 张卡余额为负、合计 −907 万)。
+	//
+	// ✅ 两个 family 实测都是 '2'(hbposv7 的 paylist 只有 '2' 行)。
+	// ⇒ 做成**可配置项**:不同门店/版本的思迅若换了这个编码,改配置即可,
+	// 不用改代码(也不该为它写死一个魔数)。
+	StoredPayType string
+}
+
+// DefaultStoredPayType 是 StoredPayType 的默认值('2' = 储值支付)。
+const DefaultStoredPayType = "2"
+
+// MemberSQL 构造 member 模型的取数 SQL(带三张派生表的 JOIN)。
+//
+// # 为什么必须 JOIN(而不是只 SELECT * FROM t_rm_vip_info)
+//
+// 会员档案表里的三个字段**不是会员的真实值**:
+//
+//  1. **residual_amt(卡内余额)是脏字符串**,实测 ysx 43 种取值:
+//     '86220.0' / ':844201-' / '20,,' / ',' / '0' …
+//     垃圾字符全在 ASCII 44–64(':' '<' '>' '@' ',' '-' '/' '.'),
+//     同一批卡上出现**同一个**残值('86220.x' 覆盖 762 张卡),
+//     而这些卡的真实余额(实测 0 ~ 99.6 元)与它**毫无关系**。
+//     ⇒ 把它当余额导出去,前端就会显示「余额 86220 元」。
+//
+//  2. **consum_amt / consum_count 不是累计消费**:主表里 4128 行只有 403 行
+//     consum_amt 非 0,consum_count **全为 NULL**。
+//     真实的累计消费在 t_rm_vip_consume.vip_cons_amount / .cons_count。
+//
+//  3. **卡内余额的真值 = Σ充值 − Σ支付**:
+//     实测逐卡与 t_rm_card_paylist 最新一行的 residual_amt **精确相等**
+//     (900223: 200.00 − 168.40 = 31.60 = paylist 最新 residual_amt 31.60)。
+//
+// ⇒ 余额、累计消费、消费次数这三列由本 SQL 在**源库侧**算出来
+// (相当于源库的一个 view),cube 只负责把算好的值搬出去。
+//
+// # 为什么余额只对"储值卡"有意义
+//
+// 充值记录实测**只覆盖 card_type='1'(储值卡)**(1162 张卡),
+// 会员卡(card_type='0')一行充值记录都没有
+// ⇒ 会员卡的余额自然是 0,不需要按卡类特判。
+//
+// # 列别名不能与主表重名
+//
+// 派生列用 memb_ 前缀(alias),否则 SELECT v.* 与 JOIN 列同名时
+// MSSQL 会报 "列名重复"。
+const (
+	// MemberBalanceAlias 是派生列「卡内余额(元)」的别名。
+	MemberBalanceAlias = "memb_balance"
+	// MemberConsumeAmountAlias 是派生列「累计消费(元)」的别名。
+	MemberConsumeAmountAlias = "memb_consume_amount"
+	// MemberConsumeCountAlias 是派生列「消费次数」的别名。
+	MemberConsumeCountAlias = "memb_consume_count"
+)
+
+// MemberSQL 构造 member 模型的取数 SQL。
+//
+// ⚠️ 表名来自 config.yaml(不是用户输入),但仍做一次**标识符白名单校验**:
+// 表名会拼进 SQL 文本,配置写错时宁可报错也不要拼出坏 SQL。
+func MemberSQL(t MemberTables, limit int) (string, error) {
+	for name, v := range map[string]string{
+		"table_member":            t.Member,
+		"table_member_consume":    t.Consume,
+		"table_member_paylist":    t.Paylist,
+		"table_member_savingplus": t.SavingPlus,
+	} {
+		if err := assertIdent(name, v); err != nil {
+			return "", err
+		}
+	}
+	if limit <= 0 {
+		limit = DefaultRowLimit
+	}
+	storedType := strings.TrimSpace(t.StoredPayType)
+	if storedType == "" {
+		storedType = DefaultStoredPayType
+	}
+	// ⚠️ 存值支付类型码是**字符串字面量**(不是标识符)⇒ 只能做"引号内无引号"校验。
+	if strings.ContainsAny(storedType, "'") {
+		return "", fmt.Errorf("source: 储值支付类型码 %q 含引号,拒绝拼进 SQL", storedType)
+	}
+	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
+	return fmt.Sprintf(`SELECT TOP %d
+  v.*,
+  c.vip_cons_amount AS %s,
+  c.cons_count AS %s,
+  ISNULL(p.plus_total, 0) - ISNULL(pay.pay_total, 0) AS %s
+FROM %s v
+LEFT JOIN (SELECT card_id, MAX(vip_cons_amount) AS vip_cons_amount, MAX(cons_count) AS cons_count FROM %s GROUP BY card_id) c
+       ON c.card_id = v.card_id
+LEFT JOIN (SELECT card_id, SUM(plus_count) AS plus_total FROM %s GROUP BY card_id) p
+       ON p.card_id = v.card_id
+LEFT JOIN (SELECT card_id, SUM(amount) AS pay_total FROM %s WHERE card_type = '%s' GROUP BY card_id) pay
+       ON pay.card_id = v.card_id`,
+		limit,
+		MemberConsumeAmountAlias,
+		MemberConsumeCountAlias,
+		MemberBalanceAlias,
+		t.Member, t.Consume, t.SavingPlus, t.Paylist, storedType,
+	), nil
+}
+
+// assertIdent 校验表名是合法标识符(只允许字母/数字/下划线,不允许空格与符号)。
+//
+// ⚠️ 表名会**拼进 SQL 文本**(不是参数绑定能解决的 —— 表名不能占位)。
+// 配置里的表名不是外部输入,但配置是**人写的**:
+// 写成 "t_rm_vip_info; DROP TABLE x" 时,没有这道校验就是一条注入。
+func assertIdent(name, v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return fmt.Errorf("source: %s 未配置", name)
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '_':
+		default:
+			return fmt.Errorf("source: %s=%q 不是合法表名标识符", name, v)
+		}
+	}
+	return nil
+}

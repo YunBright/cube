@@ -106,27 +106,37 @@ mappings:
     target: points_used
     type: decimal
 
-  # 源列 residual_amt(**varchar(20)**):卡内余额(元)。
-  # ⚠️⚠️ **这一列是带脏值的字符串,不是数字**。实测 ysx 取值:
-  #    ''(764 行) / '20,,'(583) / ':84420..'(354) / ','(239) / '86220.-'(205)…
-  # ⇒ **原样给字符串,type 必须是 string**:
+  # 源列 memb_balance:卡内余额(元)—— **派生列**,由源库侧 SQL 算出来
+  # (Σ t_rm_saving_plus_record.plus_count − Σ t_rm_card_paylist.amount)。
+  #
+  # ⚠️ **不是** residual_amt:那一列是脏字符串('86220.0' / ':844201-' / '20,,' …,
+  #    43 种取值,同一批卡上出现同一个残值),与真实余额(0~99.6 元)毫无关系。
+  #    当余额导出去会让前端显示「余额 86220 元」(762 张卡)。
+  #    口径与交叉验证见 internal/source/member_sql.go。
+  - source: memb_balance
+    target: balance_yuan
+    type: decimal
+    unit: yuan
+
+  # 源列 residual_amt(**varchar(20)**):源库的**原值**,仅供审计。
+  # ⚠️ 这一列是带脏值的字符串,不是数字 ⇒ type 必须是 string:
   #    若按 decimal 处理,fieldmapping.convert 会在 ParseFloat 上报错,
   #    而 dataloader.mapRows 对转换失败的行是**静默丢弃**的
   #    ⇒ 整张表的行数会悄悄少掉一大截(症状:COUNT(*) 对不上 4128,零报错)。
-  #    脏数据是源库的事实,藏起来只会让下游把"解析失败"误判成"余额为 0"。
   - source: residual_amt
-    target: balance_yuan
+    target: residual_amt_raw
     type: string
 
-  # 源列 consum_amt(numeric(16,4)):累计消费(元)。
-  - source: consum_amt
+  # 源列 memb_consume_amount:累计消费(元)—— 派生列,
+  # 来自 t_rm_vip_consume.vip_cons_amount(主表 consum_amt 实测几乎全 0)。
+  - source: memb_consume_amount
     target: consumed_amount_yuan
     type: decimal
     unit: yuan
 
-  # 源列 consum_count(int):消费次数。
-  # ⚠️ 实测 ysx 3725/4128 行是 NULL —— NULL 与 0 含义不同,原样给。
-  - source: consum_count
+  # 源列 memb_consume_count:消费次数 —— 派生列,
+  # 来自 t_rm_vip_consume.cons_count(主表 consum_count 实测全 NULL)。
+  - source: memb_consume_count
     target: consumed_count
     type: int
 

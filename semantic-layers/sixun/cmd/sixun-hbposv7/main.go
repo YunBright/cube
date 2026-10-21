@@ -99,6 +99,17 @@ type appConfig struct {
 		// TableMemberType 是会员类别字典表(t_rm_vip_type)。
 		// member.card_type 指向它;实测两个库各 3 行。
 		TableMemberType string `yaml:"table_member_type"`
+		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
+		//
+		// ⚠️ 这三列的真值**不在** t_rm_vip_info 里:
+		//   余额(residual_amt)是脏字符串、累计消费 / 消费次数主表里几乎全空。
+		//   ⇒ 取数 SQL 走 source.MemberSQL(带 JOIN),口径见 internal/source/member_sql.go。
+		TableMemberConsume    string `yaml:"table_member_consume"`
+		TableMemberPaylist    string `yaml:"table_member_paylist"`
+		TableMemberSavingPlus string `yaml:"table_member_savingplus"`
+		// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值
+		// (空 = source.DefaultStoredPayType = '2')。
+		MemberStoredPayType string `yaml:"member_stored_pay_type"`
 		// 结算审批场景(2026-10-09)。表名在两个 family 同名同表,
 		// 单据类型不同:hbposv7 的结款单是 DP(供应商对帐单)、ysx 是 CP。
 		TableSettlement      string `yaml:"table_settlement"`
@@ -120,6 +131,9 @@ type appConfig struct {
 		// 促销(2026-10-15)。POP 价签打印要"当前生效特价",时效性极强,
 		// 所以 promotion 是 live model(不落 DuckDB),漏配表名该 model 直接不可查。
 		TablePromotion string `yaml:"table_promotion"`
+		// 商品条码补充表(2026-10-21)。一品多码:一个货号可有 1~7 个条码。
+		// 实测两库都有该表(ysx 153 行 / hbposv7 同表同列)。
+		TableItemBarcode string `yaml:"table_item_barcode"`
 		// RowLimit 所有角色共用的拉取行数上限;<=0 回落到 source.DefaultRowLimit。
 		RowLimit int `yaml:"row_limit"`
 		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
@@ -281,7 +295,12 @@ func main() {
 		TableSale:       appCfg.Source.TableSale,
 		TableMember:     appCfg.Source.TableMember,
 		TableMemberType: appCfg.Source.TableMemberType,
-		RowLimits:       source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
+		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
+		TableMemberConsume:    appCfg.Source.TableMemberConsume,
+		TableMemberPaylist:    appCfg.Source.TableMemberPaylist,
+		TableMemberSavingPlus: appCfg.Source.TableMemberSavingPlus,
+		MemberStoredPayType:   appCfg.Source.MemberStoredPayType,
+		RowLimits:             source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)
@@ -613,6 +632,8 @@ func liveTables(cfg *appConfig) map[string]string {
 		"item_cls":        cfg.Source.TableItemCls,
 		"item_cls_parent": cfg.Source.TableItemClsParent,
 		"promotion":       cfg.Source.TablePromotion,
+		// 商品条码补充表(2026-10-21)。live model 不落 DuckDB,查询时透传源库。
+		"item_barcode": cfg.Source.TableItemBarcode,
 	}
 }
 

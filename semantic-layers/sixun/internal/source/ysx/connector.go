@@ -24,7 +24,17 @@ type Connector struct {
 	tableSale       string
 	tableMember     string
 	tableMemberType string
-	rowLimits       *source.RowLimits
+	// 会员模型的**派生列**来源表(余额 / 累计消费 / 消费次数)。
+	// ⚠️ 会员档案主表里的 residual_amt / consum_amt / consum_count
+	// 都不是会员的真实值,详见 source.MemberSQL 的注释。
+	memberConsume    string
+	memberPaylist    string
+	memberSavingPlus string
+	// memberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
+	// ⚠️ 不区分它 ⇒ 会员卡的刷卡消费(24 万行,合计 908 万)会被当成储值消费扣掉
+	// ⇒ 余额算成负数(实测 2521 张卡为负)。
+	memberStoredPayType string
+	rowLimits           *source.RowLimits
 }
 
 // Options 构造参数。
@@ -49,6 +59,18 @@ type Options struct {
 	// TableMemberType 是会员类别字典表(t_rm_vip_type)。
 	// 实测两个库各 3 行;字典表被截断 = 某些会员类别查不到自己的类别。
 	TableMemberType string
+	// TableMemberConsume 是会员消费汇总表(t_rm_vip_consume):
+	// 累计消费金额(vip_cons_amount)与消费次数(cons_count)的**唯一来源**。
+	TableMemberConsume string
+	// TableMemberPaylist 是储值卡支付流水(t_rm_card_paylist):
+	// 卡内余额 = Σ充值 − Σ支付,支付额从这张表来。
+	TableMemberPaylist string
+	// TableMemberSavingPlus 是储值充值记录(t_rm_saving_plus_record):
+	// 充值金额(plus_count)从这张表来。
+	TableMemberSavingPlus string
+	// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
+	// 空 = 用 source.DefaultStoredPayType。
+	MemberStoredPayType string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
 	RowLimits *source.RowLimits
 }
@@ -72,17 +94,21 @@ func New(opts Options) (*Connector, error) {
 		legacy = true // 探测失败保守处理:老方言在任何版本都能跑
 	}
 	return &Connector{
-		db:              db,
-		legacyTSQL:      legacy,
-		tableSupplier:   opts.TableSupplier,
-		tableProduct:    opts.TableProduct,
-		tableCategory:   opts.TableCategory,
-		tableCustType:   opts.TableCustType,
-		tableSaleWay:    opts.TableSaleWay,
-		tableSale:       opts.TableSale,
-		tableMember:     opts.TableMember,
-		tableMemberType: opts.TableMemberType,
-		rowLimits:       opts.RowLimits,
+		db:                  db,
+		legacyTSQL:          legacy,
+		tableSupplier:       opts.TableSupplier,
+		tableProduct:        opts.TableProduct,
+		tableCategory:       opts.TableCategory,
+		tableCustType:       opts.TableCustType,
+		tableSaleWay:        opts.TableSaleWay,
+		tableSale:           opts.TableSale,
+		tableMember:         opts.TableMember,
+		tableMemberType:     opts.TableMemberType,
+		memberConsume:       opts.TableMemberConsume,
+		memberPaylist:       opts.TableMemberPaylist,
+		memberSavingPlus:    opts.TableMemberSavingPlus,
+		memberStoredPayType: opts.MemberStoredPayType,
+		rowLimits:           opts.RowLimits,
 	}, nil
 }
 
@@ -142,15 +168,34 @@ func (c *Connector) FetchSaleWay(ctx context.Context) ([]map[string]any, error) 
 		source.FilterRowsByColumn(rows, "type_no", "SW"))
 }
 
-// FetchMember 拉会员卡档案(t_rm_vip_info)。
+// FetchMember 拉会员卡档案(t_rm_vip_info)+ 三张派生表(余额 / 消费)。
 //
-// ⚠️ 表名只来自 config.yaml(source.table_member):它是 family 私有事实,
+// ⚠️ 表名只来自 config.yaml(source.table_member*):它们是 family 私有事实,
 // 不能写进共享的 sixun-models/schema.yaml。
+//
+// ⚠️ 这里**不是** `SELECT TOP n * FROM t_rm_vip_info`:
+// 主表里的 residual_amt(余额)是脏字符串、consum_amt / consum_count 几乎全空,
+// 真值在另外三张表里 ⇒ 取数 SQL 走 source.MemberSQL(带 JOIN)。
+// 口径与证据见 source/member_sql.go 的注释。
 func (c *Connector) FetchMember(ctx context.Context) ([]map[string]any, error) {
 	if c.tableMember == "" {
 		return nil, fmt.Errorf("ysx: table_member not configured")
 	}
-	return c.fetchTable(ctx, c.tableMember, source.RoleMember)
+	q, err := source.MemberSQL(source.MemberTables{
+		Member:        c.tableMember,
+		Consume:       c.memberConsume,
+		Paylist:       c.memberPaylist,
+		SavingPlus:    c.memberSavingPlus,
+		StoredPayType: c.memberStoredPayType,
+	}, c.rowLimits.For(source.RoleMember))
+	if err != nil {
+		return nil, fmt.Errorf("ysx: %w", err)
+	}
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("ysx: query member: %w", err)
+	}
+	return source.ScanRows(rows)
 }
 
 // FetchMemberType 拉会员类别字典(t_rm_vip_type)。

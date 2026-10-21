@@ -63,11 +63,15 @@ import (
 // liveConfig 是本测试需要的配置子集(与 cmd/sixun-*/main.go 的 appConfig 同构)。
 type liveConfig struct {
 	Source struct {
-		DSN             string         `yaml:"dsn"`
-		TableMember     string         `yaml:"table_member"`
-		TableMemberType string         `yaml:"table_member_type"`
-		RowLimit        int            `yaml:"row_limit"`
-		RowLimits       map[string]int `yaml:"row_limits"`
+		DSN             string `yaml:"dsn"`
+		TableMember     string `yaml:"table_member"`
+		TableMemberType string `yaml:"table_member_type"`
+		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
+		TableMemberConsume    string         `yaml:"table_member_consume"`
+		TableMemberPaylist    string         `yaml:"table_member_paylist"`
+		TableMemberSavingPlus string         `yaml:"table_member_savingplus"`
+		RowLimit              int            `yaml:"row_limit"`
+		RowLimits             map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
 }
 
@@ -105,7 +109,12 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 					DSN:             cfg.Source.DSN,
 					TableMember:     cfg.Source.TableMember,
 					TableMemberType: cfg.Source.TableMemberType,
-					RowLimits:       rl,
+					// ⚠️ 派生列来源表:缺任何一张 ⇒ 余额/消费算不出来
+					// (MemberSQL 会直接报错,不会"悄悄少一列")。
+					TableMemberConsume:    cfg.Source.TableMemberConsume,
+					TableMemberPaylist:    cfg.Source.TableMemberPaylist,
+					TableMemberSavingPlus: cfg.Source.TableMemberSavingPlus,
+					RowLimits:             rl,
 				})
 			},
 		},
@@ -120,7 +129,11 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 					DSN:             cfg.Source.DSN,
 					TableMember:     cfg.Source.TableMember,
 					TableMemberType: cfg.Source.TableMemberType,
-					RowLimits:       rl,
+					// ⚠️ 派生列来源表:缺任何一张 ⇒ 余额/消费算不出来。
+					TableMemberConsume:    cfg.Source.TableMemberConsume,
+					TableMemberPaylist:    cfg.Source.TableMemberPaylist,
+					TableMemberSavingPlus: cfg.Source.TableMemberSavingPlus,
+					RowLimits:             rl,
 				})
 			},
 		},
@@ -145,6 +158,18 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 			if cfg.Source.TableMember == "" || cfg.Source.TableMemberType == "" {
 				t.Fatalf("%s 缺少 source.table_member / table_member_type —— "+
 					"该 model 会静默不可查", cfgPath)
+			}
+			// ⚠️ 派生列来源表缺一列 ⇒ MemberSQL 直接报错(不会"悄悄少一列"),
+			//   但错误信息只说"哪个表没配" ⇒ 这里先自己查清楚,报错才指得准。
+			for name, v := range map[string]string{
+				"source.table_member_consume":    cfg.Source.TableMemberConsume,
+				"source.table_member_paylist":    cfg.Source.TableMemberPaylist,
+				"source.table_member_savingplus": cfg.Source.TableMemberSavingPlus,
+			} {
+				if strings.TrimSpace(v) == "" {
+					t.Fatalf("%s 缺少 %s —— 会员的余额/累计消费/消费次数都从这三张表派生",
+						cfgPath, name)
+				}
 			}
 
 			conn, err := fam.newConn(cfg, source.NewRowLimits(cfg.Source.RowLimit, cfg.Source.RowLimits))
@@ -256,13 +281,24 @@ func assertTargetsCoverSchema(t *testing.T, model string, m *fieldmapping.Mapper
 }
 
 // assertMemberNotNormalized 锁住"没做语义归一化"这个事实。
+//
+// ⚠️ 2026-10-21 更新:balance_yuan **不再是**主表那列脏字符串。
+//
+//	它现在是**派生列**(Σ充值 − Σ支付,见 source/member_sql.go),
+//	源表的脏原值改以 residual_amt_raw 保留(仅供审计)。
+//	⇒ 这条测试现在同时锁两件事:
+//	  1. balance_yuan 是**数字**(不是脏字符串)且**非负**;
+//	  2. residual_amt_raw 仍是**原始字符串**(没被清洗)。
 func assertMemberNotNormalized(t *testing.T, rows []map[string]any) {
 	t.Helper()
 
 	allowedStatus := map[string]bool{"0": true, "1": true, "2": true, "3": true, "5": true}
 	statuses := map[string]int{}
 	sentinels := 0
-	dirtyBalance := 0
+	dirtyRaw := 0
+	positiveBalance := 0
+	negativeBalance := 0
+	totalBalance := 0.0
 	samples := 0
 
 	for _, r := range rows {
@@ -275,26 +311,55 @@ func assertMemberNotNormalized(t *testing.T, rows []map[string]any) {
 		if n, ok := r["limited_use_count"].(int64); ok && n >= 999998 {
 			sentinels++
 		}
-		// balance_yuan 必须是**原始字符串**:能原样 parse 成数字的反而是少数。
-		bal, ok := r["balance_yuan"].(string)
+		// balance_yuan 现在是派生数字:必须能当数字读,且不为负
+		// (负余额 = 充值算错了,宁可让这条测试红)。
+		switch bal := r["balance_yuan"].(type) {
+		case float64:
+			if bal < 0 {
+				negativeBalance++
+			}
+			if bal > 0 {
+				positiveBalance++
+			}
+			totalBalance += bal
+		case int64:
+			if bal < 0 {
+				negativeBalance++
+			}
+			if bal > 0 {
+				positiveBalance++
+			}
+			totalBalance += float64(bal)
+		default:
+			t.Errorf("balance_yuan 不是数字(%T)—— 它是**派生列**(Σ充值−Σ支付),"+
+				"必须是数字;脏字符串原值在 residual_amt_raw 里", r["balance_yuan"])
+		}
+		// 源库原值仍要是**原始字符串**(没被清洗)。
+		raw, ok := r["residual_amt_raw"].(string)
 		if !ok {
-			t.Errorf("balance_yuan 不是字符串(%T)—— 源列 residual_amt 是 varchar,"+
-				"且带脏值,按 decimal 处理会让 mapRows 静默丢行", r["balance_yuan"])
+			t.Errorf("residual_amt_raw 不是字符串(%T)—— 源列 residual_amt 是 varchar,"+
+				"且带脏值,按 decimal 处理会让 mapRows 静默丢行", r["residual_amt_raw"])
 		} else {
-			if _, err := strconv.ParseFloat(bal, 64); err != nil {
-				dirtyBalance++
+			if _, err := strconv.ParseFloat(raw, 64); err != nil {
+				dirtyRaw++
 			}
 		}
 		if samples < 3 {
 			samples++
-			t.Logf("样本行: id=%v status=%v limited_use_count=%v balance_yuan=%q points_accumulated=%v points_used=%v",
-				r["id"], r["status"], r["limited_use_count"], bal, r["points_accumulated"], r["points_used"])
+			t.Logf("样本行: id=%v status=%v limited_use_count=%v balance_yuan=%v residual_amt_raw=%q points_accumulated=%v points_used=%v",
+				r["id"], r["status"], r["limited_use_count"], r["balance_yuan"], raw,
+				r["points_accumulated"], r["points_used"])
 		}
 	}
-	t.Logf("card_status 分布=%v;不限次哨兵(>=999998)=%d 行;脏余额(解析不出数字)=%d 行",
-		statuses, sentinels, dirtyBalance)
-	if dirtyBalance == 0 {
-		t.Log("提示:本库没有解析不出数字的余额(不代表被清洗过,只是源数据恰好干净)")
+	t.Logf("card_status 分布=%v;不限次哨兵(>=999998)=%d 行;脏原值(解析不出数字)=%d 行",
+		statuses, sentinels, dirtyRaw)
+	t.Logf("派生余额: 正余额 %d 行 / 负余额 %d 行 / 合计 %.2f 元",
+		positiveBalance, negativeBalance, totalBalance)
+	if negativeBalance > 0 {
+		t.Errorf("有 %d 行余额为负 —— 充值/支付的口径算错了(Σ充值 − Σ支付 不可能为负)", negativeBalance)
+	}
+	if dirtyRaw == 0 {
+		t.Log("提示:本库没有解析不出数字的原值(不代表被清洗过,只是源数据恰好干净)")
 	}
 }
 

@@ -10,6 +10,8 @@
 #   - card_status 原样给 '0'/'1'/'2'/'3'/'5'(不映射成 normal/frozen)
 #   - use_num 原样给 999998/999999(= 不限次哨兵),**不转 0**
 #   - residual_amt 是**带脏值的 varchar**,原样给字符串,不解析也不清洗
+#     ⇒ 它只以 residual_amt_raw 的名字留在 model 里(仅供审计);
+#       真正的"卡内余额"走 balance_yuan(源库侧由三张表派生,见该维度说明)
 #   - saving_flag / acc_flag 是 char(1) 的 '0'/'1',声明成 string(不是 boolean)
 #
 # 在 mapping 里偷偷清洗等于把"源库长这样"这个事实藏起来,
@@ -162,33 +164,65 @@ dimensions:
 
   - name: balance_yuan
     sql: balance_yuan
-    type: string
+    type: number
     title: 卡内余额(元)
     description: |
-      源列 residual_amt(**varchar(20)**)。
-      ⚠️⚠️ **这一列是带脏值的字符串,不是数字**。实测 ysx 的取值长这样:
-      '' (764 行)、'20,,' (583)、':84420..' (354)、',' (239)、'86220.-' (205)…
-      hbposv7 同样脏('20,,' 1772 行、'><886420.-' 446 行)。
-      ⇒ **原样给字符串,不解析不清洗**:脏数据是源库的事实,
-      藏起来只会让下游把"解析失败"误判成"余额为 0"。
-      下游要自己判断解析失败后跳过还是按 0 处理。
+      ⚠️ **这一列不是源表 t_rm_vip_info.residual_amt 那一列**
+      (那一列是脏字符串,见 residual_amt_raw)。
+
+      口径(2026-10-21 真源库实测,见 semantic-layers/sixun/internal/source/member_sql.go):
+      **卡内储值余额 = Σ(t_rm_saving_plus_record.plus_count) − Σ(t_rm_card_paylist.amount)**
+      —— 即"累计充值 − 累计储值支付"。
+
+      ✅ 实测逐卡与 t_rm_card_paylist 最新一行的 residual_amt(numeric)**精确相等**:
+        900223: 200.00 − 168.40 = 31.60 = paylist 最新 residual_amt 31.60
+        900224: 200.00 − 176.00 = 24.00 = paylist 最新 residual_amt 24.00
+        900221: 300.00 − 285.50 = 14.50 = paylist 最新 residual_amt 14.50
+      ⇒ 两张表互为交叉验证,不是"猜一个口径"。
+
+      ✅ 充值记录实测**只覆盖储值卡**(card_type='1',1162 张卡),
+        会员卡一行充值记录都没有 ⇒ 会员卡余额自然是 0,不需要按卡类特判。
+      ✅ ysx 储值卡实测 808 张卡余额 > 0,合计 4897.00 元。
+
+  - name: residual_amt_raw
+    sql: residual_amt_raw
+    type: string
+    title: 源库卡内余额原值(不可用)
+    description: |
+      源列 residual_amt(**varchar(20)**)—— **保留原样,仅供审计**。
+
+      ⚠️⚠️ **这一列不可用**:实测 ysx 43 种取值,垃圾字符全在 ASCII 44–64
+      (':' '<' '>' '@' ',' '-' '/' '.'),样例:
+        '86220.0'(149) / ':84420..'(354) / '20,,'(583) / ','(239) / '0'(314) …
+      ⇒ 同一批卡上出现**同一个**残值('86220.x' 覆盖 762 张卡),
+        而这些卡的真实余额是 0~99.6 元 ⇒ **与真实余额毫无关系**。
+
+      ⇒ 曾经把它当余额导出去,前端就显示「余额 86220 元」(762 张卡)。
+      ⇒ 现在 balance_yuan 走 source.MemberSQL 的派生口径,本列只留原值备查。
 
   - name: consumed_amount_yuan
     sql: consumed_amount_yuan
     type: number
     title: 累计消费(元)
     description: |
-      源列 consum_amt(numeric(16,4))。
-      ⚠️ 实测 hbposv7 里有 consum_amt=100.0000 的**初始化数据**
-      (2572 行"储值卡"几乎都是这个值),下游做消费统计时要留意。
+      ⚠️ **不是**源表 t_rm_vip_info.consum_amt 那一列
+      (实测 ysx 4128 行里只有 403 行 consum_amt 非 0,其余是 0.0000)。
+
+      源列 t_rm_vip_consume.vip_cons_amount(会员消费汇总表)。
+      ✅ 实测 800486:27862.6800(主表 consum_amt 是 0.0000)。
+      ⚠️ hbposv7 里有 consum_amt=100.0000 的**初始化数据**
+        (2572 行"储值卡"几乎都是这个值),下游做消费统计时要留意。
 
   - name: consumed_count
     sql: consumed_count
     type: number
     title: 消费次数
     description: |
-      源列 consum_count(int)。
-      ⚠️ 实测 ysx 3725/4128 行是 NULL、hbposv7 733/2642 行是 NULL,
+      ⚠️ **不是**源表 t_rm_vip_info.consum_count 那一列
+      (实测 ysx 3725/4128 行是 NULL、hbposv7 733/2642 行是 NULL)。
+
+      源列 t_rm_vip_consume.cons_count(会员消费汇总表)。
+      ✅ 实测 800486:1315 次(主表 consum_count 是 NULL)。
       NULL 与 0 含义不同(没消费过 vs 消费过但没计数),原样给。
 
   - name: favorite
@@ -258,6 +292,7 @@ measures:
     title: 会员数
     description: |
       ⚠️ 本 model **故意没有金额类 measure**:
-      balance_yuan 是带脏值的字符串,SUM(它)在 DuckDB 里要么报错、
-      要么把解析不了的行当成 0 —— 那是把数据质量问题藏进聚合结果。
+      余额/消费是**逐卡快照**,把它们 SUM 成"本店总余额"会把
+      "这张卡有多少钱"与"本店一共多少钱"混成一件事(且会员卡余额恒 0,
+      SUM 出来的数会被储值卡主导)。
       金额统计留给下游 importer 在自己的库里做。
