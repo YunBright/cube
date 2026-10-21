@@ -122,6 +122,13 @@ mappings:
     target: points_used
     type: decimal
 
+  # 源列 memb_remaining_points:剩余积分 —— **派生列**。
+  # ⚠️ **本库恒为 NULL**:该库没有 acc_num / dec_num ⇒ 源库侧不派生这一列
+  #   (照实映射;不用 now_acc_num 顶替 —— "当前积分"不是"剩余积分")。
+  - source: memb_remaining_points
+    target: remaining_points
+    type: decimal
+
   # 源列 memb_balance:卡内余额(元)—— **派生列**,由源库侧 SQL 算出来
   # (Σ t_rm_saving_plus_record.plus_count − Σ t_rm_card_paylist.amount)。
   # ⚠️ **不是** residual_amt:那一列是脏字符串('20,,' 1772 行 / '><886420.-' 446 行 …),

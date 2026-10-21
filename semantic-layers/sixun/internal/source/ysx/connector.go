@@ -34,6 +34,10 @@ type Connector struct {
 	// ⚠️ 不区分它 ⇒ 会员卡的刷卡消费(24 万行,合计 908 万)会被当成储值消费扣掉
 	// ⇒ 余额算成负数(实测 2521 张卡为负)。
 	memberStoredPayType string
+	// memberPointsAccCol / memberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
+	// 用来在源库侧派生「剩余积分」。空 = 不派生。
+	memberPointsAccCol  string
+	memberPointsUsedCol string
 	rowLimits           *source.RowLimits
 }
 
@@ -71,6 +75,10 @@ type Options struct {
 	// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
 	// 空 = 用 source.DefaultStoredPayType。
 	MemberStoredPayType string
+	// MemberPointsAccumulatedCol / MemberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
+	// 用来派生「剩余积分」。**两个都空 = 不派生该列**(该库恒 NULL)。
+	MemberPointsAccumulatedCol string
+	MemberPointsUsedCol        string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
 	RowLimits *source.RowLimits
 }
@@ -108,6 +116,8 @@ func New(opts Options) (*Connector, error) {
 		memberPaylist:       opts.TableMemberPaylist,
 		memberSavingPlus:    opts.TableMemberSavingPlus,
 		memberStoredPayType: opts.MemberStoredPayType,
+		memberPointsAccCol:  opts.MemberPointsAccumulatedCol,
+		memberPointsUsedCol: opts.MemberPointsUsedCol,
 		rowLimits:           opts.RowLimits,
 	}, nil
 }
@@ -182,11 +192,13 @@ func (c *Connector) FetchMember(ctx context.Context) ([]map[string]any, error) {
 		return nil, fmt.Errorf("ysx: table_member not configured")
 	}
 	q, err := source.MemberSQL(source.MemberTables{
-		Member:        c.tableMember,
-		Consume:       c.memberConsume,
-		Paylist:       c.memberPaylist,
-		SavingPlus:    c.memberSavingPlus,
-		StoredPayType: c.memberStoredPayType,
+		Member:               c.tableMember,
+		Consume:              c.memberConsume,
+		Paylist:              c.memberPaylist,
+		SavingPlus:           c.memberSavingPlus,
+		StoredPayType:        c.memberStoredPayType,
+		PointsAccumulatedCol: c.memberPointsAccCol,
+		PointsUsedCol:        c.memberPointsUsedCol,
 	}, c.rowLimits.For(source.RoleMember))
 	if err != nil {
 		return nil, fmt.Errorf("ysx: %w", err)

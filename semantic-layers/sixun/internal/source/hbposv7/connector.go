@@ -39,6 +39,10 @@ type Connector struct {
 	// memberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
 	// ⚠️ 不区分它 ⇒ 非储值的消费行会被当成储值消费扣掉 ⇒ 余额算成负数。
 	memberStoredPayType string
+	// memberPointsAccCol / memberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
+	// 用来派生「剩余积分」。**本库没有这两列** ⇒ 留空 ⇒ 不派生(恒 NULL)。
+	memberPointsAccCol  string
+	memberPointsUsedCol string
 	rowLimits           *source.RowLimits
 }
 
@@ -76,6 +80,10 @@ type Options struct {
 	// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
 	// 空 = 用 source.DefaultStoredPayType。
 	MemberStoredPayType string
+	// MemberPointsAccumulatedCol / MemberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
+	// 用来派生「剩余积分」。**本库没有这两列** ⇒ 留空 ⇒ 不派生(该列恒 NULL)。
+	MemberPointsAccumulatedCol string
+	MemberPointsUsedCol        string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
 	RowLimits *source.RowLimits
 }
@@ -113,6 +121,8 @@ func New(opts Options) (*Connector, error) {
 		memberPaylist:       opts.TableMemberPaylist,
 		memberSavingPlus:    opts.TableMemberSavingPlus,
 		memberStoredPayType: opts.MemberStoredPayType,
+		memberPointsAccCol:  opts.MemberPointsAccumulatedCol,
+		memberPointsUsedCol: opts.MemberPointsUsedCol,
 		rowLimits:           opts.RowLimits,
 	}, nil
 }
@@ -191,11 +201,13 @@ func (c *Connector) FetchMember(ctx context.Context) ([]map[string]any, error) {
 		return nil, fmt.Errorf("hbposv7: table_member not configured")
 	}
 	q, err := source.MemberSQL(source.MemberTables{
-		Member:        c.tableMember,
-		Consume:       c.memberConsume,
-		Paylist:       c.memberPaylist,
-		SavingPlus:    c.memberSavingPlus,
-		StoredPayType: c.memberStoredPayType,
+		Member:               c.tableMember,
+		Consume:              c.memberConsume,
+		Paylist:              c.memberPaylist,
+		SavingPlus:           c.memberSavingPlus,
+		StoredPayType:        c.memberStoredPayType,
+		PointsAccumulatedCol: c.memberPointsAccCol,
+		PointsUsedCol:        c.memberPointsUsedCol,
 	}, c.rowLimits.For(source.RoleMember))
 	if err != nil {
 		return nil, fmt.Errorf("hbposv7: %w", err)

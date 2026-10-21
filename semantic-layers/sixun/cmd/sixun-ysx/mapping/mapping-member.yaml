@@ -106,6 +106,12 @@ mappings:
     target: points_used
     type: decimal
 
+  # 源列 memb_remaining_points:剩余积分 —— **派生列**(源库侧算:acc_num − dec_num)。
+  # ⚠️ 本域(supertrade)member 表的剩余积分口径一致 ⇒ 两边可比。
+  - source: memb_remaining_points
+    target: remaining_points
+    type: decimal
+
   # 源列 memb_balance:卡内余额(元)—— **派生列**,由源库侧 SQL 算出来
   # (Σ t_rm_saving_plus_record.plus_count − Σ t_rm_card_paylist.amount)。
   #

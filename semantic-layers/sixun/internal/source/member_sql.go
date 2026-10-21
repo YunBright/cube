@@ -37,6 +37,15 @@ type MemberTables struct {
 	// ⇒ 做成**可配置项**:不同门店/版本的思迅若换了这个编码,改配置即可,
 	// 不用改代码(也不该为它写死一个魔数)。
 	StoredPayType string
+	// PointsAccumulatedCol / PointsUsedCol 是"累计积分 / 已用积分"的**源列名**,
+	// 用来在源库侧派生「剩余积分」(累计 − 已用)。
+	//
+	// ⚠️ 这是 family 私有事实(源列名各库不同),所以走配置而不是写死:
+	//   ysx     : acc_num / dec_num
+	//   hbposv7 : **没有这两列**(只有 now_acc_num 且 2642 行全为 NULL)
+	//             ⇒ 留空 ⇒ 该库不派生这一列 ⇒ 恒为 NULL(照实映射)。
+	PointsAccumulatedCol string
+	PointsUsedCol        string
 }
 
 // DefaultStoredPayType 是 StoredPayType 的默认值('2' = 储值支付)。
@@ -83,6 +92,10 @@ const (
 	MemberConsumeAmountAlias = "memb_consume_amount"
 	// MemberConsumeCountAlias 是派生列「消费次数」的别名。
 	MemberConsumeCountAlias = "memb_consume_count"
+	// MemberRemainingPointsAlias 是派生列「剩余积分(累计 − 已用)」的别名。
+	//
+	// ⚠️ 只有源库**同时有**累计积分列与已用积分列时才派生(hbposv7 没有 ⇒ 该库恒 NULL)。
+	MemberRemainingPointsAlias = "memb_remaining_points"
 )
 
 // MemberSQL 构造 member 模型的取数 SQL。
@@ -111,12 +124,26 @@ func MemberSQL(t MemberTables, limit int) (string, error) {
 	if strings.ContainsAny(storedType, "'") {
 		return "", fmt.Errorf("source: 储值支付类型码 %q 含引号,拒绝拼进 SQL", storedType)
 	}
+	// 积分列名(可选):配了才派生「剩余积分」这一列。
+	accCol := strings.TrimSpace(t.PointsAccumulatedCol)
+	usedCol := strings.TrimSpace(t.PointsUsedCol)
+	remainingExpr := ""
+	if accCol != "" && usedCol != "" {
+		if err := assertIdent("table_member_points_accumulated", accCol); err != nil {
+			return "", err
+		}
+		if err := assertIdent("table_member_points_used", usedCol); err != nil {
+			return "", err
+		}
+		remainingExpr = fmt.Sprintf(",\n  ISNULL(%s, 0) - ISNULL(%s, 0) AS %s",
+			accCol, usedCol, MemberRemainingPointsAlias)
+	}
 	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
 	return fmt.Sprintf(`SELECT TOP %d
   v.*,
   c.vip_cons_amount AS %s,
   c.cons_count AS %s,
-  ISNULL(p.plus_total, 0) - ISNULL(pay.pay_total, 0) AS %s
+  ISNULL(p.plus_total, 0) - ISNULL(pay.pay_total, 0) AS %s%s
 FROM %s v
 LEFT JOIN (SELECT card_id, MAX(vip_cons_amount) AS vip_cons_amount, MAX(cons_count) AS cons_count FROM %s GROUP BY card_id) c
        ON c.card_id = v.card_id
@@ -128,6 +155,7 @@ LEFT JOIN (SELECT card_id, SUM(amount) AS pay_total FROM %s WHERE card_type = '%
 		MemberConsumeAmountAlias,
 		MemberConsumeCountAlias,
 		MemberBalanceAlias,
+		remainingExpr,
 		t.Member, t.Consume, t.SavingPlus, t.Paylist, storedType,
 	), nil
 }

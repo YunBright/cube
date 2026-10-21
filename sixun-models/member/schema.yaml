@@ -162,6 +162,19 @@ dimensions:
       ✅ 实测 ysx 无 NULL(348 行非零)。
       ⚠️ **hbposv7 的 t_rm_vip_info 没有 dec_num 这一列**,该侧恒为 NULL。
 
+  - name: remaining_points
+    sql: remaining_points
+    type: number
+    title: 剩余积分
+    description: |
+      **派生列**:累计积分 − 已用积分(源库侧算,见 semantic-layers/sixun/internal/source/member_sql.go)。
+
+      ⚠️ 本域(supertrade)的 member 表也有同名列,口径一致 ⇒ 两边可比。
+
+      ⚠️ **hbposv7 恒为 NULL**:该库 t_rm_vip_info 没有 acc_num / dec_num
+      (只有 now_acc_num 且 2642 行全为 NULL)⇒ 不派生 ⇒ 照实给 NULL,
+      不用 now_acc_num 顶替("当前积分"与"剩余积分"不是一回事)。
+
   - name: balance_yuan
     sql: balance_yuan
     type: number

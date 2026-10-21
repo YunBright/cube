@@ -97,6 +97,9 @@ type appConfig struct {
 		// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值
 		// (空 = source.DefaultStoredPayType = '2')。
 		MemberStoredPayType string `yaml:"member_stored_pay_type"`
+		// MemberPointsAccumulatedCol / MemberPointsUsedCol 是积分列名(派生剩余积分用)。
+		MemberPointsAccumulatedCol string `yaml:"member_points_accumulated_col"`
+		MemberPointsUsedCol        string `yaml:"member_points_used_col"`
 		// 结算审批场景(2026-10-09)。表名在两个 family 同名同表,
 		// 单据类型不同:ysx 的结款单是 CP、hbposv7 是 DP(见 mapping-settlement.yaml)。
 		TableSettlement      string `yaml:"table_settlement"`
@@ -317,11 +320,13 @@ func main() {
 		TableMember:     appCfg.Source.TableMember,
 		TableMemberType: appCfg.Source.TableMemberType,
 		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
-		TableMemberConsume:    appCfg.Source.TableMemberConsume,
-		TableMemberPaylist:    appCfg.Source.TableMemberPaylist,
-		TableMemberSavingPlus: appCfg.Source.TableMemberSavingPlus,
-		MemberStoredPayType:   appCfg.Source.MemberStoredPayType,
-		RowLimits:             source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
+		TableMemberConsume:         appCfg.Source.TableMemberConsume,
+		TableMemberPaylist:         appCfg.Source.TableMemberPaylist,
+		TableMemberSavingPlus:      appCfg.Source.TableMemberSavingPlus,
+		MemberStoredPayType:        appCfg.Source.MemberStoredPayType,
+		MemberPointsAccumulatedCol: appCfg.Source.MemberPointsAccumulatedCol,
+		MemberPointsUsedCol:        appCfg.Source.MemberPointsUsedCol,
+		RowLimits:                  source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)
