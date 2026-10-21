@@ -114,16 +114,20 @@ dimensions:
 
   - name: fee_amount_yuan
     sql: fee_amount_yuan
-    type: string
+    type: number
     title: 卡费(元)
     description: |
       源列 vip_tax(numeric(16,4))。
-      ⚠️ 金额/比率列一律声明成 **string**(对齐 cube 既有惯例):
-      下游拿到的是字符串,自己做小数解析 —— cube 不参与金额计算,
-      也就不会在"保留几位"上替下游做决定。
-      ⚠️ 注意 mapping 里这一列的 type 仍是 decimal:
-      go-mssqldb 把 numeric 扫成 []byte,若 mapping 写 string,
+      ⚠️ **type 必须与物理列一致(= number)**（2026-10-21 生产实测踩到）：
+      查询构造器按 dimension 的 type 决定要不要包 RTRIM，而
+      **DuckDB 的 RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报
+      "No function matches RTRIM(DECIMAL)" ⇒ 整个查询 500。
+      ⚠️ mapping 里这一列的 type 也必须是 decimal：
+      go-mssqldb 把 numeric 扫成 []byte，若 mapping 写 string，
       fieldmapping.convert 会把它转成 "[48 46 48 48]" 这样的**字节码**。
+      ⚠️ "下游拿到字符串"这件事由**导出层**负责（supertrade 的
+      cube-router 把数值列导成字符串），**不**是 schema 的职责 ——
+      schema 的 type 描述的是**物理列**，不是对外契约。
 
   - name: limited_use_count
     sql: limited_use_count
@@ -138,7 +142,7 @@ dimensions:
 
   - name: points_accumulated
     sql: points_accumulated
-    type: string
+    type: number
     title: 累计积分
     description: |
       源列 acc_num(numeric)。
@@ -149,7 +153,7 @@ dimensions:
 
   - name: points_used
     sql: points_used
-    type: string
+    type: number
     title: 已用积分
     description: |
       源列 dec_num(numeric)。
@@ -171,7 +175,7 @@ dimensions:
 
   - name: consumed_amount_yuan
     sql: consumed_amount_yuan
-    type: string
+    type: number
     title: 累计消费(元)
     description: |
       源列 consum_amt(numeric(16,4))。

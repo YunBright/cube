@@ -39,12 +39,15 @@ dimensions:
 
   - name: discount_rate
     sql: discount_rate
-    type: string
+    type: number
     title: 折扣率
     description: |
       源列 discount(numeric(5,4))。
+      ⚠️ **type 必须与物理列一致(= number)**（2026-10-21 生产实测踩到）：
+      查询构造器按 dimension 的 type 决定要不要包 RTRIM，而
+      **DuckDB 的 RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报错 ⇒ 整个查询 500。
+      （"下游拿到字符串"由**导出层**负责，不在 schema 这一层。）
       ⚠️ 实测三行**都是 1.0000**(即不打折),两库相同。
-      原样给字符串:1.0000 是"折扣率 100%"而不是"折扣 1 折",
       换算口径留给下游 —— cube 不替下游乘 100 或取整。
 
   - name: allow_stored_value
