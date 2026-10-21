@@ -1,0 +1,194 @@
+# hbposv7 member mapping:思迅 7pro t_rm_vip_info(会员卡档案) → 统一 member
+#
+# 与 ysx **共用同一份 schema**(sixun-models/member/schema.yaml),
+# 差异**只在源列名** —— 两个库的 t_rm_vip_info 列名高度一致(实测 2026-10-21)。
+#
+# ✅ 实测行数(2026-10-21):hbposv7/hbposepro = 2642 行
+#    ysx/hbposv10 = 4128 行(见 sixun-ysx 那份 mapping 的注释)
+#
+# ⚠️ 本 mapping 只做「列名规范化 + 取值」,**不做任何语义归一化**
+#   (playbook §3.2 禁止 enum_map / transform):
+#   - card_status 原样给 '0'/'1'(不映射成 normal/frozen)
+#   - use_num 原样给 999635~999999(= 不限次哨兵),**不转 0**
+#   - residual_amt 是**带脏值的 varchar**,原样给字符串,不解析也不清洗
+#
+# ⚠️ numeric 源的列(金额 / 积分)type 必须是 **decimal**,不能写 string:
+#   go-mssqldb 把 numeric 扫成 []byte,fieldmapping.convert 若按 string 处理
+#   会把它变成 "[48 46 48 48]" 这样的**字节码**。
+#   (schema 里 dimension 的 type 是**对外契约**,与这里的 mapping type 不同层。)
+version: 1
+model: member
+
+mappings:
+  # 源列 card_id(varchar(20))。
+  # ⚠️ 源库有脏值(实测 ysx 有 2 行前导空格、1 行以反引号开头);
+  #    查询层的 RTRIM 只去尾部空格 ⇒ 下游按卡号匹配前必须自己 TRIM。
+  - source: card_id
+    target: id
+    type: string
+
+  # 源列 cardid_source(varchar(20))。卡面印刷号。
+  # ✅ 实测两库全为空,但列存在且语义明确,照样映射 —— 列的空与非空是数据事实。
+  - source: cardid_source
+    target: card_face_no
+    type: string
+
+  # 源列 card_type(char(2))。
+  # ⚠️ 本库实测取值与 ysx **不同**:'1 '=储值卡(2572) / 'wx'=微信会员(70);
+  #    ysx 是 '0'=会员卡 / '1'=储值卡 / '2'=VIP储值卡。
+  # ⇒ 原样给,不归一化;'wx' 只在本库出现,下游按 member_type 关联时必须容忍未知类型。
+  - source: card_type
+    target: card_type
+    type: string
+
+  # 源列 vip_name(varchar(40))。
+  # ✅ 实测本库只有 70/2642 行有值 —— 该店 t_rm_vip_info 多半是初始化数据,
+  #    不是真实会员档案。这是**源库事实**,照实映射,不在 cube 层清洗。
+  - source: vip_name
+    target: name
+    type: string
+
+  # 源列 vip_sex(char(2))。实测值是**中文单字**('女'/'男'),不是 '1'/'2'/'M'/'F'
+  # ⇒ 原样给,翻译留给下游。
+  - source: vip_sex
+    target: gender
+    type: string
+
+  # 源列 vip_tel(varchar(16)):固话。与 mobile(手机)分列,不要混用。
+  - source: vip_tel
+    target: phone
+    type: string
+
+  # 源列 mobile(varchar(20)):手机号。
+  - source: mobile
+    target: mobile
+    type: string
+
+  # 源列 birthday(datetime)。
+  # ⚠️ 实测 ysx 4048/4128 行是 NULL ⇒ 该列不能当"必填"字段用。
+  - source: birthday
+    target: birthday
+    type: datetime
+
+  # 源列 social_id(varchar(18)):身份证号。✅ 实测本库全空。
+  - source: social_id
+    target: id_card_no
+    type: string
+
+  # 源列 card_status(char(1))。
+  # ⚠️ **原样给源值,不做枚举归一化**。实测本库分布:'0'=2641 / '1'=1。
+  - source: card_status
+    target: status
+    type: string
+
+  # 源列 vip_tax(numeric(16,4)):卡费(元)。
+  # ⚠️ type 必须是 decimal(numeric 被 go-mssqldb 扫成 []byte,按 string 处理会出字节码)。
+  - source: vip_tax
+    target: fee_amount_yuan
+    type: decimal
+    unit: yuan
+
+  # 源列 use_num(int):可用次数。
+  # ⚠️ **哨兵值**:本库实测取值 999635~999999,其中 1461 行 ∈ {999998, 999999}
+  #    (= 思迅的"不限次"编码)。原样给,不转 0、不转 NULL,由下游 importer 解释。
+  - source: use_num
+    target: limited_use_count
+    type: int
+
+  # 源列 acc_num(numeric):累计积分。
+  # ⚠️⚠️ **本库的 t_rm_vip_info 没有 acc_num 这一列**
+  #    (实测 INFORMATION_SCHEMA:积分列只有 now_acc_num,且 2642 行**全部为 NULL**)。
+  #
+  #    这里**照常列出** source: acc_num,而不是删掉:
+  #      - mapping 的 target 决定 DuckDB 的**物理列**(dataloader.loadFull 用
+  #        meta.Columns 建表),两个 family 的 target 集合必须一致
+  #        (internal/source/mapping_parity_test.go 会因此红);
+  #      - 共享 schema 的 dimension 查的就是这个列名,删了它
+  #        ⇒ DuckDB 里根本没有这一列 ⇒ 查询报 column not found。
+  #      - 源列不存在时,mapRows 拿不到该键 ⇒ toRows 写入 nil ⇒ **该列恒为 NULL**。
+  #
+  #    ⚠️ 也**不能**改成 now_acc_num:那是"当前积分",与"累计获得"语义不同,
+  #    换个名字顶替等于把两件事混成一件,下游算"累计"会拿到错的值。
+  #    (schema.yaml 的 points_accumulated 描述里已注明本库恒为 NULL。)
+  - source: acc_num
+    target: points_accumulated
+    type: decimal
+
+  # 源列 dec_num(numeric):已用积分。
+  # ⚠️⚠️ **本库同样没有 dec_num 这一列** ⇒ 本列恒为 NULL。
+  #    理由同上(物理列必须与 ysx 一致;不能用 save_amt 顶替 ——
+  #    save_amt 是"储值金额",与"已用积分"不是一回事)。
+  - source: dec_num
+    target: points_used
+    type: decimal
+
+  # 源列 residual_amt(**varchar(20)**):卡内余额(元)。
+  # ⚠️⚠️ **这一列是带脏值的字符串,不是数字**。实测本库取值:
+  #    '20,,'(1772 行) / '><886420.-'(446) / '<:66420.1'(138) / ','(72)…
+  # ⇒ **原样给字符串,type 必须是 string**:
+  #    若按 decimal 处理,fieldmapping.convert 会在 ParseFloat 上报错,
+  #    而 dataloader.mapRows 对转换失败的行是**静默丢弃**的
+  #    ⇒ 整张表的行数会悄悄少掉一大截(症状:COUNT(*) 对不上 2642,零报错)。
+  #    脏数据是源库的事实,藏起来只会让下游把"解析失败"误判成"余额为 0"。
+  - source: residual_amt
+    target: balance_yuan
+    type: string
+
+  # 源列 consum_amt(numeric(16,4)):累计消费(元)。
+  # ⚠️ 实测本库有 1430 行 consum_amt = 100.0000 的**初始化数据**
+  #    (2572 行"储值卡"里的大部分),下游做消费统计时要留意。
+  - source: consum_amt
+    target: consumed_amount_yuan
+    type: decimal
+    unit: yuan
+
+  # 源列 consum_count(int):消费次数。
+  # ⚠️ 实测本库 733/2642 行是 NULL —— NULL 与 0 含义不同,原样给。
+  - source: consum_count
+    target: consumed_count
+    type: int
+
+  # 源列 favor(varchar(50)):偏好。
+  - source: favor
+    target: favorite
+    type: string
+
+  # 源列 memo(varchar(255)):备注。
+  - source: memo
+    target: remark
+    type: string
+
+  # 源列 branch_no(char(6)):门店号。
+  # ⚠️ 实测本库是 NULL(2572 行)+ '0000'(70 行)⇒ **不可当分区键**用。
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  # 源列 oper_id(char(4)):操作员。
+  - source: oper_id
+    target: operator_id
+    type: string
+
+  # 源列 oper_date(datetime):建卡 / 最后一次业务操作时间。
+  # 它同时是增量刷新的**回退列**(config.yaml 的 refresh.incremental_fallback.member):
+  # 实测 modify_date 有 2573/2642 行是 NULL,而 oper_date **0 行为 NULL**
+  # ⇒ COALESCE(modify_date, oper_date) 能覆盖全部行。
+  - source: oper_date
+    target: operated_at
+    type: datetime
+
+  # 源列 vip_start_date(datetime):有效期起。
+  - source: vip_start_date
+    target: valid_from
+    type: datetime
+
+  # 源列 vip_end_date(datetime):有效期止。
+  - source: vip_end_date
+    target: valid_until
+    type: datetime
+
+  # 源列 openid(varchar(60)):微信 OpenID。
+  # ✅ 实测两库全为空,但列存在,将来接入微信会员后直接可用。
+  - source: openid
+    target: open_id
+    type: string

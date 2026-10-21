@@ -1,0 +1,75 @@
+# member_type model - 思迅家族共享 schema(会员类别字典)
+#
+# 源表: t_rm_vip_type(会员类别)
+# ✅ 实测行数(2026-10-21): ysx/hbposv10 = 3 / hbposv7/hbposepro = 3
+#
+# ⚠️ **两个库的类别字典完全不同** —— 这是本 model 最容易踩的坑:
+#   ysx(hbposv10):  '0'=会员卡 / '1'=储值卡 / '2'=VIP储值卡
+#   hbposv7:        '0'=会员卡 / '1'=储值卡 / 'wx'=微信会员
+#   ⇒ hbposv7 根本没有 '2'(VIP储值卡),多出来一个 'wx'(微信会员)。
+#   ⇒ 下游做「member.card_type → member_type.id」关联时,
+#     **必须按同一个库的字典关联**,跨库拿 ID 会张冠李戴。
+#
+# 本 model 只做「列名规范化 + 取值」,不做任何语义归一化:
+#   - saving_flag / acc_flag 是 char(1) 的 '0'/'1',原样给字符串(不转 boolean)
+#   - discount 是 numeric,原样给(不做 100 倍换算、不做四舍五入)
+name: member_type
+sql_table: member_type
+# 增量刷新按主键 upsert(见 internal/dataloader)。
+# ✅ 实测 type_id 两库各自唯一(3 行 3 个不同 id)。
+primary_key: id
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 会员类别 ID
+    description: |
+      源列 type_id(char(2))。
+      ⚠️ char 定长补空格(实测 '0 ' / '1 '),查询层统一 RTRIM。
+      ⚠️ 取值集合**按库不同**(见文件头),下游必须同库关联。
+
+  - name: name
+    sql: name
+    type: string
+    title: 会员类别名称
+    description: |
+      源列 type_name(char(30))。
+      实测:会员卡 / 储值卡 / VIP储值卡(ysx)、会员卡 / 储值卡 / 微信会员(hbposv7)。
+
+  - name: discount_rate
+    sql: discount_rate
+    type: string
+    title: 折扣率
+    description: |
+      源列 discount(numeric(5,4))。
+      ⚠️ 实测三行**都是 1.0000**(即不打折),两库相同。
+      原样给字符串:1.0000 是"折扣率 100%"而不是"折扣 1 折",
+      换算口径留给下游 —— cube 不替下游乘 100 或取整。
+
+  - name: allow_stored_value
+    sql: allow_stored_value
+    type: string
+    title: 允许储值
+    description: |
+      源列 saving_flag(char(1)),'0'/'1'。
+      ⚠️ 声明成 **string 而不是 boolean**:char 定长值要经过 RTRIM 才干净,
+      而 boolean 在这里没有额外信息量(下游要的是"是/否"之外的原始值)。
+      实测 ysx:会员卡 '0' / 储值卡 '1' / VIP储值卡 '1';
+      hbposv7:会员卡 '0' / 储值卡 '1' / 微信会员 '1'。
+
+  - name: allow_points_pay
+    sql: allow_points_pay
+    type: string
+    title: 允许积分抵扣
+    description: |
+      源列 acc_flag(char(1)),'0'/'1'。
+      ⚠️ 声明成 string,理由同 allow_stored_value。
+      实测 ysx:会员卡 '0' / 储值卡 '0' / VIP储值卡 '1';
+      hbposv7:会员卡 '1' / 储值卡 '1' / 微信会员 '1'(两库口径不同)。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 会员类别数

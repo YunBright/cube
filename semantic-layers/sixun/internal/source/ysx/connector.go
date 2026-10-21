@@ -14,15 +14,17 @@ import (
 // Connector 实现 source.Connector,接思迅云商x DB。
 type Connector struct {
 	// legacyTSQL	true = 目标实例是 SQL Server 2008 及更早(见 internal/source/legacy.go)
-	legacyTSQL    bool
-	db            *sql.DB
-	tableSupplier string
-	tableProduct  string
-	tableCategory string
-	tableCustType string
-	tableSaleWay  string
-	tableSale     string
-	rowLimits     *source.RowLimits
+	legacyTSQL      bool
+	db              *sql.DB
+	tableSupplier   string
+	tableProduct    string
+	tableCategory   string
+	tableCustType   string
+	tableSaleWay    string
+	tableSale       string
+	tableMember     string
+	tableMemberType string
+	rowLimits       *source.RowLimits
 }
 
 // Options 构造参数。
@@ -40,7 +42,13 @@ type Options struct {
 	// ⚠️ 这张表是**通用**基础代码字典,含职称/民族/学历/企业类型/品牌/单位/
 	// 销售方式… 共 30+ 行;只取 type_no='SW' 的子集(见 FetchSaleWay)。
 	TableSaleWay string
-	TableSale     string
+	TableSale    string
+	// TableMember 是会员卡档案表(t_rm_vip_info)。
+	// 实测 ysx/hbposv10 = 4128 行 / hbposv7/hbposepro = 2642 行。
+	TableMember string
+	// TableMemberType 是会员类别字典表(t_rm_vip_type)。
+	// 实测两个库各 3 行;字典表被截断 = 某些会员类别查不到自己的类别。
+	TableMemberType string
 	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
 	RowLimits *source.RowLimits
 }
@@ -64,15 +72,17 @@ func New(opts Options) (*Connector, error) {
 		legacy = true // 探测失败保守处理:老方言在任何版本都能跑
 	}
 	return &Connector{
-		db:            db,
-		legacyTSQL:    legacy,
-		tableSupplier: opts.TableSupplier,
-		tableProduct:  opts.TableProduct,
-		tableCategory: opts.TableCategory,
-		tableCustType: opts.TableCustType,
-		tableSaleWay:  opts.TableSaleWay,
-		tableSale:     opts.TableSale,
-		rowLimits:     opts.RowLimits,
+		db:              db,
+		legacyTSQL:      legacy,
+		tableSupplier:   opts.TableSupplier,
+		tableProduct:    opts.TableProduct,
+		tableCategory:   opts.TableCategory,
+		tableCustType:   opts.TableCustType,
+		tableSaleWay:    opts.TableSaleWay,
+		tableSale:       opts.TableSale,
+		tableMember:     opts.TableMember,
+		tableMemberType: opts.TableMemberType,
+		rowLimits:       opts.RowLimits,
 	}, nil
 }
 
@@ -132,6 +142,28 @@ func (c *Connector) FetchSaleWay(ctx context.Context) ([]map[string]any, error) 
 		source.FilterRowsByColumn(rows, "type_no", "SW"))
 }
 
+// FetchMember 拉会员卡档案(t_rm_vip_info)。
+//
+// ⚠️ 表名只来自 config.yaml(source.table_member):它是 family 私有事实,
+// 不能写进共享的 sixun-models/schema.yaml。
+func (c *Connector) FetchMember(ctx context.Context) ([]map[string]any, error) {
+	if c.tableMember == "" {
+		return nil, fmt.Errorf("ysx: table_member not configured")
+	}
+	return c.fetchTable(ctx, c.tableMember, source.RoleMember)
+}
+
+// FetchMemberType 拉会员类别字典(t_rm_vip_type)。
+//
+// 实测 ysx 3 行('0'=会员卡 / '1'=储值卡 / '2'=VIP储值卡),
+// 独立于 member 表:member.card_type 指向本表的 type_id,两张表都要拉。
+func (c *Connector) FetchMemberType(ctx context.Context) ([]map[string]any, error) {
+	if c.tableMemberType == "" {
+		return nil, fmt.Errorf("ysx: table_member_type not configured")
+	}
+	return c.fetchTable(ctx, c.tableMemberType, source.RoleMemberType)
+}
+
 // FetchSaleDetail 拉销售明细(含销售退货)。
 func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, error) {
 	if c.tableSale == "" {
@@ -159,6 +191,10 @@ func (c *Connector) duckTarget(model string) (table, role string, ok bool) {
 		return c.tableSaleWay, source.RoleSaleWay, true
 	case "sale_detail":
 		return c.tableSale, source.RoleSale, true
+	case "member":
+		return c.tableMember, source.RoleMember, true
+	case "member_type":
+		return c.tableMemberType, source.RoleMemberType, true
 	}
 	return "", "", false
 }

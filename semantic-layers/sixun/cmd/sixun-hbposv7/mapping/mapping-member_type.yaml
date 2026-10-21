@@ -1,0 +1,54 @@
+# hbposv7 member_type mapping:思迅 7pro t_rm_vip_type(会员类别) → 统一 member_type
+#
+# 与 ysx **共用同一份 schema**(sixun-models/member_type/schema.yaml),
+# 差异只在源列名 —— 两个库的 t_rm_vip_type 列名一致(实测 2026-10-21)。
+#
+# ✅ 实测行数(2026-10-21):hbposv7/hbposepro = 3 行
+#    ysx/hbposv10 = 3 行(见 sixun-ysx 那份 mapping 的注释)
+#
+# ⚠️ 本 mapping 只做「列名规范化 + 取值」,**不做任何语义归一化**
+#   (playbook §3.2 禁止 enum_map / transform):
+#   - saving_flag / acc_flag 是 char(1) 的 '0'/'1',原样给字符串(不转 boolean)
+#   - discount 是 numeric,原样给(不做 100 倍换算、不做四舍五入)
+#
+# ⚠️ discount 的 mapping type 必须是 **decimal**:源列是 numeric(5,4),
+#   go-mssqldb 把它扫成 []byte,若按 string 处理,fieldmapping.convert 会给出
+#   "[49 46 48 48 48 48 48]" 这样的**字节码**(1.0000 的字节)。
+#   (schema 里 dimension 的 type: string 是**对外契约**,与这里的 mapping type 不同层。)
+version: 1
+model: member_type
+
+mappings:
+  # 源列 type_id(char(2))。
+  # ⚠️ char 定长补空格(实测 '0 ' / '1 '),查询层统一 RTRIM。
+  # ⚠️ 取值集合**按库不同**(见文件头),下游必须同库关联。
+  - source: type_id
+    target: id
+    type: string
+
+  # 源列 type_name(char(30))。
+  # 实测 hbposv7:会员卡 / 储值卡 / **微信会员**('wx',ysx 没有这一类)。
+  - source: type_name
+    target: name
+    type: string
+
+  # 源列 discount(numeric(5,4)):折扣率。
+  # ⚠️ 实测三行**都是 1.0000**(即不打折)。原样给,不乘 100、不取整 ——
+  #   "1.0000 是折扣率 100%"这个换算口径留给下游。
+  - source: discount
+    target: discount_rate
+    type: decimal
+
+  # 源列 saving_flag(char(1)):'0'/'1'。
+  # ⚠️ 声明成 string 而不是 boolean:char 定长值要经过 RTRIM 才干净,
+  #   而 boolean 在这里没有额外信息量(下游要的是原始值)。
+  #   实测 hbposv7:会员卡 '0' / 储值卡 '1' / 微信会员 '1'。
+  - source: saving_flag
+    target: allow_stored_value
+    type: string
+
+  # 源列 acc_flag(char(1)):'0'/'1'。理由同 allow_stored_value。
+  # 实测 hbposv7:会员卡 '1' / 储值卡 '1' / 微信会员 '1'(与 ysx 口径不同)。
+  - source: acc_flag
+    target: allow_points_pay
+    type: string

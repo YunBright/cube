@@ -20,6 +20,11 @@ source:
   table_sale:     t_mp_saleflow    # ⚠️ 实测 0 行空表,历史配置,勿依赖
   table_stock:    t_im_branch_stock
 
+  # 会员卡档案(t_rm_vip_info)+ 会员类别字典(t_rm_vip_type)。
+  # ✅ 实测 2026-10-21:ysx t_rm_vip_info 4128 行 / t_rm_vip_type 3 行。
+  table_member:      t_rm_vip_info
+  table_member_type: t_rm_vip_type
+
   table_settlement:          t_fm_recpay_gx_master
   table_settlement_line:     t_fm_recpay_detail
   table_purchase_sheet:      t_pm_sheet_master
@@ -53,6 +58,11 @@ source:
     supplier: 20000    # 218 / 300
     category: 20000    # 186 / 596
     sale:     500000
+    # 会员卡档案(t_rm_vip_info):实测 ysx 4128 / hbposv7 2642 行。
+    # 它会持续增长 ⇒ 上限给到 20000(截断是静默的,丢的是随机行)。
+    member: 20000
+    # 会员类别字典(t_rm_vip_type):实测两个库各 3 行,字典表不该被截断。
+    member_type: 2000
 
   # ⚠️ 上面这些 row_limits **不再**需要为 settlement / settlement_line /
   #    purchase_sheet / purchase_sheet_line / sale_day / stock 配置:
@@ -82,6 +92,9 @@ refresh:
   incremental:
     product:  modify_date
     supplier: modify_date
+    # 会员卡档案(t_rm_vip_info):实测有 modify_date。
+    # member_type 故意不配(字典表没有时间列,走全量)。
+    member:   modify_date
 
   # ==================== 增量回退列 ====================
   # 拼成 COALESCE(modify_date, build_date) >= 水位。留空则退化成单列比较。
@@ -103,6 +116,10 @@ refresh:
   # modify_date / check_out_date),而它只有 218 行、30 天才变 2~9 行。
   incremental_fallback:
     product: build_date
+    # member 的回退列是 **oper_date**(源表 t_rm_vip_info 没有 build_date 列)。
+    # 实测 2026-10-21:modify_date 有 1154/4128 行是 NULL,oper_date 0 行为 NULL
+    # ⇒ COALESCE(modify_date, oper_date) 覆盖全部行。
+    member: oper_date
 
   # 夜间全量校准的调度式,原样交给 Dapr 解析(6 字段 cron:秒 分 时 日 月 周)。
   #

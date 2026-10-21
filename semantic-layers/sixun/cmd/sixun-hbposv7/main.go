@@ -57,9 +57,11 @@ import (
 	models "github.com/YunBright/cube/sixun-models"
 	categorymodel "github.com/YunBright/cube/sixun-models/category"
 	custtypemodel "github.com/YunBright/cube/sixun-models/cust_type"
+	membermodel "github.com/YunBright/cube/sixun-models/member"
+	membertypemodel "github.com/YunBright/cube/sixun-models/member_type"
 	productmodel "github.com/YunBright/cube/sixun-models/product"
-	salewaymodel "github.com/YunBright/cube/sixun-models/sale_way"
 	salemodel "github.com/YunBright/cube/sixun-models/sale_detail"
+	salewaymodel "github.com/YunBright/cube/sixun-models/sale_way"
 	suppliermodel "github.com/YunBright/cube/sixun-models/supplier"
 
 	"github.com/gin-gonic/gin"
@@ -88,9 +90,15 @@ type appConfig struct {
 		// TableSaleWay 是「销售方式」字典表(t_bd_base_code)。
 		// supplier.supply_way(源列 sale_way)指向它;
 		// 实测两个库的供应商全部有值(ysx 219 / hbposv7 300)。
-		TableSaleWay  string `yaml:"table_sale_way"`
-		TableSale     string `yaml:"table_sale"`
-		TableStock    string `yaml:"table_stock"`
+		TableSaleWay string `yaml:"table_sale_way"`
+		TableSale    string `yaml:"table_sale"`
+		TableStock   string `yaml:"table_stock"`
+		// TableMember 是会员卡档案表(t_rm_vip_info)。
+		// 实测 hbposv7/hbposepro = 2642 行 / ysx/hbposv10 = 4128 行。
+		TableMember string `yaml:"table_member"`
+		// TableMemberType 是会员类别字典表(t_rm_vip_type)。
+		// member.card_type 指向它;实测两个库各 3 行。
+		TableMemberType string `yaml:"table_member_type"`
 		// 结算审批场景(2026-10-09)。表名在两个 family 同名同表,
 		// 单据类型不同:hbposv7 的结款单是 DP(供应商对帐单)、ysx 是 CP。
 		TableSettlement      string `yaml:"table_settlement"`
@@ -264,14 +272,16 @@ func main() {
 
 	// 5. SQL Server
 	conn, err := hbposv7.New(hbposv7.Options{
-		DSN:           appCfg.Source.DSN,
-		TableSupplier: appCfg.Source.TableSupplier,
-		TableProduct:  appCfg.Source.TableProduct,
-		TableCategory: appCfg.Source.TableCategory,
-		TableCustType: appCfg.Source.TableCustType,
-		TableSaleWay:  appCfg.Source.TableSaleWay,
-		TableSale:     appCfg.Source.TableSale,
-		RowLimits:     source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
+		DSN:             appCfg.Source.DSN,
+		TableSupplier:   appCfg.Source.TableSupplier,
+		TableProduct:    appCfg.Source.TableProduct,
+		TableCategory:   appCfg.Source.TableCategory,
+		TableCustType:   appCfg.Source.TableCustType,
+		TableSaleWay:    appCfg.Source.TableSaleWay,
+		TableSale:       appCfg.Source.TableSale,
+		TableMember:     appCfg.Source.TableMember,
+		TableMemberType: appCfg.Source.TableMemberType,
+		RowLimits:       source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)
@@ -304,6 +314,11 @@ func main() {
 		{Name: "cust_type", Fetch: conn.FetchCustType, Build: custtypemodel.Build},
 		{Name: "sale_way", Fetch: conn.FetchSaleWay, Build: salewaymodel.Build},
 		{Name: "sale_detail", Fetch: conn.FetchSaleDetail, Build: salemodel.Build},
+		// 会员卡档案 + 会员类别字典(2026-10-21)。
+		// member 走增量(config.yaml 的 refresh.incremental.member = modify_date,
+		// 回退列 oper_date);member_type 没有可用时间列 ⇒ 走全量(才 3 行)。
+		{Name: "member", Fetch: conn.FetchMember, Build: membermodel.Build},
+		{Name: "member_type", Fetch: conn.FetchMemberType, Build: membertypemodel.Build},
 	}
 	// fresh 记录每次物化的成败,喂给 /healthz。
 	// duck model 是快照,不是实时透传 —— 所以"这份数据有多旧"是必须能被外部看见的事实。

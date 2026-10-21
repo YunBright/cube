@@ -72,10 +72,14 @@ func TestDefaultRowLimitCoversRealTableSizes(t *testing.T) {
 		{"ysx  t_im_branch_stock (库存)", 23576},
 		{"ysx  t_bd_supcust_info (供应商)", 218},
 		{"ysx  t_bd_item_cls     (分类)", 186},
+		{"ysx  t_rm_vip_info     (会员)", 4128},
+		{"ysx  t_rm_vip_type     (会员类别)", 3},
 		{"hbposv7 t_bd_item_info    (商品)", 44313},
 		{"hbposv7 t_im_branch_stock (库存)", 10607},
 		{"hbposv7 t_bd_supcust_info (供应商)", 300},
 		{"hbposv7 t_bd_item_cls     (分类)", 596},
+		{"hbposv7 t_rm_vip_info     (会员)", 2642},
+		{"hbposv7 t_rm_vip_type     (会员类别)", 3},
 	}
 	for _, c := range cases {
 		if DefaultRowLimit < c.rows {

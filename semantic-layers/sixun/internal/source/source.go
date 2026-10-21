@@ -100,6 +100,20 @@ const (
 	// 它和 supplier 不是同一张表,行数上限的语义也不同(字典表永远不该被截断,
 	// 而截断了就等于"某些供应商查不到自己的类别")。
 	RoleCustType = "cust_type"
+	// RoleMember 是会员卡档案(t_rm_vip_info)。
+	//
+	// 实测 ysx/hbposv10 = 4128 行 / hbposv7/hbposepro = 2642 行。
+	//
+	// ⚠️ 会员档案是**会持续增长**的表(每开一次卡就多一行),所以它的上限
+	// 与商品表同级(20000),不能按"现在只有几千行"配个小值 ——
+	// 小值的失败模式是**静默截断**:SELECT TOP n * 没有 ORDER BY,
+	// 丢的是随机行,表现是"部分会员查不到",而 healthz 全绿。
+	RoleMember = "member"
+	// RoleMemberType 是会员类别字典(t_rm_vip_type)。
+	//
+	// 实测两个库各 3 行。字典表**永远不该被截断** ——
+	// 截断了就等于"某些会员类别查不到自己的类别"。
+	RoleMemberType = "member_type"
 	// RoleSaleWay 是「销售方式」字典(t_bd_base_code 中 type_no='SW' 的行)。
 	//
 	// 实测两个库的供应商**全部有 sale_way**(ysx 219 / hbposv7 300),

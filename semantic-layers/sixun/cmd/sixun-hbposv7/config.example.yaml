@@ -27,6 +27,13 @@ source:
   table_sale:     t_rm_order_saleflow
   table_stock:    t_im_branch_stock
 
+  # 会员卡档案(t_rm_vip_info)+ 会员类别字典(t_rm_vip_type)。
+  # ✅ 实测 2026-10-21:hbposv7 t_rm_vip_info 2642 行 / t_rm_vip_type 3 行。
+  # ⚠️ 本库的 t_rm_vip_info 没有 acc_num / dec_num 两列 ⇒ member model 的
+  #    points_accumulated / points_used 恒为 NULL(源库事实,照实映射)。
+  table_member:      t_rm_vip_info
+  table_member_type: t_rm_vip_type
+
   table_settlement:          t_fm_recpay_gx_master
   table_settlement_line:     t_fm_recpay_detail
   table_purchase_sheet:      t_pm_sheet_master
@@ -58,6 +65,11 @@ source:
     supplier: 20000    # 218 / 300
     category: 20000    # 186 / 596
     sale:     500000
+    # 会员卡档案(t_rm_vip_info):实测 ysx 4128 / hbposv7 2642 行。
+    # 它会持续增长 ⇒ 上限给到 20000(截断是静默的,丢的是随机行)。
+    member: 20000
+    # 会员类别字典(t_rm_vip_type):实测两个库各 3 行,字典表不该被截断。
+    member_type: 2000
 
   # ⚠️ 上面这些 row_limits **不再**需要为 settlement / settlement_line /
   #    purchase_sheet / purchase_sheet_line / sale_day / stock 配置:
@@ -79,9 +91,12 @@ refresh:
   incremental:
     product:  modify_date
     supplier: modify_date
+    # 会员卡档案(t_rm_vip_info):实测有 modify_date。
+    # member_type 故意不配(字典表没有时间列,走全量)。
+    member:   modify_date
 
   # ==================== 增量回退列 ====================
-  # **本库故意不配 incremental_fallback** —— 配了也没有任何效果。
+  # **product 故意不配 incremental_fallback** —— 配了也没有任何效果。
   #
   # 2026-10-10 真库实测:
   #   modify_date 为 NULL 的 12607 行商品,**build_date 也全部为 NULL**
@@ -94,6 +109,13 @@ refresh:
   #
   # ⚠️ 无论配不配,**夜间全量校准都不可省**:那 12607 行(占全部商品 28%)
   #    两个时间列都是 NULL,任何基于时间列的增量都永远拉不到它们。
+  #
+  # ⚠️ member 配了(理由与 product 不同):回退列是 **oper_date** ——
+  #   源表 t_rm_vip_info 没有 build_date 列。
+  #   实测 2026-10-21:modify_date 有 2573/2642 行是 NULL,oper_date 0 行为 NULL
+  #   ⇒ COALESCE(modify_date, oper_date) 覆盖全部行。
+  incremental_fallback:
+    member: oper_date
 
   # 夜间全量校准,6 字段 cron(秒 分 时 日 月 周)= 每天 03:00:00。
   # ⚠️ 必须写满 6 个字段:2026-10-10 真机实测,写 5 字段("0 3 * * *")

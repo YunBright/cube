@@ -1,0 +1,259 @@
+# member model - 思迅家族共享 schema(会员卡档案)
+#
+# 源表: t_rm_vip_info(会员卡档案)
+# ✅ 实测行数(2026-10-21): ysx/hbposv10 = 4128 / hbposv7/hbposepro = 2642
+#
+# # 本 model 只做「列名规范化 + 取值」,**不做任何语义归一化**
+#
+# 这不是省事,是 cube 的硬规矩(AGENTS.md §4:枚举值归一化不做,
+# 留在 schema meta + BI 层翻译):
+#   - card_status 原样给 '0'/'1'/'2'/'3'/'5'(不映射成 normal/frozen)
+#   - use_num 原样给 999998/999999(= 不限次哨兵),**不转 0**
+#   - residual_amt 是**带脏值的 varchar**,原样给字符串,不解析也不清洗
+#   - saving_flag / acc_flag 是 char(1) 的 '0'/'1',声明成 string(不是 boolean)
+#
+# 在 mapping 里偷偷清洗等于把"源库长这样"这个事实藏起来,
+# 让下游排查时无从查证(playbook §3.2)。
+name: member
+sql_table: member
+# 增量刷新按主键 upsert(见 internal/dataloader)。
+# ✅ 实测两库 distinct(card_id) == 行数(无重复),所以 card_id 可以当主键。
+primary_key: id
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 会员卡号
+    description: |
+      源列 card_id(varchar(20))。
+      ⚠️ **源库有脏值**:实测 ysx 有 2 行**前导空格**(' 801598')、
+      1 行以反引号开头('`800973')。
+      查询层的 RTRIM 只去**尾部**空格(那是思迅 char 定长补空格的通病),
+      前导空格不会被去掉 ⇒ 下游按卡号匹配前必须自己 TRIM,
+      否则 ' 801598' 和 '801598' 会被当成两个会员。
+
+  - name: card_face_no
+    sql: card_face_no
+    type: string
+    title: 卡面号
+    description: |
+      源列 cardid_source(varchar(20))。
+      ✅ 实测两库**全为空**(ysx 0 行 / hbposv7 0 行非空),
+      但列存在且语义明确(卡面印刷号),照样映射 —— 列的空与非空是数据事实,
+      不该由建模层替下游决定。
+
+  - name: card_type
+    sql: card_type
+    type: string
+    title: 卡类型
+    description: |
+      源列 card_type(char(2))。
+      ⚠️ **两个库的取值集合不同**,原样给,不归一化:
+        ysx(hbposv10): '0'=会员卡(2751) / '1'=储值卡(1376) / '2'=VIP储值卡(1)
+        hbposv7:       '1'=储值卡(2572) / 'wx'=微信会员(70)
+      ⇒ 'wx' 只在 hbposv7 出现;下游按 member_type 关联时必须容忍未知类型。
+
+  - name: name
+    sql: name
+    type: string
+    title: 会员姓名
+    description: |
+      源列 vip_name(varchar(40))。
+      ✅ 实测 ysx 3773/4128 行有值;hbposv7 只有 70/2642 行有值
+      (该店 t_rm_vip_info 多半是初始化数据,不是真实会员档案)。
+
+  - name: gender
+    sql: gender
+    type: string
+    title: 性别
+    description: |
+      源列 vip_sex(char(2))。实测值是**中文单字**('女' / '男'),
+      不是 '1'/'2'/'M'/'F' ⇒ 不做归一化,原样给下游翻译。
+
+  - name: phone
+    sql: phone
+    type: string
+    title: 固话
+    description: 源列 vip_tel(varchar(16))。与 mobile(手机)分列,不要混用。
+
+  - name: mobile
+    sql: mobile
+    type: string
+    title: 手机号
+    description: 源列 mobile(varchar(20))。
+
+  - name: birthday
+    sql: birthday
+    type: time
+    title: 生日
+    description: |
+      源列 birthday(datetime)。
+      ⚠️ 实测 ysx **4048/4128 行是 NULL**(只有 80 行填了生日),
+      所以它不能当"必填"字段用。
+
+  - name: id_card_no
+    sql: id_card_no
+    type: string
+    title: 身份证号
+    description: |
+      源列 social_id(varchar(18))。
+      ✅ 实测 ysx 只有 12 行非空、hbposv7 全空。
+
+  - name: status
+    sql: status
+    type: string
+    title: 卡状态
+    description: |
+      源列 card_status(char(1)),**原样给源值,不做枚举归一化**。
+      ✅ 实测分布:
+        ysx: '0'=4101 / '3'=21 / '1'=4 / '2'=1 / '5'=1
+        hbposv7: '0'=2641 / '1'=1
+      下游要翻译成 normal/frozen/lost 之类,那是下游 importer 的事
+      (cube 只负责把"源库长这样"如实搬出去)。
+
+  - name: fee_amount_yuan
+    sql: fee_amount_yuan
+    type: string
+    title: 卡费(元)
+    description: |
+      源列 vip_tax(numeric(16,4))。
+      ⚠️ 金额/比率列一律声明成 **string**(对齐 cube 既有惯例):
+      下游拿到的是字符串,自己做小数解析 —— cube 不参与金额计算,
+      也就不会在"保留几位"上替下游做决定。
+      ⚠️ 注意 mapping 里这一列的 type 仍是 decimal:
+      go-mssqldb 把 numeric 扫成 []byte,若 mapping 写 string,
+      fieldmapping.convert 会把它转成 "[48 46 48 48]" 这样的**字节码**。
+
+  - name: limited_use_count
+    sql: limited_use_count
+    type: number
+    title: 可用次数
+    description: |
+      源列 use_num(int)。
+      ⚠️ **哨兵值**:实测 ysx 有 1223 行 = 999999、405 行 = 999998,
+      hbposv7 更宽(999980~999999 一整段)。
+      这些是思迅的"**不限次**"编码,不是真实次数 ——
+      这里**原样给**(不转 0、不转 NULL),由下游 importer 解释。
+
+  - name: points_accumulated
+    sql: points_accumulated
+    type: string
+    title: 累计积分
+    description: |
+      源列 acc_num(numeric)。
+      ✅ 实测 ysx 无 NULL(2864 行非零)。
+      ⚠️ **hbposv7 的 t_rm_vip_info 没有 acc_num 这一列**
+      (实测 INFORMATION_SCHEMA:该表积分列只有 now_acc_num,
+      且 2642 行**全部为 NULL**),所以 hbposv7 侧本列恒为 NULL。
+
+  - name: points_used
+    sql: points_used
+    type: string
+    title: 已用积分
+    description: |
+      源列 dec_num(numeric)。
+      ✅ 实测 ysx 无 NULL(348 行非零)。
+      ⚠️ **hbposv7 的 t_rm_vip_info 没有 dec_num 这一列**,该侧恒为 NULL。
+
+  - name: balance_yuan
+    sql: balance_yuan
+    type: string
+    title: 卡内余额(元)
+    description: |
+      源列 residual_amt(**varchar(20)**)。
+      ⚠️⚠️ **这一列是带脏值的字符串,不是数字**。实测 ysx 的取值长这样:
+      '' (764 行)、'20,,' (583)、':84420..' (354)、',' (239)、'86220.-' (205)…
+      hbposv7 同样脏('20,,' 1772 行、'><886420.-' 446 行)。
+      ⇒ **原样给字符串,不解析不清洗**:脏数据是源库的事实,
+      藏起来只会让下游把"解析失败"误判成"余额为 0"。
+      下游要自己判断解析失败后跳过还是按 0 处理。
+
+  - name: consumed_amount_yuan
+    sql: consumed_amount_yuan
+    type: string
+    title: 累计消费(元)
+    description: |
+      源列 consum_amt(numeric(16,4))。
+      ⚠️ 实测 hbposv7 里有 consum_amt=100.0000 的**初始化数据**
+      (2572 行"储值卡"几乎都是这个值),下游做消费统计时要留意。
+
+  - name: consumed_count
+    sql: consumed_count
+    type: number
+    title: 消费次数
+    description: |
+      源列 consum_count(int)。
+      ⚠️ 实测 ysx 3725/4128 行是 NULL、hbposv7 733/2642 行是 NULL,
+      NULL 与 0 含义不同(没消费过 vs 消费过但没计数),原样给。
+
+  - name: favorite
+    sql: favorite
+    type: string
+    title: 偏好
+    description: 源列 favor(varchar(50))。✅ 实测 ysx 全为空。
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 memo(varchar(255))。✅ 实测 ysx 只有 1 行非空。
+
+  - name: branch_no
+    sql: branch_no
+    type: string
+    title: 门店号
+    description: |
+      源列 branch_no(char(6))。
+      ⚠️ 实测 ysx 全是 '00'(4127 行)+ 1 行空;
+      hbposv7 是 NULL(2572 行)+ '0000'(70 行)——
+      两个库都**不可当分区键**用(与 settlement.branch_id 同样的结论)。
+
+  - name: operator_id
+    sql: operator_id
+    type: string
+    title: 操作员
+    description: 源列 oper_id(char(4))。实测值如 '1000' / '5002'。
+
+  - name: operated_at
+    sql: operated_at
+    type: time
+    title: 操作时间
+    description: |
+      源列 oper_date(datetime)= 建卡/最后一次业务操作时间。
+      ⚠️ **它同时是增量刷新的回退列**(见 config.yaml 的
+      refresh.incremental_fallback.member):实测 modify_date 有
+      1154 行(ysx)/2573 行(hbposv7)是 NULL,而 oper_date **0 行为 NULL**,
+      所以 COALESCE(modify_date, oper_date) 能覆盖全部行。
+
+  - name: valid_from
+    sql: valid_from
+    type: time
+    title: 有效期起
+    description: 源列 vip_start_date(datetime)。实测 ysx 有 4 行为 NULL。
+
+  - name: valid_until
+    sql: valid_until
+    type: time
+    title: 有效期止
+    description: 源列 vip_end_date(datetime)。✅ 实测两库均无 NULL。
+
+  - name: open_id
+    sql: open_id
+    type: string
+    title: 微信 OpenID
+    description: |
+      源列 openid(varchar(60))。
+      ✅ 实测两库**全为空**(ysx 0 行 / hbposv7 0 行非空),
+      但列存在,将来接入微信会员后直接可用。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 会员数
+    description: |
+      ⚠️ 本 model **故意没有金额类 measure**:
+      balance_yuan 是带脏值的字符串,SUM(它)在 DuckDB 里要么报错、
+      要么把解析不了的行当成 0 —— 那是把数据质量问题藏进聚合结果。
+      金额统计留给下游 importer 在自己的库里做。
