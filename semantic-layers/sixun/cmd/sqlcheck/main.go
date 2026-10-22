@@ -831,6 +831,27 @@ func buildCases() []checkCase {
 			},
 		},
 		{
+			// ⚠️ 这条用例是 2026-10-23 加的:之前**根本没有会员用例**,
+			// 于是 hbposv7 的 member 查询 500(列名 memb_remaining_points 无效)
+			// 一直没人发现 —— 而 ysx 侧一切正常 ⇒ 症状是"一家店能查会员、另一家不能"。
+			//
+			// 会员的 live 源是**片段**(余额 = 充值 − 储值支付,要 JOIN 三张流水表),
+			// 四个派生列都由源库侧算出来 ⇒ 这条用例把它们一次性验掉。
+			name: "会员档案-派生列抽样", base: "member",
+			desc: "卡内余额 / 累计消费 / 消费次数 / 剩余积分四个派生列(源库侧算出来)。" +
+				"⚠️ hbposv7 的 t_rm_vip_info 没有积分列 ⇒ 剩余积分恒为 NULL" +
+				"(但**列必须在**:整列省掉 ⇒ 源库报'列名无效' ⇒ 整个 member 查询 500)。",
+			query: &cubequery.Query{
+				Measures: []string{"member.count"},
+				Dimensions: []string{
+					"member.id", "member.name", "member.card_type",
+					"member.balance_yuan", "member.consumed_amount_yuan",
+					"member.consumed_count", "member.remaining_points",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
 			name: "商品档案价-维度抽样", base: "branch_price",
 			desc: "进价 / 批发价 / 零售价 / 会员价四列(源列 base_price/price/sale_price/vip_price)。" +
 				"⚠️ 源列名与语义相反,靠 canonical 名钉住语义;会员价实测恒 0.0000。",

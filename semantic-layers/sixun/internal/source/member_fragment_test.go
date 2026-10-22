@@ -94,3 +94,41 @@ func TestMemberFragmentHasNoTop(t *testing.T) {
 	assert.NotContains(t, strings.ToUpper(frag), "TOP ",
 		"live 片段不该带 TOP(分页由 cube 的 limit/offset 负责;带 TOP 会静默截断):\n%s", frag)
 }
+
+// TestMemberFragmentAlwaysProvidesDerivedColumns 锁"四个派生列**永远在**"。
+//
+// ⚠️ 2026-10-23 生产实测:hbposv7 的 t_rm_vip_info **没有** acc_num / dec_num
+// ⇒ 当时的片段在"没配积分列"时**整列省掉**
+// ⇒ 派生表里没有 memb_remaining_points
+// ⇒ 编译期把 canonical 名 remaining_points 重写成 memb_remaining_points
+// ⇒ 源库报「列名 'memb_remaining_points' 无效」⇒ **整个 member 查询 500**
+// (而 ysx 侧一切正常 ⇒ 症状是"一家店能查会员、另一家不能")。
+//
+// ⇒ 结论:**「这一列没值」与「这一列不存在」是两件事** ——
+// 前者照实给 NULL,后者会让整张 model 查不了。
+func TestMemberFragmentAlwaysProvidesDerivedColumns(t *testing.T) {
+	// ① 配了积分列。
+	frag, err := source.MemberFromFragment(memberTables())
+	require.NoError(t, err)
+	for _, want := range []string{
+		"memb_balance", "memb_consume_amount", "memb_consume_count", "memb_remaining_points",
+	} {
+		assert.Contains(t, frag, want, "片段必须提供 %s:\n%s", want, frag)
+	}
+
+	// ② **没配**积分列(hbposv7 的情形):列仍然要在,只是值为 NULL。
+	noPoints := memberTables()
+	noPoints.PointsAccumulatedCol = ""
+	noPoints.PointsUsedCol = ""
+	frag2, err := source.MemberFromFragment(noPoints)
+	require.NoError(t, err)
+	for _, want := range []string{
+		"memb_balance", "memb_consume_amount", "memb_consume_count", "memb_remaining_points",
+	} {
+		assert.Contains(t, frag2, want,
+			"没配积分列时也必须给出 %s(给 NULL,而不是整列省掉 —— 省掉会让整个 member 查询 500):\n%s",
+			want, frag2)
+	}
+	assert.Contains(t, frag2, "NULL AS "+source.MemberRemainingPointsAlias,
+		"没配积分列时 remaining_points 应照实给 NULL:\n%s", frag2)
+}

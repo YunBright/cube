@@ -188,6 +188,18 @@ func memberSelectBody(t MemberTables) (string, error) {
 		}
 		remainingExpr = fmt.Sprintf(",\n  ISNULL(%s, 0) - ISNULL(%s, 0) AS %s",
 			accCol, usedCol, MemberRemainingPointsAlias)
+	} else {
+		// ⚠️ **没配积分列时也必须给出这一列**(值为 NULL)。
+		//
+		// hbposv7 的 t_rm_vip_info 没有 acc_num / dec_num ⇒ 该库的「剩余积分」恒为 NULL
+		// (schema 里写明了这个语义)⇒ 但**列必须在**:
+		// 少这一列 ⇒ 派生表里没有 memb_remaining_points
+		// ⇒ 编译期把 canonical 名 remaining_points 重写成 memb_remaining_points
+		// ⇒ 源库报「列名 'memb_remaining_points' 无效」⇒ **整个 member 查询 500**。
+		//
+		// ⇒ 也就是说:「这一列没值」与「这一列不存在」是两件事,
+		// 前者照实给 NULL,后者会让整张 model 查不了。
+		remainingExpr = fmt.Sprintf(",\n  NULL AS %s", MemberRemainingPointsAlias)
 	}
 	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
 	return fmt.Sprintf(`  v.*,
