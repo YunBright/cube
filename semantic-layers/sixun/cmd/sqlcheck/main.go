@@ -85,6 +85,11 @@ type config struct {
 		//    已退役:前者实测 0 行、后者表根本不存在 ⇒ 两个库都取不到数据。
 		//    live model 的源表名一律按 `table_<model>` 命名(见 loadSchemas 的 srcTables)。
 		TableSaleDetail    string `yaml:"table_sale_detail"`
+		// SaleDetailReturnQtyCol 是"本行被退掉的数量"列名(ysx = ret_qnty;hbposv7 无此列)。
+		//
+		// ⚠️ family 私有事实 ⇒ 走 config 不走 mapping(mapping 的 target 集合
+		//    两个 family 必须逐字一致)。
+		SaleDetailReturnQtyCol string `yaml:"sale_detail_return_qty_col"`
 		TablePayflow       string `yaml:"table_payflow"`
 		TablePromotionPlan string `yaml:"table_promotion_plan"`
 		TableSupplierItem  string `yaml:"table_supplier_item"`
@@ -731,6 +736,29 @@ func buildCases() []checkCase {
 		// 这一组是**后台四个新域**的数据底座(商品销售流水 / 收银流水 /
 		// 促销方案 / 商品档案供货信息与价格),每条都打真实源库。
 		{
+			// 净额口径的验证:逐笔流水的退货**不是独立行**,而是同一行里的
+			// "被退掉的数量"列(ysx 的 ret_qnty)⇒ 净额由 family 私有的片段算。
+			// ⚠️ 这条用例在**真源库**上跑 ⇒ 它验的就是生产跑的那段 SQL。
+			name: "销售流水-净额口径(卖出−退回)", base: "sale_detail",
+			desc: "net_qty / net_amount_yuan 是**净额**(卖出 − 退回)。" +
+				"⚠️ 源库实测:逐笔流水里没有'退货行'(负值行 0 行)," +
+				"ysx 用同一行的 ret_qnty 表示'这一单里被退掉的数量'(1939 行非 0)," +
+				"hbposv7 没有该列 ⇒ 净额 = 原销售金额。",
+			query: &cubequery.Query{
+				Measures: []string{
+					"sale_detail.count",
+					"sale_detail.total_qty",
+					"sale_detail.total_amount_yuan",
+					"sale_detail.net_amount_yuan",
+				},
+				Dimensions: []string{
+					"sale_detail.order_no", "sale_detail.qty", "sale_detail.net_qty",
+					"sale_detail.sale_price",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
 			name: "销售流水-维度抽样", base: "sale_detail",
 			desc: "单号 / 货号 / 金额 / 销售时间四列都要过 mapping 翻成源列名。" +
 				"⚠️ 源表实测 ysx 3327514 行 / hbposv7 1743882 行。",
@@ -916,7 +944,8 @@ func loadSchemas(mappingDir string, cfg *config) (
 		//
 		// ⚠️ 键名必须与 model 名一致:少一条就是「该 model 静默不可查」
 		// (本工具只打一行 WARN 然后跳过,而最后照样打印 "N passed")。
-		"sale_detail":    cfg.Source.TableSaleDetail,
+		//
+		// ⚠️ sale_detail 是**片段**(净额要扣掉"本行被退掉的数量")⇒ 见下面。
 		"payflow":        cfg.Source.TablePayflow,
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,
@@ -935,6 +964,17 @@ func loadSchemas(mappingDir string, cfg *config) (
 	if t := strings.TrimSpace(cfg.Source.TableSaleWay); t != "" {
 		srcTables["sale_way"] = "(SELECT * FROM " + t + " WHERE type_no = 'SW')"
 	}
+	// 逐笔销售流水:退货不是独立行,而是同一行里的 ret_qnty(ysx 独有列)
+	// ⇒ 净额只能由 family 私有的片段算(与 app 用的是**同一个**函数 ⇒
+	//    这里验的口径就是生产跑的口径)。
+	saleDetailFragment, err := source.SaleDetailFragment(source.SaleDetailTables{
+		Table:        cfg.Source.TableSaleDetail,
+		ReturnQtyCol: cfg.Source.SaleDetailReturnQtyCol,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("sale_detail live 片段: %w", err)
+	}
+	srcTables["sale_detail"] = saleDetailFragment
 	// 会员档案:卡内余额 / 累计消费 / 消费次数是"主表 JOIN 三张流水表"算出来的
 	// ⇒ live 的源是**片段**(见 internal/source/member_sql.go)。
 	memberFragment, err := source.MemberFromFragment(source.MemberTables{

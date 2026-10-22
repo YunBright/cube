@@ -1,16 +1,22 @@
-# sale_detail model - 思迅家族销售明细(含销售退货)
+# sale_detail model - 思迅家族销售明细(逐笔流水)
 #
-# 源表(2026-10-22 真库实测,两个 family 同名同列):
+# 源表(2026-10-22 真库实测,两个 family 同名):
 #   ysx(hbposv10)      t_rm_saleflow 3,327,514 行
 #   hbposv7(hbposepro) t_rm_saleflow 1,743,882 行
 #
 # 关键差异处理:
-#   - 这张表**没有** order_status 列(旧的 t_mp_saleflow 才有),
-#     所以单据类型一律按**数量正负**判定:数量 < 0 ⇒ 退货(R),否则销售(S)。
 #   - 列名一律用 **canonical 名**(qty / sale_price / sale_amount …),
 #     由 mapping 重写成源列名(sale_qnty / sale_price / sale_money …)。
 #     ⚠️ 写源列名会在"两个 family 源列名恰好相同"时蒙混过关,
 #     不一致时才炸 —— 而症状是查询那一刻的 column not found。
+#   - **退货不是独立行**:实测两个库的 sale_qnty / sale_money / sale_price
+#     负值行都是 0 行 ⇒ 逐笔流水里**没有"退货行"**。
+#     ysx 用**同一行里的 ret_qnty**(1939 行非 0,恒等于同行 sale_qnty)表示
+#     "这一单里被退掉的数量";hbposv7 没有这一列。
+#     ⇒ "单据类型 S/R"在共享 schema 里**给不出来**(没有可判的列),
+#     也不要靠"负数 = 退货"糊弄(那样恒等于"全是销售")。
+#     ⇒ **净额由 family 私有的 live 片段算**(net_qty / net_amount_yuan,
+#       见 internal/source/sale_detail_sql.go)。
 name: sale_detail
 sql_table: sale_detail
 # 2026-10-23:改成 live(全仓去 DuckDB)。
@@ -71,15 +77,6 @@ dimensions:
     type: time
     title: 销售时间
 
-  - name: order_status
-    sql: >
-      CASE WHEN qty < 0 THEN 'R' ELSE 'S' END
-    type: string
-    title: 单据类型
-    enum_values:
-      - { value: "S",  label: 销售 }
-      - { value: "R",  label: 退货 }
-
   # ---- 金额 / 数量(源列名见 mapping)----
   #
   # ⚠️ 这几个维度是**销售流水查询的必备项**(销售报表、POS 回放都要):
@@ -90,7 +87,33 @@ dimensions:
     type: number
     title: 数量
     description: |
-      源列 sale_qnty。**退货为负**(销售报表靠它判正负,见 order_status 维度)。
+      源列 sale_qnty。
+
+      ⚠️ **实测(2026-10-23,两个生产源库):这一列从不为负**
+      (sale_qnty / sale_money / sale_price 的负值行都是 0 行)
+      ⇒ **不能用"负数 = 退货"来判退货**(那样写出来的口径恒等于"全是销售")。
+
+      逐笔流水的退货**不是独立行**,而是**同一行里的另一列**
+      (ysx 的 ret_qnty:实测 1939 行非 0,且恒等于同行的 sale_qnty
+      ⇒ 卖 2.545 件、其中 2.545 件被退)。
+      ⚠️ 而 ret_qnty 是 **ysx 独有**的列(hbposv7 没有)⇒ 它不能进共享 schema
+      ⇒ **净额由 family 私有的片段算**(见 net_qty 维度与 net_amount_yuan 度量)。
+
+  # net_qty 是**净额数量**(卖出 − 退回)。
+  #
+  # ⚠️ 它不在任何 mapping 里 ⇒ 编译器不会重写它 ⇒ 由 family 私有的
+  #    live 片段直接产出(见 internal/source/sale_detail_sql.go)。
+  - name: net_qty
+    sql: net_qty
+    type: number
+    title: 净额数量
+    description: |
+      卖出数量 − 退回数量。
+
+      - ysx:源列 sale_qnty − ISNULL(ret_qnty, 0)(ret_qnty 是 ysx 独有列)
+      - hbposv7:源列 sale_qnty(该库逐笔流水里**没有退货行** ⇒ 不扣)
+
+      ⇒ 两个 family 的**语义一致**(都是"这张单实际留下多少件")。
 
   - name: sale_price
     sql: sale_price
@@ -186,22 +209,37 @@ measures:
   - name: total_qty
     sql: "SUM(qty)"
     type: number
-    title: 总数量(含退货为负)
+    title: 总数量(原销售口径)
     format: "0.00"
+    description: |
+      ⚠️ 这是**原销售**数量(sale_qnty),**没有扣掉退货** ——
+      退货在同一行的 ret_qnty 里(ysx 独有列)。
+      ⇒ 要"实际留下多少件"用 **net_qty**。
 
   - name: total_amount_yuan
     sql: "SUM(sale_price * qty)"
     type: number
-    title: 总金额(元)
+    title: 总金额(元,原销售口径)
     format: "0.00"
+    description: |
+      ⚠️ 同上:这是**原销售**金额,**没有扣掉退货**。
+      ⇒ 要净额用 **net_amount_yuan**。
 
-  # ⚠️ 这里**不能**引用 order_status:hbposv7 配的 t_rm_order_saleflow 没有这一列,
-  #   引用它会让本 measure 在 hbposv7 上查询即报 column not found
-  #   (空表也会报错 —— SQL 解析阶段就失败,与行数无关)。
-  #   改用数量正负判断,与上面 order_status 维度的兜底分支保持同一口径:
-  #   ysx 的 t_mp_saleflow.order_status 取值 S/R,退货行数量为负。
+  # net_amount_yuan = 净额(原销售 − 退货)。
+  #
+  # ⚠️ 它对**行内金额**求和,而"行内净额"由 family 私有的 live 片段算
+  #    (见 internal/source/sale_detail_sql.go):
+  #    - ysx     : (sale_qnty − ISNULL(ret_qnty,0)) × sale_price
+  #    - hbposv7 : sale_qnty × sale_price(该库逐笔流水里没有退货行)
+  #
+  # ⚠️ 为什么不能直接写算式:`ret_qnty` 是 **ysx 独有**的列,
+  #    写进共享 schema ⇒ hbposv7 那边直接 column not found
+  #    (空表也会报错 —— SQL 解析阶段就失败,与行数无关)。
+  #
+  # ⚠️ 旧写法 `SUM(CASE WHEN qty < 0 THEN … END)` 是**假的**:
+  #    实测 qty 从不为负 ⇒ 它恒等于 total_amount_yuan ⇒ "净额"骗人。
   - name: net_amount_yuan
-    sql: "SUM(CASE WHEN qty < 0 THEN -sale_price * qty ELSE sale_price * qty END)"
+    sql: "SUM(net_amount)"
     type: number
     title: 净额(销售-退货)
     format: "0.00"

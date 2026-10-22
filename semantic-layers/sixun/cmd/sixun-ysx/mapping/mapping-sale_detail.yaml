@@ -116,3 +116,16 @@ mappings:
   - source: uptime
     target: uptime
     type: datetime
+  # ---- 派生列(由 live 片段算,不是源库列)----
+  #
+  # ⚠️ 逐笔流水的**退货不是独立行**,而是同一行里的 ret_qnty(ysx 独有)
+  # ⇒ 净额(卖出 − 退回)必须由 family 私有的片段算
+  # (见 internal/source/sale_detail_sql.go)。
+  # ⇒ 片段产出的列用 memb_ 前缀,这里把它们钉成 canonical 名 ——
+  #    这样"两个 family 的 target 集合逐字一致"这条规矩仍然成立。
+  - source: memb_net_qty
+    target: net_qty
+    type: decimal
+  - source: memb_net_amount
+    target: net_amount
+    type: decimal

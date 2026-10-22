@@ -74,7 +74,14 @@ type appConfig struct {
 		//   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐
 		//   (键名与 model 名不一致 = 少接一条,该 model 静默不可查)。
 		TableSaleDetail string `yaml:"table_sale_detail"`
-		TableStock      string `yaml:"table_stock"`
+		// SaleDetailReturnQtyCol 是"本行被退掉的数量"列名(ysx = ret_qnty)。
+		//
+		// ⚠️ **family 私有事实**,所以走 config 而不是 mapping:
+		// mapping 的 target 集合两个 family 必须逐字一致(mapping parity 测试),
+		// 而 ret_qnty 只有 ysx 有(hbposv7 的 t_rm_saleflow 没这一列,实测 2026-10-23)。
+		// ⇒ 留空 = 该库没有退货列 ⇒ 片段按"不扣退货"生成。
+		SaleDetailReturnQtyCol string `yaml:"sale_detail_return_qty_col"`
+		TableStock            string `yaml:"table_stock"`
 		// ---- 2026-10-22 新增的 live model 源表 ----
 		// 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
 		// 表名是 family 私有事实,所以只在这里配,不进共享的 sixun-models/
@@ -206,6 +213,16 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 	if t := strings.TrimSpace(cfg.Source.TableSaleWay); t != "" {
 		saleWayFragment = "(SELECT * FROM " + t + " WHERE type_no = 'SW')"
 	}
+	// sale_detail:逐笔流水的**退货不是独立行**,而是同一行里的 ret_qnty
+	// (ysx 独有列,实测 1939 行非 0 且恒等于同行 sale_qnty)⇒
+	// "净额"只能由 family 私有的片段算(见 internal/source/sale_detail_sql.go)。
+	saleDetailFragment, err := source.SaleDetailFragment(source.SaleDetailTables{
+		Table:         cfg.Source.TableSaleDetail,
+		ReturnQtyCol:  cfg.Source.SaleDetailReturnQtyCol,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sale_detail live 片段: %w", err)
+	}
 	return map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLine,
@@ -234,7 +251,10 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		//
 		// ⚠️ 键名必须与 model 名一致:少一条就是「该 model 静默不可查」
 		// (main.go 只打一行 Info 日志然后 continue,healthz 照样全绿)。
-		"sale_detail":    cfg.Source.TableSaleDetail,
+		//
+		// ⚠️ sale_detail 是**片段**不是表名:退货不是独立行,
+		// 而是同一行里的 ret_qnty(ysx 独有列)⇒ 净额只能由片段算。
+		"sale_detail":    saleDetailFragment,
 		"payflow":        cfg.Source.TablePayflow,
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,

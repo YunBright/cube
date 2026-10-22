@@ -87,7 +87,17 @@ type appConfig struct {
 		//   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐
 		//   (键名与 model 名不一致 = 少接一条,该 model 静默不可查)。
 		TableSaleDetail string `yaml:"table_sale_detail"`
-		TableStock      string `yaml:"table_stock"`
+		// SaleDetailReturnQtyCol 是"本行被退掉的数量"列名。
+		//
+		// ⚠️ **hbposv7 故意留空**:实测它的 t_rm_saleflow **没有**这一列
+		// (2026-10-23 真库:ret_qnty 无效),而该库的逐笔流水里
+		// sale_qnty / sale_money / sale_price 的负值行都是 0 行
+		// ⇒ 根本没有退货行 ⇒ 片段按"不扣退货"生成(净额 = 原销售)。
+		//
+		// ⚠️ 这是 **family 私有事实**,所以走 config 而不是 mapping
+		// (mapping 的 target 集合两个 family 必须逐字一致)。
+		SaleDetailReturnQtyCol string `yaml:"sale_detail_return_qty_col"`
+		TableStock            string `yaml:"table_stock"`
 		// ---- 2026-10-22 新增的 live model 源表 ----
 		// 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
 		// 表名是 family 私有事实,所以只在这里配,不进共享的 sixun-models/
@@ -554,6 +564,16 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 	if t := strings.TrimSpace(cfg.Source.TableSaleWay); t != "" {
 		saleWayFragment = "(SELECT * FROM " + t + " WHERE type_no = 'SW')"
 	}
+	// sale_detail:逐笔流水的**退货不是独立行**,而是同一行里的 ret_qnty
+	// (ysx 独有列)⇒ "净额"只能由 family 私有的片段算。
+	// 本库没有该列 ⇒ 片段按"不扣退货"生成(见 internal/source/sale_detail_sql.go)。
+	saleDetailFragment, err := source.SaleDetailFragment(source.SaleDetailTables{
+		Table:        cfg.Source.TableSaleDetail,
+		ReturnQtyCol: cfg.Source.SaleDetailReturnQtyCol,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sale_detail live 片段: %w", err)
+	}
 	return map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLine,
@@ -582,7 +602,10 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		//
 		// ⚠️ 键名必须与 model 名一致:少一条就是「该 model 静默不可查」
 		// (main.go 只打一行 Info 日志然后 continue,healthz 照样全绿)。
-		"sale_detail":    cfg.Source.TableSaleDetail,
+		//
+		// ⚠️ sale_detail 是**片段**不是表名:净额要把"本行被退掉的数量"扣掉,
+		// 而那一列是 family 私有事实(本库没有 ⇒ 不扣)。
+		"sale_detail":    saleDetailFragment,
 		"payflow":        cfg.Source.TablePayflow,
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,
