@@ -40,6 +40,23 @@ source:
   #    points_accumulated / points_used 恒为 NULL(源库事实,照实映射)。
   table_member:      t_rm_vip_info
   table_member_type: t_rm_vip_type
+  # 供应商/客户类别字典(t_bd_cust_type)。supplier.cust_clsno 指向它。
+  table_cust_type: t_bd_cust_type
+  # 「销售方式」字典(t_bd_base_code)。supplier.supply_way(源列 sale_way)指向它。
+  #    ⚠️ 这是**通用**基础代码字典(30+ 行,code_id 跨 type_no 重复)⇒ 取数时只取
+  #       type_no='SW' 的子集(过滤写在 main.go 的 liveTables 里)。
+  table_sale_way:  t_bd_base_code
+  # ---- 会员 live 片段(= 主表 JOIN 三张流水表)----
+  # 卡内余额 = Σ充值 − Σ储值支付;累计消费在 t_rm_vip_consume。
+  # ⚠️ 少配任何一张 ⇒ 片段构造直接报错 ⇒ 启动失败(显式失败,好过"余额恒为 0")。
+  table_member_consume:    t_rm_vip_consume
+  table_member_paylist:    t_rm_card_paylist
+  table_member_savingplus: t_rm_saving_plus_record
+  # paylist.card_type 里表示"储值支付"的那个取值(实测两个库都是 '2')。
+  member_stored_pay_type: "2"
+  # 积分列名(用来在源库侧派生"剩余积分");hbposv7 没有这两列 ⇒ 留空。
+  member_points_accumulated_col: acc_num
+  member_points_used_col: dec_num
 
   table_settlement:          t_fm_recpay_gx_master
   table_settlement_line:     t_fm_recpay_detail
@@ -84,57 +101,5 @@ source:
   #    返回行数由查询里的 limit 控制(上限见 pkg/cubequery 的 DefaultLimit)。
   #    上面的 table_* 是它们**必需的**源表名,漏配则该 model 不可查询。
 
-storage:
-  duckdb_path: ./data/sixun-hbposv7.duckdb
-
-# 刷新策略:增量为主 + 夜间全量校准
-#
-# 实测依据(2026-10-10):
-#   t_bd_item_info  44316 行,最近 7 天改动 49 行。
-#   改造前是"每 30 分钟全量重拉 44316 行",为每天约 10 行的变化付全表扫描的代价。
-refresh:
-  # model 名 → **源库侧**的增量时间列名。
-  # 未列出的 model 自动走全量(category 无时间列;sale_detail 指向的表实测 0 行)。
-  incremental:
-    product:  modify_date
-    supplier: modify_date
-    # 会员卡档案(t_rm_vip_info):实测有 modify_date。
-    # member_type 故意不配(字典表没有时间列,走全量)。
-    member:   modify_date
-
-  # ==================== 增量回退列 ====================
-  # **product 故意不配 incremental_fallback** —— 配了也没有任何效果。
-  #
-  # 2026-10-10 真库实测:
-  #   modify_date 为 NULL 的 12607 行商品,**build_date 也全部为 NULL**
-  #   (查 `modify_date IS NULL AND build_date IS NOT NULL` 返回 0 行)。
-  #   所以 `COALESCE(modify_date, build_date)` 与只用 modify_date 结果完全一样:
-  #     30 天窗口 209 → 209 行,一行不多。
-  #   本库 61% 的商品(27151 行)build_date 就是空的。
-  #
-  # 不为零收益的配置增加复杂度 —— ysx 那边配了,那边确实多覆盖 34%。
-  #
-  # ⚠️ 无论配不配,**夜间全量校准都不可省**:那 12607 行(占全部商品 28%)
-  #    两个时间列都是 NULL,任何基于时间列的增量都永远拉不到它们。
-  #
-  # ⚠️ member 配了(理由与 product 不同):回退列是 **oper_date** ——
-  #   源表 t_rm_vip_info 没有 build_date 列。
-  #   实测 2026-10-21:modify_date 有 2573/2642 行是 NULL,oper_date 0 行为 NULL
-  #   ⇒ COALESCE(modify_date, oper_date) 覆盖全部行。
-  incremental_fallback:
-    member: oper_date
-
-  # 夜间全量校准,6 字段 cron(秒 分 时 日 月 周)= 每天 03:00:00。
-  # ⚠️ 必须写满 6 个字段:2026-10-10 真机实测,写 5 字段("0 3 * * *")
-  #    会被 Dapr 直接拒绝(HTTP 500: expected exactly 6 fields, found 5),
-  #    而主 job 不受影响、mode 照样是 dapr-job —— 于是"夜间校准没了"
-  #    会被 healthz 的整体健康掩盖,增量漏的数据永远没有兜底。
-  full_schedule: "0 0 3 * * *"
-
-gateway:
-  app_id: cube-gateway
-  # 注册地址(dev:sidecar 自动解析 app_id → host:port)
-  register_method: /register
-
-dapr:
+# ⚠️ 2026-10-23 起**没有 storage.duckdb_path 了** —— 不再有本地副本。
   secret_store: cube-secrets

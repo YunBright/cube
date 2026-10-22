@@ -10,10 +10,11 @@
 每个版本(云商x / 7pro)→ 家族内一个 binary,
 每个 store/instance(门店 / 租户)→ 一个 dapr cube app 进程,由 `CUBE_APP_ID` 区分
 (`sixun-ysx-00` / `sixun-ysx-baiyuan1` / `sixun-hbposv7-jiale`)。
-对外暴露 Cube.js 兼容 API(`/v1/source/{source}/load` + `/v1/sources`),内部用 DuckDB 做预聚合 + L1/L2 缓存。
+对外暴露 Cube.js 兼容 API(`/v1/source/{source}/load` + `/v1/sources`),
+内部**不做任何数据缓存** —— 查询时把 schema 编译成 T-SQL 直打源库(全部 model 都是 `storage: live`,见 §4.1)。
 所有非 2xx 响应必须返回统一错误信封(`pkg/apierror`)。
 
-参考 cube-core 的 **schema / measure / dimension / pre-aggregation** 设计,**不照搬 driver 抽象**——driver 由 Dapr app 隔离。
+参考 cube-core 的 **schema / measure / dimension** 设计,**不照搬 driver 抽象**——driver 由 Dapr app 隔离。
 
 ## 2. 仓库结构(Go workspace 多 module)
 
@@ -69,15 +70,10 @@ cube/
 | 枚举值归一化 | **不做**,留在 schema.yaml meta + BI 层翻译 | ❌ 在 mapping.yaml 写 enum_map |
 | segment(预定义过滤) | schema 里写一段静态 SQL 谓词,调用方只传名字(`"segments":["purchase_return"]`),编译进 WHERE。**SQL 里只能用 canonical 名**(mapping 的 target),由 mapping 在查询时重写成该 family 的源列名 | ❌ 写源库列名(两个 family 源列名一致时恰好能跑,不一致时才炸)、❌ 含 `?`(segment 不带参数,占位符变成无人绑定的位置)、❌ 含子查询(列名重写是标识符盲替换,会误伤)、❌ 跨 model 引用别的 model 的 segment(编译期报 `segment not found`) |
 | 采购退货单 | **不是独立 model**:pm 模块实测只有 `t_pm_sheet_master` / `t_pm_sheet_detail` / `t_pm_process_yh` 三张表,RO 就是 master 里的行。用 `purchase_sheet` 的 segment `purchase_return` / `purchase_receipt`。⚠️ **两侧金额符号相反**:采购侧 RO 是**正数**(ysx +175.2 万 / hbposv7 +130.5 万),结算侧 RO 是**负数**(ysx -171.7 万 / hbposv7 -174.4 万) | ❌ 为它单开一个 model(同一张表的维度定义要维护两份,必然分叉),❌ 用 `total_amount_yuan` 不带 segment 直接聚合(退货被再加一遍,实测多算 350 万/261 万),❌ 拿采购侧 RO 与结算侧 RO 直接比(差一个符号、约 346 万) —— 必须用 `total_net_amount_yuan`(RO 取负) |
-| 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.Build`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
-| 拉取行数上限 | **`DefaultRowLimit = 50000`,必须高于所有维表实测行数**;按角色在 `config.yaml` 的 `source.row_limits` 覆盖 | ❌ 设成小于实测行数的值(曾硬编码 `TOP 10000` → ysx 丢 63% 商品、hbposv7 丢 77%、**库存表丢 57%**,零报错) |
-| 刷新模式 | **方案 D:增量为主 + 夜间 3 点全量校准**。两个 dapr job:主 `cube-refresh`(`@every 30m`,增量)、校准 `cube-refresh-full`(`0 0 3 * * *`,全量)。实测 30 天变更量:ysx product 410/27304(1.5%)、hbposv7 209/44316(0.5%) | ❌ 每 30 分钟全量重拉 2.7~4.4 万行、❌ 把校准 job 失败与主 job 混成一个 mode(丢掉一层保险换另一层缺失) |
-| 增量水位 | **取源库时间 `GETDATE()`**(`SourceNow` 在 `FetchSince` **之前**读),**全程字符串**(ODBC style 121 `2006-01-02 15:04:05.000`),比较用 `>=` 且 `CAST(@p1 AS datetime)`;水位**只在 Build 成功后推进**,全量成功后也推进 | ❌ 用本地时钟取水位、❌ 用 `time.Time` 往返(无时区 datetime ±8h 偏移)、❌ 用 `>`(边界变更永久丢失)、❌ 占位符写 `?`(go-mssqldb **原样**发给 SQL Server → 报 102 语法错误)、❌ 先拉后读源库时间(把拉取耗时算进已处理区间) |
-| 增量回退列 | **`COALESCE(modify_date, build_date)`**,配在 `config.yaml` 的 `refresh.incremental_fallback`(源库列名)。语义:`modify_date IS NULL` = "**建档后从未被修改过**",那 `build_date` 就是它最后一次被写入的时间。实测 ysx 按 `build_date >= DATEADD(day,-7,GETDATE())` 筛出的 45 个近 7 天新建商品里 **36 个(80%)modify_date 是 NULL**,30 天窗口 410→549(**+34%**),多覆盖的正是最该拉到的新增商品。实测 `modify_date < build_date` 的行数为 0(两库皆然),不引入时间倒流;代价是让两列索引都失效,约 2~3 ms/次 | ❌ 把它当成夜间全量的替代品 —— hbposv7 有 **12607 行商品两个时间列同时为 NULL**(占 28%),任何基于时间列的增量都永远拉不到它们,全量校准仍是唯一兜底;❌ 给 hbposv7 也配上(实测该库 12607 行 modify_date 为 NULL 的商品 build_date **也全部为 NULL**,COALESCE 30 天窗口 209→209 零收益);❌ `COALESCE` 参数写反(写反后 SQL 照样能跑、结果看着正常,只是语义反了);❌ 只校验主列不校验回退列(回退列同样是拼进 SQL 的注入入口) |
-| 增量空结果 vs 全量空结果 | 语义**刻意相反**:增量拉回 0 行 → **不动表**;全量拉回 0 行 → **清表** | ❌ 统一成一种(增量清表 = 早上所有商品查不到,零报错) |
-| cron 表达式 | **Dapr job 的 cron 严格 6 字段(秒 分 时 日 月 周)**。2026-10-10 真机实测:`"0 3 * * *"` → HTTP 500 `expected exactly 6 fields, found 5`;`"0 0 3 * * *"` → 204 | ❌ 写 5 字段(**启动不失败、主 job 正常、mode 照样 dapr-job,只有夜间校准静默消失**,增量漏的数据永远没兜底)。`refreshschedule.validateSchedule` 在登记前拦一道 |
-| 增量开关配置位置 | 增量列在 **`config.yaml` 的 `refresh.incremental`**(源库列名),主键在 **schema.yaml 的 `primary_key`**(canonical 名)。两者职责分离,且两个 family 的 config 独立 | ❌ 写进 mapping.yaml(那只是字段映射)、❌ 两个 family 漏改一个 |
-| 启动首次加载 | **启动必须走全量**(三个理由:首次无水位、水位表可能与 `_raw` 不同步导致超前=永久跳过、部署后应立刻有完整数据);无水位时增量会**自动 bootstrap 全量**并写回水位 | ❌ 启动直接走增量(超前水位 = 永久丢数据) |
+| 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.BuildTSQLJoin`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
+| 拉取行数上限 | 实时查询的行数由**调用方的 limit** 决定(cube-router 每页 5000);`pkg/cubequery.DefaultLimit = 1000` 是没给 limit 时的兜底 | ❌ 在 SQL 里写死 `TOP 10000` 之类的上限(历史上丢过 63% 商品,零报错) |
+| 增量刷新 / 水位 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准"、没有 `refresh:` 配置段。**下游**(supertrade 侧)的增量水位是**另一套东西**(它自己的编排服务管),与 cube 无关 | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加 DuckDB 水位表、❌ 再在 config 里加 `refresh:` 段 |
+| 增量过滤维度 | 要做"只导变过的行",用 model 上**显式声明**的"最后变动时间"维度(如 `product.updated_at` = `COALESCE(modify_date, created_at)`,`type: time`)⇒ 下游的编排方加 `gt` 过滤 | ❌ 用 `type: string` 声明时间列(live 路径会退化成文本比较 ⇒ 字典序 ≠ 时间序 ⇒ 过滤静默出错)、❌ 直接用 `modify_date`(新建商品 80% 是 NULL ⇒ 新商品永远同步不到) |
 | char 补空格 | 在**查询层**统一 `RTRIM`(SELECT 与 filter 两侧都包,GROUP BY 用裸列),已固化在 `pkg/cubequery` | ❌ 加载层 trim、❌ 调用方 LIKE/trim 兜底 |
 | 存储分层 | **全部 model 一律 `storage: live`**(2026-10-23 起):查询时把 schema 编译成 T-SQL 直打源库,**不落任何本地副本**。live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 新增 `storage: duck` 的 model、❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
 | 增量刷新 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准" | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加 DuckDB 水位表 |
@@ -85,7 +81,7 @@ cube/
 | join 解析 | **只走 schema 显式声明的 joins**,BFS 找最短路径;链深度不限;列名必须 model 别名限定(`settlement_line.id`);`live → duck` 不可 join,编译期拒绝 | ❌ JIT 自动关联、❌ 把 model 名当物理表名(2026-10-09 真库验证抓到:JOIN 用了 model 名当表名,而单测的假 registry 恰好同名,所以 40+ 单测全绿) |
 | 扇出防护 | join 链上存在 `one_to_many` 时,**被放大一侧的 measure → 400**,错误信息指出该用多的那一侧;**不做链式传播**(曾误加,把唯一正确的用法一起拦了) | ❌ 静默返回翻倍的数字 |
 | 旧版 SQL Server 兼容 | **能力探测而非配置**:`source.DetectLegacyTSQL` 读 `SERVERPROPERTY('ProductMajorVersion')`,< 12 走 2008 方言(`DATEADD(month, DATEDIFF(month,0,d),0)` + `ROW_NUMBER()`),探测失败保守返 true | ❌ 硬编码 `DATEFROMPARTS` / `OFFSET-FETCH`(两个生产库都是 **2008 R2**,直接语法错)、❌ 用配置开关描述能力(配置会骗人) |
-| 只读约束 | `QueryLive` 前置 `source.AssertReadOnly`;live model 的 `preagg.Build` 是显式守卫,永远返错 | ❌ 给 live model 接 fetchers(会静默同步百万行) |
+| 只读约束 | `QueryLive` 前置 `source.AssertReadOnly`(只发 SELECT;连接池=1;时间窗有界) | ❌ 给源库发任何写语句、❌ 一次导出把百万行拉进内存 |
 
 ## 4.1 ⛔ 禁止的架构:不要给 cube 加数据缓存 / 原始数据同步
 
@@ -176,7 +172,7 @@ cube/
 | `add-new-model` | 加新 model(如 customer) | `docs/semantic-layer-design.md` |
 | `write-field-mapping` | 写 mapping.yaml | **`docs/data-source-mapping-playbook.md`** |
 | `design-schema` | 写 schema.yaml | `docs/semantic-layer-design.md` |
-| `write-preaggregation` | 写 DuckDB 预聚合 | `docs/semantic-layer-design.md` |
+| `write-preaggregation` | ~~写 DuckDB 预聚合~~ | **已作废**(2026-10-23 去 DuckDB)。新的 model 一律 `storage: live`,见 §4.1 |
 | `debug-query` | 排查 cube query 慢/错 | `docs/dapr-app-contract.md` |
 
 ## 7. 完成前自检
@@ -202,18 +198,15 @@ cube/
 - [ ] 共享 schema(`sixun-models/`)的改动 → **所有 family 的 mapping 都同步改了**
 - [ ] 新增 `storage: live` 的 model → **每个部署实例的 `config.yaml` 都补了 `table_<model>`**,
       并已重启验证(缺表名会在启动期报错,不是运行期静默空结果)
-- [ ] 碰过增量刷新(`refresh.incremental` / 水位 / 校准 job)→ **`go run ./cmd/incrementalcheck -family <f>`
-      在真机上跑过**(本机 libduckdb 加载失败,DuckDB 集成测试全 SKIP —— **skip 不是通过**),
-      且 **healthz 的 `jobs` 段里 `cube-refresh` 与 `cube-refresh-full` 都是 `registered: true`**
-      (校准 job 挂掉不会让 mode 变 ticker,只会在这一段里体现)
-- [ ] 碰过 `refresh.full_schedule` → **写满 6 字段**(秒 分 时 日 月 周),
-      `refreshschedule_test.go` 的 `TestDefaultFullSchedule*` 与
-      `cmd/sixun-*/config_test.go` 的 `TestDeployedFullScheduleIsSixFieldCron` 都绿
-- [ ] 碰过增量**回退列**(`refresh.incremental_fallback` / `COALESCE`)→ 写进注释的实测
-      数字都能在源库上复现(`modify_date IS NULL` 的行数、`both-NULL` 的行数、
-      `modify_date < build_date` 的行数),且 `incremental_test.go` 的
-      `TestIncrementalSelectWithFallbackUsesCoalesce` 与
-      `cmd/sixun-ysx/config_test.go` 的 `TestDeployedIncrementalFallbackCoversNewItems` 都绿
+- [ ] 碰过增量刷新(`refresh.incremental` / 水位 / 校准 job)→ **已删除**(2026-10-23 去 DuckDB)。
+      仓库里不该再有 `pkg/duckdb`、`internal/dataloader`、`internal/refreshschedule`、
+      `sixun-models/*/preagg.go`、`cmd/incrementalcheck`,也不该再有 `config.yaml` 的 `refresh:` 段
+- [ ] 碰过**增量过滤维度**(model 上的"最后变动时间")→ 它必须 `type: time`
+      (live 路径按 DATETIME 比较;声明成 string 会退化成文本比较 ⇒ 过滤静默出错),
+      且**必须用 COALESCE 兜住 NULL**(新建商品 80% 的 modify_date 是 NULL)
+- [ ] ~~碰过 `refresh.full_schedule`~~ → **已作废**(2026-10-23 去 DuckDB,不再有校准 job)
+- [ ] 碰过**增量过滤维度**的 `COALESCE` 兜底 → 写进注释的实测数字能在源库上复现
+      (`modify_date IS NULL` 的行数、`both-NULL` 的行数、`modify_date < build_date` 的行数)
 - [ ] 改了 segment / measure 的 SQL → **`go run ./cmd/sqlcheck -family ysx|hbposv7 -only segment`
       在真机上跑过**(单测只比对字符串,不执行;2008 R2 方言错、列名没被 rewrite
       这类 bug 只有真库抓得到),且注释里的金额符号/正负数字能在源库上复现

@@ -145,7 +145,10 @@ func MemberFromFragment(t MemberTables) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "(" + body + ")", nil
+	// ⚠️ **必须带 SELECT**:memberSelectBody 给的是"SELECT 列表 + FROM"这一段,
+	// 拼进片段时要自己补上 SELECT —— 漏了会变成 `FROM ( v.*, … )`,
+	// 报 "mssql: '*' 附近有语法错误" —— 看起来像源库坏了,其实只是少一个词。
+	return "(SELECT\n" + body + ")", nil
 }
 
 // memberSelectBody 构造 member 取数 SQL 的 SELECT + FROM 部分(不含 TOP)。
