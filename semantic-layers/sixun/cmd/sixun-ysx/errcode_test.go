@@ -53,12 +53,15 @@ func postQuery(t *testing.T, model string, body string) (int, errEnvelope) {
 	}
 
 	schemas := map[string]*schemaMeta{
-		model: {Schema: sch},
+		// ⚠️ 现在**全部 model 都是 live** ⇒ 必须给 SourceTable,
+		// 否则编译期就会报 "live model requires a source table name",
+		// 错误分类就变成"model 问题"而不是"dimension 写错了"。
+		model: {Schema: sch, Live: true, SourceTable: "t_bd_item_info"},
 	}
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	engine.POST("/query", queryHandler(nil, nil, schemas, []string{model}, "sixun-ysx-test", log.New("test")))
+	engine.POST("/query", queryHandler(nil, schemas, []string{model}, "sixun-ysx-test", log.New("test")))
 
 	srv := httptest.NewServer(engine)
 	defer srv.Close()

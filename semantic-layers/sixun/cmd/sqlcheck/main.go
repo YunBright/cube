@@ -89,6 +89,20 @@ type config struct {
 		TablePromotionPlan string `yaml:"table_promotion_plan"`
 		TableSupplierItem  string `yaml:"table_supplier_item"`
 		TableBranchPrice   string `yaml:"table_branch_price"`
+		// ---- 2026-10-23:最后六个 live model(全部 model 都是 live 了)----
+		// 供应商 / 分类 / 客户类别 / 会员类别 / 销售方式 / 会员档案。
+		TableCustType   string `yaml:"table_cust_type"`
+		TableSaleWay    string `yaml:"table_sale_way"`
+		TableMember     string `yaml:"table_member"`
+		TableMemberType string `yaml:"table_member_type"`
+		// 会员片段(= 主表 JOIN 三张流水表)要用的表。
+		TableMemberConsume    string `yaml:"table_member_consume"`
+		TableMemberPaylist    string `yaml:"table_member_paylist"`
+		TableMemberSavingPlus string `yaml:"table_member_savingplus"`
+		// MemberStoredPayType 是 paylist.card_type 里"储值支付"的那个取值。
+		MemberStoredPayType        string `yaml:"member_stored_pay_type"`
+		MemberPointsAccumulatedCol string `yaml:"member_points_accumulated_col"`
+		MemberPointsUsedCol        string `yaml:"member_points_used_col"`
 	} `yaml:"source"`
 }
 
@@ -886,7 +900,35 @@ func loadSchemas(mappingDir string, cfg *config) (
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,
 		"branch_price":   cfg.Source.TableBranchPrice,
+		// ---- 2026-10-23:最后六个 live model ----
+		// 供应商 / 分类 / 客户类别 / 会员类别 是普通表名;
+		// 销售方式要**过滤**(t_bd_base_code 是通用字典);
+		// 会员档案是**片段**(余额要 JOIN 三张流水表)。
+		"supplier":    cfg.Source.TableSupplier,
+		"category":    cfg.Source.TableCategory,
+		"cust_type":   cfg.Source.TableCustType,
+		"member_type": cfg.Source.TableMemberType,
 	}
+	// 销售方式:源表是通用基础代码字典(30+ 行,code_id 跨 type_no 重复)
+	// ⇒ 只取 type_no='SW' 的子集,否则 code_id→code_name 的对应关系是错的。
+	if t := strings.TrimSpace(cfg.Source.TableSaleWay); t != "" {
+		srcTables["sale_way"] = "(SELECT * FROM " + t + " WHERE type_no = 'SW')"
+	}
+	// 会员档案:卡内余额 / 累计消费 / 消费次数是"主表 JOIN 三张流水表"算出来的
+	// ⇒ live 的源是**片段**(见 internal/source/member_sql.go)。
+	memberFragment, err := source.MemberFromFragment(source.MemberTables{
+		Member:               cfg.Source.TableMember,
+		Consume:              cfg.Source.TableMemberConsume,
+		Paylist:              cfg.Source.TableMemberPaylist,
+		SavingPlus:           cfg.Source.TableMemberSavingPlus,
+		StoredPayType:        cfg.Source.MemberStoredPayType,
+		PointsAccumulatedCol: cfg.Source.MemberPointsAccumulatedCol,
+		PointsUsedCol:        cfg.Source.MemberPointsUsedCol,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("member live 片段: %w", err)
+	}
+	srcTables["member"] = memberFragment
 
 	names, err := models.ModelNames()
 	if err != nil {

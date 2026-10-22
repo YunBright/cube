@@ -374,7 +374,13 @@ func metaHandler(schemas map[string]*schemaMeta, appID string, lg *log.Logger) g
 // 编译器会明确报 storage 不匹配,而不是猜。
 func registryOf(schemas map[string]*schemaMeta, conn interface{ LegacyTSQL() bool }) cubequery.ModelRegistry {
 	entries := map[string]cubequery.ModelEntry{}
-	legacy := conn.LegacyTSQL()
+	// ⚠️ conn 允许为 nil:错误路径的单测只验证"错误分类不依赖任何 IO 成功",
+	// 而 registry 是在**拼 SQL 之前**就要构造的 ⇒ 这里直接解引用会 panic,
+	// 症状是连接被掐断(EOF)而不是一个可断言的 4xx。
+	legacy := false
+	if conn != nil {
+		legacy = conn.LegacyTSQL()
+	}
 	for name, m := range schemas {
 		if m == nil || m.Schema == nil || !m.Live {
 			continue

@@ -58,6 +58,16 @@ func liveModelNames(t *testing.T) []string {
 // mapKeyRe 抓 liveTables / srcTables 这种 map 字面量里的 `"<model>":` 键。
 var mapKeyRe = regexp.MustCompile(`^\s*"([a-z0-9_]+)":`)
 
+// assignKeyRe 抓 `srcTables["<model>"] = …` 这种**运行期赋值**的键。
+//
+// ⚠️ 为什么需要它:有些 live model 的源不是常量表名,而是**算出来的片段**
+// (member 的余额要 JOIN 三张流水表;sale_way 要过滤通用字典的子集)
+// ⇒ 它们的值只能先算再赋值,没法写进 map 字面量。
+//
+// ⇒ 只认 map 字面量的话,这两个 model 会被判成"少接一条"
+// —— 而它们的源其实**在**,只是写法不同 ⇒ 假红会让人去乱加重复条目。
+var assignKeyRe = regexp.MustCompile(`^\s*srcTables\["([a-z0-9_]+)"\]\s*=`)
+
 // keysFromGoSource 扫 Go 源码里指定函数的 map 字面量键。
 func keysFromGoSource(t *testing.T, path, funcName string) map[string]bool {
 	t.Helper()
@@ -78,6 +88,10 @@ func keysFromGoSource(t *testing.T, path, funcName string) map[string]bool {
 	out := map[string]bool{}
 	for _, line := range strings.Split(body, "\n") {
 		if m := mapKeyRe.FindStringSubmatch(line); m != nil {
+			out[m[1]] = true
+			continue
+		}
+		if m := assignKeyRe.FindStringSubmatch(line); m != nil {
 			out[m[1]] = true
 		}
 	}
