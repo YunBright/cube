@@ -29,6 +29,33 @@ dimensions:
     type: string
     title: 流水号
 
+  # ⚠️ order_no / sale_way 是**销售流水查询的必备维度**(销售报表与 POS 回放都要):
+  # 少了任何一个,查询会 400 "dimension not found: order_no (on model sale_detail)"
+  # ⇒ 症状是"销售流水查不出来",而真因只是 schema 少了一列。
+  - name: order_no
+    sql: order_no
+    type: string
+    title: 单据号
+    description: |
+      源列 flow_no(收银单号)。与 flow_no(流水号)是两回事:
+      flow_no 是**逐笔流水**的号,order_no 是**整单**的号。
+
+  - name: random_order_no
+    sql: random_order_no
+    type: string
+    title: 随机单号
+    description: |
+      源列 flowno_rand。与 order_no 一一对应,但每次交易重新生成
+      (收银小票上打的是它,用它对账比 order_no 更准)。
+
+  - name: sale_way
+    sql: sale_way
+    type: string
+    title: 销售方式
+    description: |
+      源列 sell_way(char(1)):A=购销 / B=代销 / C=联营 …
+      销售报表按它分组。
+
   - name: branch_id
     sql: branch_id
     type: string
@@ -52,6 +79,103 @@ dimensions:
     enum_values:
       - { value: "S",  label: 销售 }
       - { value: "R",  label: 退货 }
+
+  # ---- 金额 / 数量(源列名见 mapping)----
+  #
+  # ⚠️ 这几个维度是**销售流水查询的必备项**(销售报表、POS 回放都要):
+  # 少了任何一个,查询会 400 "dimension not found: … (on model sale_detail)"
+  # ⇒ 症状是"销售流水查不出来",真因只是 schema 少了一列。
+  - name: qty
+    sql: qty
+    type: number
+    title: 数量
+    description: |
+      源列 sale_qnty。**退货为负**(销售报表靠它判正负,见 order_status 维度)。
+
+  - name: sale_price
+    sql: sale_price
+    type: number
+    title: 售价(元)
+
+  - name: source_price
+    sql: source_price
+    type: number
+    title: 原价(元)
+    description: |
+      源列 source_price。⚠️ 思迅的 sale_price / source_price 在促销时**互为原价/促销价**
+      (别当成固定的两个价),报表口径以商品档案的 price 为准。
+
+  - name: sale_amount
+    sql: sale_amount
+    type: number
+    title: 金额(元)
+    description: |
+      源列 sale_money(本笔实收/退货金额)。
+
+  - name: discount_amount
+    sql: discount_amount
+    type: number
+    title: 优惠(元)
+    description: |
+      源列 pref_amt。
+
+  - name: cost_price
+    sql: cost_price
+    type: number
+    title: 成本价(元)
+    description: |
+      源列 in_price。销售报表的毛利按它算。
+
+  # ---- 收银现场维度 ----
+  - name: cashier_id
+    sql: cashier_id
+    type: string
+    title: 收银员编码
+    description: |
+      源列 oper_id。
+
+  - name: salesman_id
+    sql: salesman_id
+    type: string
+    title: 导购编码
+    description: |
+      源列 sale_man。
+
+  - name: counter_no
+    sql: counter_no
+    type: string
+    title: 柜台号
+
+  - name: online_flag
+    sql: online_flag
+    type: string
+    title: 是否线上单
+    description: |
+      源列 remote_flag。
+
+  - name: shift_no
+    sql: shift_no
+    type: string
+    title: 班次号
+
+  - name: pos_id
+    sql: pos_id
+    type: string
+    title: POS 机号
+    description: |
+      源列 posid。
+
+  - name: spec_sheet_no
+    sql: spec_sheet_no
+    type: string
+    title: 规格单号
+
+  - name: uptime
+    sql: uptime
+    type: string
+    title: 上传时间
+    description: |
+      源列 uptime(收银端上传时刻)。
 
 measures:
   - name: count

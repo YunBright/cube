@@ -1,5 +1,12 @@
 # Dapr App 协议(v2 — plan B 解耦版)
 
+> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
+> **不保留任何本地副本、不做任何原始数据同步**。
+> 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
+> 下面保留的是"当时的决策与踩过的坑",**读的时候按历史资料对待** ——
+> 照着它加"刷新 job / 预聚合 / 水位"会直接违反 AGENTS.md §4.1。
+>
 > v2 起按 **wire source id → dapr app-id** 解耦寻址:URL 上的 source 与
 > dapr sidecar 的 app-id 可以不同,默认 cube app 启动时把 `DAPR_APP_ID`
 > (dapr 自动注入)或 `CUBE_DAPR_APP_ID` 上报给 gateway。13 → 14 个错误码

@@ -56,7 +56,19 @@ mappings:
     type: decimal
     unit: yuan
 
-  - source: status
+  # ⚠️ **ysx 的供应商表没有 status 列**(2026-10-23 真库实测 39 列:
+  #    supcust_no / supcust_flag / sup_name / … / modify_date / cust_clsno,
+  #    没有 status)。照着 hbposv7 写 `source: status` ⇒ live 查询直接报
+  #    "列名 'status' 无效" ⇒ 整条供应商链路 502。
+  #
+  # ⇒ ysx 侧取 **display_flag**(是否显示):实测 217 行 '1' / 2 行 '0'。
+  #
+  # ⚠️ **极性与 hbposv7 相反**:hbposv7 的 status 是 '0' 正常(299 行)/ '1' 停用(1 行),
+  #    而 display_flag 是 '1' 显示(217)/ '0' 隐藏(2)。
+  #    ⇒ canonical `status` 在两个 family 里**不是同一个含义**,按 AGENTS.md §4
+  #    "枚举值归一化不做" ⇒ 这里**原样给源值**,由 BI 层翻译;
+  #    跨店比较 status 时**必须**知道自己看的是哪一家。
+  - source: display_flag
     target: status
     type: string
 
