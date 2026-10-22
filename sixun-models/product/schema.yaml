@@ -48,6 +48,34 @@ dimensions:
     type: string
     title: 状态
 
+  # ⚠️ 下面三个维度是**商品档案页要展示的列**(不是"可有可无的补充"):
+  # 少了任何一个,cube-router 的 products 导出会 400
+  # ("dimension not found: sub_code (on model product)"),
+  # 而那个 400 在链路上被翻成 502 cube_unavailable ⇒ 症状是
+  # "数据源暂不可用",真因却是 schema 少了一列。
+  #
+  # ⇒ 补维度时记得**两个 family 的 mapping 都要有对应的 source 列**。
+  - name: sub_code
+    sql: sub_code
+    type: string
+    title: 助记码
+    description: |
+      源列 item_subno(思迅的助记码/短码),用于人工敲码。
+
+  - name: spec
+    sql: spec
+    type: string
+    title: 规格
+    description: |
+      源列 item_size(如 "500g" / "-4斤箱" / "1.5L")。
+
+  - name: brand_name
+    sql: brand_name
+    type: string
+    title: 品牌
+    description: |
+      源列 item_brandname。商品档案页与销售报表按它分组。
+
   - name: created_at
     sql: created_at
     type: time
