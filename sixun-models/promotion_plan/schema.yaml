@@ -1,0 +1,134 @@
+# promotion_plan model - 思迅家族**促销方案头**(t_pub_plan_master)
+#
+# # 为什么是**另一个** model(不是 promotion)
+#
+# 已有 promotion model = t_pub_plan_flow = **商品行**表(方案 → 商品 → 价),
+# 供 POP 价签打印取"当前生效特价"。
+# 而后台"促销方案"页要的是**方案头**:方案编号 / 名称 / 起止日期 / 审核状态 /
+# 制单审核终止人 —— 这些只在 t_pub_plan_master 里。
+#
+# ⇒ 新增 promotion_plan(方案头),与 promotion(商品行)**并存**。
+#   不合并:合并就要把"方案头"与"商品行"的字段塞进一张表,
+#   而两者的行数与粒度完全不同(头 2646 行 vs 行 31355 行)。
+#
+# 实测行数(2026-10-22,两库真库):
+#   ysx(hbposv10)      2,646 行
+#   hbposv7(hbposepro)     **0 行** ← 表在,但**这个库没有促销方案数据**
+#
+# ⚠️ hbposv7 的 0 行是**源库事实**,不是配置错误:
+#   t_pub_plan_master 在 hbposepro 里存在(51 列,列名与 ysx 同名同类型),
+#   只是**一张空表**。⇒ 促销方案功能在 hbposv7 实例上查不到数据,
+#   这是业务侧的事实,不要用"恒空值 mapping"去假装有数据
+#   (playbook §2:只有一个库有 ⇒ 别偷偷造一个恒空列)。
+#
+# # approve_flag **原样透出**,不翻译
+#
+# 源列 approve_flag varchar(1),实测两库取值:
+#   "1" → ysx 2504 行 / "2" → ysx 142 行(2 = 已审核)
+#   (hbposv7 空表,无取值)
+#
+# 后台要的是 draft / approved / stopped 这类**业务词**,
+# 而"1/2/3 分别是什么"是**业务口径**,两个库可能不一样
+# ⇒ 翻译放在消费方(后台),cube 只交**源码**。
+# ⚠️ 在 schema 里写死 `CASE WHEN approve_flag='2' THEN 'approved' ...` 是错的:
+#   一旦业务口径变(比如 3 = 已终止),改 schema 要重发两个 family 的
+#   schema + mapping + 三处表名接线,而直接改后台一个映射函数就够了。
+#
+# # 为什么是 storage: live
+#
+# 方案是**时效数据**:begin_date/end_date 一到就失效,而且随时会有新单录入。
+# 与 promotion 同理(见 promotion/schema.yaml 顶部):落快照等于把"当前生效"
+# 变成"某次刷新时刻的生效",而后台要的是"此刻有效"。
+name: promotion_plan
+sql_table: promotion_plan
+storage: live
+
+dimensions:
+  - name: plan_no
+    sql: RTRIM(plan_no)
+    type: string
+    title: 方案编号
+    description: |
+      源列 plan_no(varchar(20))。实测形如 PS002109160001
+      (PS = 促销,后面是日期 + 序号,取自源库字典 t_pub_plan_master.rule_no)。
+
+  - name: plan_name
+    sql: RTRIM(plan_name)
+    type: string
+    title: 方案名称
+    description: 源列 plan_name(varchar(50))。实测值有"开业促销"/"干货促销",也有 "1"(脏值,原样透出)
+
+  - name: plan_memo
+    sql: RTRIM(plan_memo)
+    type: string
+    title: 方案摘要
+    description: 源列 plan_memo(varchar(200))
+
+  - name: begin_date
+    sql: begin_date
+    type: time
+    title: 开始日期
+    description: 源列 begin_date(datetime)。实测带时分秒(00:00:00 / 23:59:59)
+
+  - name: end_date
+    sql: end_date
+    type: time
+    title: 结束日期
+    description: 源列 end_date(datetime)
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date(datetime)
+
+  - name: created_by
+    sql: RTRIM(created_by)
+    type: string
+    title: 制单人
+    description: 源列 oper_man(varchar(6))。实测形如 2001 / 3001 / 5001
+
+  - name: approved_at
+    sql: approved_at
+    type: time
+    title: 审核时间
+    description: 源列 confirm_date(datetime)。未审核的行是 NULL
+
+  - name: approved_by
+    sql: RTRIM(approved_by)
+    type: string
+    title: 审核人
+    description: 源列 confirm_man(varchar(6))
+
+  - name: stopped_at
+    sql: stopped_at
+    type: time
+    title: 终止时间
+    description: 源列 stop_date(datetime)。未终止的行是 NULL
+
+  - name: stopped_by
+    sql: RTRIM(stopped_by)
+    type: string
+    title: 终止人
+    description: 源列 stop_man(varchar(6))
+
+  # ⚠️ 原始状态码,**不翻译**(见文件头"approve_flag 原样透出"一节)
+  - name: approve_flag
+    sql: RTRIM(approve_flag)
+    type: string
+    title: 审核状态码(源值)
+    description: |
+      源列 approve_flag(varchar(1))。实测 "1"(2504 行)/ "2"(142 行,已审核)。
+      ⚠️ 业务词(draft/approved/stopped)由消费方翻译,不要在这里写死。
+
+  - name: member_level
+    sql: RTRIM(member_level)
+    type: string
+    title: 会员等级
+    description: 源列 vip_type(varchar(255))。实测恒 "无"
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 方案数

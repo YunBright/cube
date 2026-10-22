@@ -7,6 +7,13 @@ mappings:
     target: id
     type: string
 
+  # 2026-10-20 新增:自编码 / 助记码。
+  # ⚠️ **不唯一**(实测 72 个自编码对应 2 个货号,全是「正常品 + 换购品」配对)
+  #    ⇒ 按自编码查会命中多个候选;唯一键是 id(货号)。
+  - source: item_subno
+    target: sub_code
+    type: string
+
   - source: item_name
     target: name
     type: string
@@ -39,10 +46,36 @@ mappings:
     type: decimal
     unit: yuan
 
+  # 2026-10-21 新增:商品规格(源列 item_size)。
+  # 实测形如 "1*10" / "500*12" / "1*12";有脏值,原样存不清洗。
+  - source: item_size
+    target: spec
+    type: string
+
+  # 2026-10-22 新增:品牌(源列 item_brandname)。
+  # ✅ 实测两个库覆盖率 100%(NULL 0 行),但整库只有 1 个取值("PM")⇒ 区分度为零。
+  #    业务 2026-10-15 已确认不把品牌作为报表维度;这里仍然暴露,
+  #    是为了商品档案页/流水下钻时能回答"这批货是哪个牌子"。
+  - source: item_brandname
+    target: brand_name
+    type: string
+
   - source: status              # 状态 char
     target: status
     type: string
 
   - source: build_date          # 建档时间 datetime
     target: created_at
+    type: datetime
+
+  # 2026-10-22 新增:最后修改时间(增量导出的过滤维度)。
+  #
+  # ⚠️ **两个 family 必须同时加**(mapping parity 测试会红):
+  #   共享 schema 的 product.updated_at = COALESCE(modify_date, created_at)
+  #   ⇒ modify_date 必须真实存在于**两个** DuckDB 表里。
+  #   实测两个源库都有这一列:
+  #     ysx(hbposv10)     27569 行 / 6816 NULL(25%)
+  #     hbposv7(hbposepro) 44623 行 / 12607 NULL(28%)
+  - source: modify_date
+    target: modify_date
     type: datetime

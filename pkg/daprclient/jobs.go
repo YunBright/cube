@@ -73,6 +73,8 @@ func (c *JobsClient) ScheduleJob(ctx context.Context, name string, req ScheduleJ
 	endpoint := c.SidecarAddr + jobsAPIPrefix + "/" + url.PathEscape(name)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+
+	setAPIToken(httpReq)
 	if err != nil {
 		return err
 	}
@@ -103,6 +105,7 @@ func (c *JobsClient) ScheduleJob(ctx context.Context, name string, req ScheduleJ
 func (c *JobsClient) DeleteJob(ctx context.Context, name string) error {
 	endpoint := c.SidecarAddr + jobsAPIPrefix + "/" + url.PathEscape(name)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
+	setAPIToken(httpReq)
 	if err != nil {
 		return err
 	}

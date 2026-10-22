@@ -1,0 +1,59 @@
+# supplier_item mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
+#
+# 源表 t_bd_supcust_item —— 商品 × 供应商 的供货关系与价格。
+#
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      43,751 行 / 20 列
+#   hbposv7(hbposepro) 45,275 行 / 21 列(多一列 contract_no,varchar(20))
+#   共有 20 列,本文件**只映射共有列**。
+#
+# ⚠️ 粒度实测:(item_no, supcust_no, sale_way) 三元组**唯一**
+#   (ysx 43751/43751,v7 45275/45275)⇒ 一个货号可以有多行(多个供应商)。
+#
+# ⚠️ appointed_price 实测**恒 0.0000**(抽样前 5 行全是 0),
+#   真实价在 top / bottom / last 三列。原样映射,不猜、不清零。
+version: 1
+model: supplier_item
+
+mappings:
+  - source: item_no
+    target: item_no
+    type: string
+
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  - source: supcust_no
+    target: supplier_id
+    type: string
+
+  - source: sale_way
+    target: sale_way
+    type: string
+
+  # ---- 金额:行上的价,不是聚合口径 ⇒ 维度(见 schema 顶部说明)----
+  - source: appointed_price
+    target: appointed_price_yuan
+    type: decimal
+    unit: yuan
+
+  - source: top_price
+    target: top_price_yuan
+    type: decimal
+    unit: yuan
+
+  - source: bottom_price
+    target: bottom_price_yuan
+    type: decimal
+    unit: yuan
+
+  - source: last_price
+    target: last_price_yuan
+    type: decimal
+    unit: yuan
+
+  # ⚠️ 源列是 **datetime**(不是 char 日期串)⇒ type: datetime
+  - source: contract_date
+    target: contract_date
+    type: datetime

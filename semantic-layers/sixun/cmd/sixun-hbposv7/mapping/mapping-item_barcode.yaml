@@ -1,0 +1,25 @@
+# hbposv7 item_barcode mapping(与 ysx 内容一致 —— 2026-10-21 两库实测同表同列)
+#
+# 源表 t_bd_item_barcode。两库都是:
+#   item_no char(20) / item_barcode char(20) / num1-3 numeric / other1-3 varchar / modify_date datetime
+#
+# ⚠️ 只用三列。其余(num1-3 / other2-3 / modify_date)不查就不映射。
+#
+# ⚠️ RTRIM:item_no / item_barcode 都是 char(20) 且**补空格规则两库不一致**
+#   (hbposv7 补、ysx 不补)⇒ 过滤条件必须包 RTRIM,否则静默漏命中。
+version: 1
+model: item_barcode
+
+mappings:
+  - source: item_barcode
+    target: barcode
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  # other1 实测值是口味/规格变体说明('草莓味'/'桔子味')。
+  - source: other1
+    target: label
+    type: string

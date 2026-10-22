@@ -1,15 +1,26 @@
-# ysx sale_detail mapping
+# sale_detail mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
 #
-# ysx 的 t_mp_saleflow 有 order_status 字段(区分销售/退货):
-#   S = 销售
-#   R = 退货
-#   但**这里不映射它** —— hbposv7 配的 t_rm_order_saleflow 实测没有这一列,
-#   共享 schema 若依赖 family 专属列,hbposv7 查该维度/度量就是 column not found。
-#   schema 的 order_status 维度用 COALESCE(order_status, CASE WHEN quantity<0 ...) 兜底,
-#   两个 family 统一按数量正负判断销售/退货。
+# 源表 t_rm_saleflow —— 逐笔销售流水。
 #
-# 注意:本 model 的源表在**两个库实测都是 0 行空表**,
-# 销售数据请用新的 sale_day(t_rm_daysum,实测 59.8 万 / 120.8 万行)。
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      3,327,514 行 / 29 列
+#   hbposv7(hbposepro) 1,743,882 行 / 32 列
+#   共有 25 列,本文件**只映射共有列** ——
+#   少映射一列 → 该 family 查不了;多映射一列 → 另一边 column not found。
+#
+# ⚠️ 不共有的列(有意不映射):
+#   仅 ysx:n_stan / flowno_type / ret_qnty / cic_sheet_no
+#   仅 hbposv7:paysum_flag / voucher_no / pr_spec_* / ot_spec_* / item_no_Fresh
+#
+# ⚠️ 两库宽度不同的 char 列(都补空格,查询层统一 RTRIM):
+#   flow_no      ysx char(14) / hbposv7 char(20)
+#   flowno_rand  ysx char(14) / hbposv7 varchar(20)
+#   spec_sheet_no ysx char(14) / hbposv7 char(20)
+#   item_no      两库都是 char(20)(ysx 实测 13 字符 + 7 尾随空格)
+#
+# ⚠️ **type 写的是源库物理类型**,不是"业务类型":
+#   char/varchar → string;numeric → decimal / int;datetime → datetime。
+#   金额类带 unit: yuan。
 version: 1
 model: sale_detail
 
@@ -19,26 +30,89 @@ mappings:
     type: int
 
   - source: flow_no
-    target: flow_no
+    target: order_no
+    type: string
+
+  - source: flowno_rand
+    target: random_order_no
     type: string
 
   - source: branch_no
-    target: branch_id
+    target: branch_no
     type: string
 
   - source: item_no
     target: product_id
     type: string
 
+  # ---- 价与量(行上的价,不是聚合口径)----
+  - source: source_price
+    target: source_price
+    type: decimal
+
   - source: sale_price
-    target: unit_price
+    target: sale_price
     type: decimal
     unit: yuan
 
   - source: sale_qnty
-    target: quantity
+    target: qty
     type: decimal
 
+  - source: sale_money
+    target: sale_amount
+    type: decimal
+    unit: yuan
+
+  - source: pref_amt
+    target: discount_amount
+    type: decimal
+    unit: yuan
+
+  - source: in_price
+    target: cost_price
+    type: decimal
+    unit: yuan
+
+  # ---- 人 / 柜台 / 销售方式 ----
+  - source: sell_way
+    target: sale_way
+    type: string
+
+  - source: oper_id
+    target: cashier_id
+    type: string
+
+  - source: sale_man
+    target: salesman_id
+    type: string
+
+  - source: counter_no
+    target: counter_no
+    type: string
+
+  # ---- 时间 ----
   - source: oper_date
     target: sold_at
+    type: datetime
+
+  # ---- 其它(两库共有)----
+  - source: remote_flag
+    target: online_flag
+    type: string
+
+  - source: shift_no
+    target: shift_no
+    type: string
+
+  - source: posid
+    target: pos_id
+    type: string
+
+  - source: spec_sheet_no
+    target: spec_sheet_no
+    type: string
+
+  - source: uptime
+    target: uptime
     type: datetime

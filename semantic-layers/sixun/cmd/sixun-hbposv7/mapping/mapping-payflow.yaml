@@ -1,0 +1,81 @@
+# payflow mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
+#
+# 源表 t_rm_payflow —— 收银流水(一笔销售按付款方式拆成 1~N 行)。
+#
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      1,143,219 行 / 34 列
+#   hbposv7(hbposepro)   550,213 行 / 26 列
+#   共有 26 列,本文件**只映射共有列**。
+#
+# ⚠️ 仅 ysx 有(有意不映射):ciceroni_no / ciceroni_id / flowno_type /
+#   trans_type / up_batchno / up_vipacc / remark / cash_no / checkdata
+#
+# ⚠️ 两库宽度不同的 char 列(都补空格,查询层统一 RTRIM):
+#   flow_no      ysx char(14) / hbposv7 char(20)
+#   flowno_rand  ysx char(14) / hbposv7 varchar(20)
+#   voucher_no   ysx char(14) / hbposv7 char(20) —— 本 model 未映射(不在契约维度清单)
+version: 1
+model: payflow
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: flow_no
+    target: order_no
+    type: string
+
+  - source: flowno_rand
+    target: random_order_no
+    type: string
+
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  - source: sell_way
+    target: sale_way
+    type: string
+
+  - source: pay_way
+    target: pay_way
+    type: string
+
+  - source: card_no
+    target: card_no
+    type: string
+
+  - source: vip_no
+    target: vip_no
+    type: string
+
+  - source: coin_rate
+    target: exchange_rate
+    type: decimal
+
+  - source: pay_amount
+    target: pay_amount
+    type: decimal
+    unit: yuan
+
+  - source: sale_amount
+    target: sale_amount
+    type: decimal
+    unit: yuan
+
+  - source: oper_date
+    target: paid_at
+    type: datetime
+
+  - source: oper_id
+    target: cashier_id
+    type: string
+
+  - source: sale_man
+    target: salesman_id
+    type: string
+
+  - source: counter_no
+    target: counter_no
+    type: string

@@ -4,6 +4,9 @@
 # 两边实例(hbposv7/ysx)的 mapping.yaml target 列表相同 → schema 一致 → BI 工具无感知
 name: supplier
 sql_table: supplier
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+# 供应商档案(219~300 行)变化少,但**新签的供应商必须立刻能被选中**。
+storage: live
 # 增量刷新按主键 upsert(见 internal/dataloader)。
 primary_key: id
 

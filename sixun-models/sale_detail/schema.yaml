@@ -1,10 +1,22 @@
 # sale_detail model - 思迅家族销售明细(含销售退货)
 #
+# 源表(2026-10-22 真库实测,两个 family 同名同列):
+#   ysx(hbposv10)      t_rm_saleflow 3,327,514 行
+#   hbposv7(hbposepro) t_rm_saleflow 1,743,882 行
+#
 # 关键差异处理:
-#   - ysx (t_mp_saleflow) 有 order_status 字段,直接映射
-#   - hbposv7 (t_rm_order_saleflow) 没有,用 SQL: CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END
+#   - 这张表**没有** order_status 列(旧的 t_mp_saleflow 才有),
+#     所以单据类型一律按**数量正负**判定:数量 < 0 ⇒ 退货(R),否则销售(S)。
+#   - 列名一律用 **canonical 名**(qty / sale_price / sale_amount …),
+#     由 mapping 重写成源列名(sale_qnty / sale_price / sale_money …)。
+#     ⚠️ 写源列名会在"两个 family 源列名恰好相同"时蒙混过关,
+#     不一致时才炸 —— 而症状是查询那一刻的 column not found。
 name: sale_detail
 sql_table: sale_detail
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+# 逐笔流水实测 3327514 / 1743882 行且每天在长 —— 这种表**最不该**有本地副本:
+# 副本要么过期(销售流水过期 = POS 少收的钱),要么要不停重拉(压生产库)。
+storage: live
 
 dimensions:
   - name: id
@@ -34,8 +46,7 @@ dimensions:
 
   - name: order_status
     sql: >
-      COALESCE(order_status,
-               CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END)
+      CASE WHEN qty < 0 THEN 'R' ELSE 'S' END
     type: string
     title: 单据类型
     enum_values:
@@ -49,13 +60,13 @@ measures:
     title: 流水数
 
   - name: total_qty
-    sql: "SUM(quantity)"
+    sql: "SUM(qty)"
     type: number
     title: 总数量(含退货为负)
     format: "0.00"
 
   - name: total_amount_yuan
-    sql: "SUM(unit_price * quantity)"
+    sql: "SUM(sale_price * qty)"
     type: number
     title: 总金额(元)
     format: "0.00"
@@ -66,7 +77,7 @@ measures:
   #   改用数量正负判断,与上面 order_status 维度的兜底分支保持同一口径:
   #   ysx 的 t_mp_saleflow.order_status 取值 S/R,退货行数量为负。
   - name: net_amount_yuan
-    sql: "SUM(CASE WHEN quantity < 0 THEN -unit_price * quantity ELSE unit_price * quantity END)"
+    sql: "SUM(CASE WHEN qty < 0 THEN -sale_price * qty ELSE sale_price * qty END)"
     type: number
     title: 净额(销售-退货)
     format: "0.00"

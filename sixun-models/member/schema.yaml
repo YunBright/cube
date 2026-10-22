@@ -18,6 +18,11 @@
 # 让下游排查时无从查证(playbook §3.2)。
 name: member
 sql_table: member
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+# ⚠️ **member 的 live 源不是表名,是片段**:卡内余额 / 累计消费 / 消费次数
+#    是"主表 JOIN 三张流水表"算出来的(源库里没有这几列)
+#    ⇒ 片段见 internal/source/member_sql.go 的 MemberFromFragment。
+storage: live
 # 增量刷新按主键 upsert(见 internal/dataloader)。
 # ✅ 实测两库 distinct(card_id) == 行数(无重复),所以 card_id 可以当主键。
 primary_key: id

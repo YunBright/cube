@@ -4,12 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/freshness"
 )
 
 // callHealth 通过真实 gin engine 发一次请求 —— 不能直接构造 gin.Context
@@ -37,78 +34,37 @@ func getHealth(t *testing.T, h gin.HandlerFunc) map[string]any {
 	return out
 }
 
-// TestHealthHandler_RefreshIsEvaluatedPerRequest 锁的是 2026-10-10 踩到的那个坑。
-//
-// 把 `sched.Stats()` 直接当值传进来时,它在 handler 构造那一刻就求值了,
-// 之后 healthz 里的 triggered / skipped / data_age 永久冻结在启动值 ——
-// 接口 200、内容看着正常,只是再也不反映运行期。
-// 日志里明明有 "dapr job triggered",healthz 却显示 triggered:0。
-//
-// 判据不是"格式对不对",而是"第二次请求能不能看到变化"。
-func TestHealthHandler_RefreshIsEvaluatedPerRequest(t *testing.T) {
-	n := 0
-	h := (&Config{AppID: "sixun-ysx-00"}).HealthHandler(
-		[]string{"product"},
-		nil,
-		func() any {
-			n++
-			return map[string]any{"triggered": n}
-		},
-	)
-
-	first := getHealth(t, h)["refresh"].(map[string]any)
-	if first["triggered"].(float64) != 1 {
-		t.Fatalf("第一次请求 triggered 应为 1,实际 %v", first["triggered"])
+// TestHealthHandler_ReportsModels 锁"healthz 报出注册了的 model"。
+func TestHealthHandler_ReportsModels(t *testing.T) {
+	body := getHealth(t, (&Config{AppID: "sixun-ysx-00"}).HealthHandler([]string{"product", "member"}))
+	if body["source"] != "sixun-ysx-00" {
+		t.Errorf("source 应是 app id,实际 %v", body["source"])
 	}
-
-	second := getHealth(t, h)["refresh"].(map[string]any)
-	if second["triggered"].(float64) != 2 {
-		t.Fatalf("第二次请求必须看到新值(triggered=2),实际 %v —— "+
-			"说明 refresh 被当成值求值了一次,计数器已冻结", second["triggered"])
-	}
-}
-
-// TestHealthHandler_NilRefreshOmitsSegment 没传 provider 时不能输出 refresh 段。
-func TestHealthHandler_NilRefreshOmitsSegment(t *testing.T) {
-	h := (&Config{AppID: "x"}).HealthHandler([]string{"product"}, nil, nil)
-	body := getHealth(t, h)
-	if _, ok := body["refresh"]; ok {
-		t.Fatal("nil provider 时不应有 refresh 段")
+	models, ok := body["models"].([]any)
+	if !ok || len(models) != 2 {
+		t.Fatalf("models 应列出 2 个 model,实际 %v", body["models"])
 	}
 	if body["status"] != "ok" {
-		t.Fatalf("无 tracker 时 status 应为 ok,实际 %v", body["status"])
+		t.Errorf("status 应为 ok,实际 %v", body["status"])
 	}
 }
 
-// TestHealthHandler_DegradedStillReturns200 数据旧 ≠ 服务不可用。
+// TestHealthHandler_NoCopySegments 锁"healthz 里**没有**副本相关的那两段"。
 //
-// 返 503 会让 dapr / gateway 把它当宕机从而拒绝查询,
-// 把一个降级问题升级成不可用问题 —— 这是刻意不做的。
-func TestHealthHandler_DegradedStillReturns200(t *testing.T) {
-	tr := freshness.New(30 * 60 * 1e9) // 30m
-	tr.Record("product", errFailed)
-
-	h := (&Config{AppID: "x"}).HealthHandler([]string{"product"}, tr, nil)
-	code, out := callHealth(t, h)
-
-	if code != http.StatusOK {
-		t.Fatalf("degraded 时仍应 200,实际 %d", code)
+// ⚠️ 2026-10-23 去 DuckDB:以前 healthz 里有
+//   - data    = 本地副本的物化状态与年龄
+//   - refresh = 刷新 job 的统计
+// 现在**一个都不落 DuckDB** ⇒ 没有副本、没有物化、没有刷新 job
+// ⇒ 那两段永远是空,而且**留着它们是假信号**:
+// 一个恒为 "ok" 的健康检查会让人以为"有人在管数据的新鲜度",
+// 而实际上数据新鲜度 = 源库的新鲜度。
+//
+// ⇒ 这条测试是**防回退**的:谁再加回副本/刷新机制,这里就会红。
+func TestHealthHandler_NoCopySegments(t *testing.T) {
+	body := getHealth(t, (&Config{AppID: "x"}).HealthHandler([]string{"product"}))
+	for _, seg := range []string{"data", "refresh", "jobs"} {
+		if _, ok := body[seg]; ok {
+			t.Errorf("本实例不持有数据副本,healthz 不该再有 %q 段(实际 %v)", seg, body[seg])
+		}
 	}
-	if out["status"] != "degraded" {
-		t.Fatalf("有 model 加载失败时 status 应 degraded,实际 %v", out["status"])
-	}
-	if !strings.Contains(toStr(out["reason"]), "boom") {
-		t.Fatalf("reason 应包含真实错误,实际 %v", out["reason"])
-	}
-}
-
-var errFailed = errBoom{}
-
-type errBoom struct{}
-
-func (errBoom) Error() string { return "boom" }
-
-func toStr(v any) string {
-	s, _ := v.(string)
-	return s
 }

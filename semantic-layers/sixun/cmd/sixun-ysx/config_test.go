@@ -6,8 +6,8 @@ package main
 //
 // config.yaml 不在版本库(.gitignore),而且 deploy-cube.ps1 会用**打包机工作区**
 // 里那份覆盖服务器上的。后果是:代码里的默认值和约束单测全绿,但部署出去的配置
-// 可能根本没配 refresh 段 —— 此时增量完全没生效,系统安静地退回每 30 分钟全量
-// 重拉,而日志只有一行 "incremental_models=0",没人会注意到。
+// 可能根本没配某个源表名 —— 此时该 model 会**静默不可查**
+// (main.go 只打一行 Info 日志然后 continue,healthz 照样全绿)。
 //
 // 这类"配置文件与代码约定漂移"的问题,只有**直接断言配置文件本身**才拦得住。
 //
@@ -19,17 +19,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/appcfg"
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/refreshschedule"
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/source"
-)
+	"github.com/YunBright/cube/pkg/cubeschema"
+	models "github.com/YunBright/cube/sixun-models"
 
-// measuredProductRows 是 2026-10-10 对**两个生产源库**实测的 COUNT(*)
-// (ysx/hbposv10 = 27304,hbposepro = 44316)。
-//
-// 改成实测值较大的那个:两个 family 的 config 在同一台打包机上,断言必须对
-// 两者都成立。**重新实测后请同步更新这里**,否则这条测试会开始保护一个过时的数字。
-const measuredProductRows = 44316
+	"github.com/YunBright/cube/semantic-layers/sixun/internal/appcfg"
+)
 
 func loadDeployedConfig(t *testing.T) appConfig {
 	t.Helper()
@@ -49,98 +43,71 @@ func loadDeployedConfig(t *testing.T) appConfig {
 	return cfg
 }
 
-// TestDeployedConfigEnablesIncremental 增量必须真的被配上。
+// TestDeployedConfigCoversEveryLiveModel 锁"每个 live model 都有源"。
 //
-// 空 map 是一个**合法且安静**的退路(dataloader 会全部走全量),所以它不会以
-// "配置错误"的形式暴露,只会在性能上体现 —— 也就是没人会发现。
-func TestDeployedConfigEnablesIncremental(t *testing.T) {
+// ⚠️ 2026-10-23 去 DuckDB 之后,**全部 model 都是 live** ⇒ 源表名(config 的
+// table_<model>)就是它们**唯一**的取数入口 —— 少一条,那个 model 就静默不可查。
+//
+// 症状特别难查:main.go 只打一行 "live model 缺 source.table_*,该 model 不可查询",
+// 然后 continue ⇒ healthz 照样全绿、网关照样注册成功,
+// 只是"查这个表"永远 404 MODEL_NOT_FOUND —— 而那看起来像"这个 source 没有该能力"。
+//
+// ⇒ 这条测试把"少配一条表名"从运行期的静默失败,提前到 CI 的红灯。
+func TestDeployedConfigCoversEveryLiveModel(t *testing.T) {
 	cfg := loadDeployedConfig(t)
-	if len(cfg.Refresh.Incremental) == 0 {
-		t.Fatal("refresh.incremental 为空 —— 增量刷新完全没启用," +
-			"系统会安静地退回每 30 分钟全量重拉 4.4 万行,而没有任何报错")
-	}
-	for model, col := range cfg.Refresh.Incremental {
-		if strings.TrimSpace(col) == "" {
-			t.Errorf("model %q 配了空的增量列名", model)
-		}
-	}
-	// 这两个是实测有 modify_date 且行数够大的表,漏配就等于白做增量。
-	for _, want := range []string{"product", "supplier"} {
-		if _, ok := cfg.Refresh.Incremental[want]; !ok {
-			t.Errorf("refresh.incremental 缺少 %q(实测该表有 modify_date)", want)
-		}
-	}
-}
-
-// TestDeployedFullScheduleIsSixFieldCron 锁住 cron 字段数。
-//
-// 这是本轮真机抓到的一个**静默**陷阱:5 字段会被 Dapr 拒绝(启动不失败、
-// mode 照样 dapr-job),于是夜间全量校准再也不会发生,而增量漏的数据永远
-// 没有兜底。refreshschedule 侧的 validateSchedule 只在进程启动时兜底,
-// 配置文件这一层由本测试守住。
-func TestDeployedFullScheduleIsSixFieldCron(t *testing.T) {
-	cfg := loadDeployedConfig(t)
-	s := cfg.fullSchedule()
-	if n := len(strings.Fields(s)); n != 6 {
-		t.Fatalf("refresh.full_schedule=%q 是 %d 字段,Dapr 要求 6 字段(秒 分 时 日 月 周)"+
-			" —— 实测 5 字段会得到 HTTP 500: expected exactly 6 fields, found 5,"+
-			"且主 job 不受影响、夜间校准静默消失", s, n)
-	}
-	if err := refreshschedule.ValidateSchedule(s); err != nil {
-		t.Fatalf("full_schedule 没过 schedule 校验: %v", err)
-	}
-}
-
-// TestDeployedRowLimitsCoverMeasuredSizes 锁住"不静默截断"。
-//
-// 兜底 row_limit 是 50000,而 hbposv7 的 product 实测 44316 —— 只剩 12% 余量。
-// 商品涨过 5 万时会被静默截断(没有任何报错,只是"某些条码扫不出来")。
-// 这个坑历史上已经踩过一次:硬编码 TOP 10000 丢了 77% 商品,零报错。
-func TestDeployedRowLimitsCoverMeasuredSizes(t *testing.T) {
-	cfg := loadDeployedConfig(t)
-	if got := cfg.Source.RowLimits["product"]; got < measuredProductRows {
-		t.Fatalf("source.row_limits.product=%d 不高于实测行数 %d —— 会静默截断商品",
-			got, measuredProductRows)
-	}
-	// 兜底值也必须高于所有实测值:将来新增一个 duck model 忘了加进 row_limits,
-	// 兜底就是它唯一的保护。
-	if cfg.Source.RowLimit < measuredProductRows {
-		t.Fatalf("source.row_limit(兜底)=%d 不高于实测行数 %d",
-			cfg.Source.RowLimit, measuredProductRows)
-	}
-}
-
-// TestDeployedIncrementalFallbackCoversNewItems 锁住增量回退列。
-//
-// 实测依据(2026-10-10):`modify_date IS NULL` 的语义是"建档后从未被修改过",
-// 那 `build_date` 就是这条记录最后一次被写入的时间。按
-// `build_date >= DATEADD(day,-7,GETDATE())` 筛出的 45 个近 7 天新建商品里,
-// **36 个(80%)modify_date 是 NULL**。
-//
-// 删掉这个回退列的代价是实打实的:30 天窗口从 549 行掉回 410 行,少覆盖 34%
-// 的新增商品 —— 而这些恰恰是最该被拉到的(旧数据早被上一次全量带进来了)。
-//
-// ⚠️ 它**不能替代夜间全量校准**:本库仍有 31 行商品两个时间列同时为 NULL。
-func TestDeployedIncrementalFallbackCoversNewItems(t *testing.T) {
-	cfg := loadDeployedConfig(t)
-
-	fb := cfg.Refresh.IncrementalFallback["product"]
-	if fb != "build_date" {
-		t.Fatalf("product 的增量回退列应是 build_date,实际 %q —— 缺了它,新建商品"+
-			"(实测 80%% 是 modify_date NULL)在建成当天就查不到", fb)
-	}
-
-	// 顺带确认两件事:拼写没写错(过不了白名单就是错的列名),
-	// 以及 COALESCE 的**参数顺序**正确(写反了 SQL 照样能跑,只是语义反了)。
-	expr, err := source.IncrementalCols{
-		Primary:  cfg.Refresh.Incremental["product"],
-		Fallback: fb,
-	}.Expression()
+	live, err := liveTables(&cfg)
 	if err != nil {
-		t.Fatalf("回退列没通过标识符校验(可能是拼错了列名): %v", err)
+		t.Fatalf("构造 live 表名失败: %v", err)
 	}
-	if expr != "COALESCE([modify_date], [build_date])" {
-		t.Errorf("增量表达式应是 COALESCE([modify_date], [build_date]),实际 %q —— "+
-			"顺序反了会让 COALESCE 优先取 build_date", expr)
+	names, err := models.ModelNames()
+	if err != nil {
+		t.Fatalf("列 model 失败: %v", err)
+	}
+	if len(names) == 0 {
+		t.Fatal("一个 model 都没有 —— 嵌入式资产没加载上")
+	}
+	for _, name := range names {
+		b, err := models.ReadSchema(name)
+		if err != nil {
+			t.Errorf("读 schema %q 失败: %v", name, err)
+			continue
+		}
+		schema, err := cubeschema.Load(b)
+		if err != nil {
+			t.Errorf("解析 schema %q 失败: %v", name, err)
+			continue
+		}
+		if schema.EffectiveStorage() != cubeschema.StorageLive {
+			t.Errorf("model %q 不是 live model(storage=%s)—— 全仓去 DuckDB 之后应当都是 live",
+				name, schema.EffectiveStorage())
+			continue
+		}
+		if strings.TrimSpace(live[name]) == "" {
+			t.Errorf("live model %q 在 config 里没有源(table_%s 缺)⇒ 它会**静默不可查**",
+				name, name)
+		}
+	}
+}
+
+// TestDeployedConfigHasMemberFragmentTables 锁"会员片段要用的四张表都配了"。
+//
+// ⚠️ member 的 live 源是**片段**(余额 = 充值 − 储值支付,要 JOIN 三张流水表),
+// 少配任何一张 ⇒ 片段构造直接报错 ⇒ 启动失败(这是好的失败方式:
+// 显式报错,而不是"会员余额恒为 0")。
+func TestDeployedConfigHasMemberFragmentTables(t *testing.T) {
+	cfg := loadDeployedConfig(t)
+	for name, v := range map[string]string{
+		"table_member":            cfg.Source.TableMember,
+		"table_member_consume":    cfg.Source.TableMemberConsume,
+		"table_member_paylist":    cfg.Source.TableMemberPaylist,
+		"table_member_savingplus": cfg.Source.TableMemberSavingPlus,
+	} {
+		if strings.TrimSpace(v) == "" {
+			t.Errorf("会员 live 片段需要 %s,但配置里是空的", name)
+		}
+	}
+	// 片段构造本身也要能过(表名会被拼进 SQL 文本 ⇒ 必须过标识符白名单)。
+	if _, err := liveTables(&cfg); err != nil {
+		t.Fatalf("构造 live 表名失败: %v", err)
 	}
 }

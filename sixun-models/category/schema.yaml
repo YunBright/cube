@@ -1,6 +1,10 @@
 # category model - 思迅家族商品分类
 name: category
 sql_table: category
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+# 分类字典变化极少,但**新建的分类必须立刻能查到** —— 落一份副本就意味着
+# "刚建的分类要等一次同步才出现",而 POS 选不出来就是直接不能营业。
+storage: live
 
 dimensions:
   - name: id

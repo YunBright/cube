@@ -98,11 +98,62 @@ const (
 	MemberRemainingPointsAlias = "memb_remaining_points"
 )
 
-// MemberSQL 构造 member 模型的取数 SQL。
+// MemberSQL 构造 member 模型的取数 SQL(带三张派生表的 JOIN)。
+//
+// ⚠️ 这条 SQL 是**落 DuckDB 那条路**用的(loader 拉全表 → 建 _raw 表)。
+// live 路(实时透传源库)用 MemberFromFragment。
 //
 // ⚠️ 表名来自 config.yaml(不是用户输入),但仍做一次**标识符白名单校验**:
 // 表名会拼进 SQL 文本,配置写错时宁可报错也不要拼出坏 SQL。
 func MemberSQL(t MemberTables, limit int) (string, error) {
+	body, err := memberSelectBody(t)
+	if err != nil {
+		return "", err
+	}
+	if limit <= 0 {
+		limit = DefaultRowLimit
+	}
+	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
+	return fmt.Sprintf("SELECT TOP %d\n%s", limit, body), nil
+}
+
+// MemberFromFragment 构造 member 模型的 **live 取数片段**(派生表)。
+//
+// # 为什么需要它
+//
+// member 的三个派生列(卡内余额 / 累计消费 / 消费次数)**在源库里不存在**:
+// 它们是"主表 JOIN 三张流水表"算出来的(见本文件顶部的口径说明)。
+// 而 live model 的查询是"把 schema 编译成 T-SQL 直打源库",
+// 没有"先把表物化下来再算"这一步 ⇒ 派生列必须由**片段**在源库侧算出来。
+//
+// # 片段的列名约定
+//
+//   - **源列**(card_id / vip_name / …):沿用源库列名 ——
+//     mapping.yaml 会把 canonical 名(如 id / name)重写成源列名,列名对得上。
+//   - **派生列**(余额 / 消费 / 积分):沿用 **memb_\* 别名** ——
+//     mapping.yaml 里也有这几条(source: memb_balance → target: balance_yuan),
+//     所以 canonical 名照样被重写成 memb_balance ⇒ 片段里的列名对得上。
+//
+// ⇒ **片段的列名 = 源列名(含 memb_\* 别名)**,不需要另造一套 canonical 名。
+//
+// # 与 MemberSQL 的差别
+//
+//   - 没有 TOP(分页由 cube 的 limit/offset 负责);
+//   - 整体包在括号里 ⇒ 它在 SQL 里是**派生表**,不是表名。
+func MemberFromFragment(t MemberTables) (string, error) {
+	body, err := memberSelectBody(t)
+	if err != nil {
+		return "", err
+	}
+	return "(" + body + ")", nil
+}
+
+// memberSelectBody 构造 member 取数 SQL 的 SELECT + FROM 部分(不含 TOP)。
+//
+// ⚠️ 落 DuckDB(去 DuckDB 之前)与 live 片段**共用这一段** ——
+// 两边一旦分叉,同一张卡的余额就会在"物化副本"与"实时透传"里对不上,
+// 而这种不一致**没有任何一行报错**。
+func memberSelectBody(t MemberTables) (string, error) {
 	for name, v := range map[string]string{
 		"table_member":            t.Member,
 		"table_member_consume":    t.Consume,
@@ -112,9 +163,6 @@ func MemberSQL(t MemberTables, limit int) (string, error) {
 		if err := assertIdent(name, v); err != nil {
 			return "", err
 		}
-	}
-	if limit <= 0 {
-		limit = DefaultRowLimit
 	}
 	storedType := strings.TrimSpace(t.StoredPayType)
 	if storedType == "" {
@@ -139,8 +187,7 @@ func MemberSQL(t MemberTables, limit int) (string, error) {
 			accCol, usedCol, MemberRemainingPointsAlias)
 	}
 	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
-	return fmt.Sprintf(`SELECT TOP %d
-  v.*,
+	return fmt.Sprintf(`  v.*,
   c.vip_cons_amount AS %s,
   c.cons_count AS %s,
   ISNULL(p.plus_total, 0) - ISNULL(pay.pay_total, 0) AS %s%s
@@ -151,7 +198,6 @@ LEFT JOIN (SELECT card_id, SUM(plus_count) AS plus_total FROM %s GROUP BY card_i
        ON p.card_id = v.card_id
 LEFT JOIN (SELECT card_id, SUM(amount) AS pay_total FROM %s WHERE card_type = '%s' GROUP BY card_id) pay
        ON pay.card_id = v.card_id`,
-		limit,
 		MemberConsumeAmountAlias,
 		MemberConsumeCountAlias,
 		MemberBalanceAlias,

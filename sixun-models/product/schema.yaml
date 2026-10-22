@@ -1,6 +1,12 @@
 # product model - 思迅家族共享 schema
 name: product
 sql_table: product
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+#
+# ⚠️ 为什么必须 live:pkg/cubequery/join.go 的 checkStorage 拒绝任何
+#    非 live 的 join 两侧,而后台的「商品销售流水」查询**同时**要
+#    sale_detail.* 与 product.* ⇒ sale_detail → product 必须都是 live。
+storage: live
 # 增量刷新按主键 upsert(见 internal/dataloader)。
 # 没有它就只能全量重建表 —— 实测每天约 10 行变更 vs 44316 行全量。
 primary_key: id

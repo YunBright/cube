@@ -1,0 +1,95 @@
+# branch_price model - 思迅家族**商品档案价格**(t_pc_branch_price)
+#
+# # 商品档案页的进价 / 批发价 / 零售价 / 会员价 四列全出自这张表
+#
+# 实测行数(2026-10-22,两库真库):
+#   ysx(hbposv10)      27,569 行
+#   hbposv7(hbposepro) 44,623 行
+#
+# # 粒度(实测)
+#
+# 实测 (item_no, supcust_no, sale_way) 三元组**唯一**:
+#   ysx     27569 行 / 27569 个不同三元组 / distinct(item_no) 也是 27569
+#   hbposv7 44623 行 / 44623 个不同三元组 / distinct(item_no) 也是 44623
+# ⇒ **一个货号恰好一行**(在这两个库里),后台按货号取价不会有歧义。
+#
+# 实测 branch_no **只有一个取值**(两库都是 "00"),
+# 所以 branch_no 没有进维度清单(两个库都只有一个值,当维度只会多一次分组)。
+# ⚠️ 一旦将来分店各自定价,这张表会变成"一货号多行",
+#   那时**必须**加 branch_no 维度并同步改两个 family 的 mapping + 后台口径。
+#
+# # 列名与语义的对应(⚠️ 与直觉相反,照抄源列名最容易错)
+#
+#   base_price → **进价**   (实测货号 00001 = 4.9600)
+#   price      → **批发价** (实测货号 00001 = 3.6000)
+#   sale_price → **零售价** (实测货号 00001 = 4.7600)
+#   vip_price  → **会员价** (实测货号 00001 = 0.0000)
+#
+# source_price/sale_price 这套名字在**别的表**里的含义不一样
+# (t_rm_saleflow.source_price = 原价),所以这里用
+# cost_yuan / wholesale_yuan / retail_yuan / member_price_yuan
+# 四个**带语义的 canonical 名**,并在 mapping 里显式改名 ——
+# canonical 名在这里是唯一的语义锚点。
+#
+# ⚠️ 会员价实测 **0.0000**(不是 NULL)。后台把 0 当"没有会员价"处理
+#   (契约里 member_price_yuan 是 null),那是**消费方的口径**,cube 原样透出。
+#
+# # 为什么是 storage: live
+#
+# 价格是**会变的业务事实**,落快照 = "某次刷新时刻的价格"。
+# 商品档案页要的是当前价 ⇒ live。
+name: branch_price
+sql_table: branch_price
+storage: live
+
+dimensions:
+  - name: item_no
+    sql: RTRIM(item_no)
+    type: string
+    title: 货号
+    description: 源列 item_no(char(20))。与 product.id 同一套编码
+
+  # ⚠️ 这里的 canonical 名**故意等于源列名**(不像其它 model 那样改成 supplier_id):
+  #   它对齐的是后台契约里 branch_price.supcust_no 这个成员名。
+  #   源列 supcust_no(char(8)),实测值形如 019 / 038 / 2001。
+  - name: supcust_no
+    sql: RTRIM(supcust_no)
+    type: string
+    title: 供应商编码
+    description: 源列 supcust_no(char(8))
+
+  - name: sale_way
+    sql: RTRIM(sale_way)
+    type: string
+    title: 经营方式
+    description: 源列 sale_way(char(1))。实测恒 "A"
+
+  - name: cost_yuan
+    sql: cost_yuan
+    type: number
+    title: 进价(元)
+    description: 源列 base_price(numeric)
+
+  - name: wholesale_yuan
+    sql: wholesale_yuan
+    type: number
+    title: 批发价(元)
+    description: 源列 price(numeric)
+
+  - name: retail_yuan
+    sql: retail_yuan
+    type: number
+    title: 零售价(元)
+    description: 源列 sale_price(numeric)
+
+  - name: member_price_yuan
+    sql: member_price_yuan
+    type: number
+    title: 会员价(元)
+    description: 源列 vip_price(numeric)。⚠️ 实测恒 0.0000(不是 NULL)
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 价格行数

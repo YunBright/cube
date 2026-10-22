@@ -19,7 +19,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -27,28 +26,16 @@ import (
 
 	"github.com/YunBright/cube/pkg/cubequery"
 	"github.com/YunBright/cube/pkg/cubeschema"
-	"github.com/YunBright/cube/pkg/duckdb"
 	"github.com/YunBright/cube/pkg/fieldmapping"
 	"github.com/YunBright/cube/pkg/log"
 
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/appcfg"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/boot"
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/dataloader"
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/freshness"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/meta"
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/refreshschedule"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/source"
 	"github.com/YunBright/cube/semantic-layers/sixun/internal/source/ysx"
 
 	models "github.com/YunBright/cube/sixun-models"
-	categorymodel "github.com/YunBright/cube/sixun-models/category"
-	custtypemodel "github.com/YunBright/cube/sixun-models/cust_type"
-	membermodel "github.com/YunBright/cube/sixun-models/member"
-	membertypemodel "github.com/YunBright/cube/sixun-models/member_type"
-	productmodel "github.com/YunBright/cube/sixun-models/product"
-	salemodel "github.com/YunBright/cube/sixun-models/sale_detail"
-	salewaymodel "github.com/YunBright/cube/sixun-models/sale_way"
-	suppliermodel "github.com/YunBright/cube/sixun-models/supplier"
 
 	"github.com/gin-gonic/gin"
 )
@@ -78,8 +65,24 @@ type appConfig struct {
 		// supplier.supply_way(源列 sale_way)指向它;
 		// 实测两个库的供应商全部有值(ysx 219 / hbposv7 300)。
 		TableSaleWay string `yaml:"table_sale_way"`
-		TableSale    string `yaml:"table_sale"`
-		TableStock   string `yaml:"table_stock"`
+		// TableSaleDetail 是**逐笔销售流水**表(t_rm_saleflow,两个 family 同名同表)。
+		//
+		// ⚠️ 2026-10-22:旧的 `table_sale` 键**退役**了 ——
+		//   它配的是旧的(duck)sale_detail 路径:ysx t_mp_saleflow 实测 **0 行**,
+		//   hbposv7 t_rm_order_saleflow 实测**表根本不存在** ⇒ 两个库都取不到数据,
+		//   而症状是"查询 200 OK 返回空数组",零报错。
+		//   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐
+		//   (键名与 model 名不一致 = 少接一条,该 model 静默不可查)。
+		TableSaleDetail string `yaml:"table_sale_detail"`
+		TableStock      string `yaml:"table_stock"`
+		// ---- 2026-10-22 新增的 live model 源表 ----
+		// 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
+		// 表名是 family 私有事实,所以只在这里配,不进共享的 sixun-models/
+		// (见 AGENTS.md §4「live 表名来源」)。
+		TablePayflow       string `yaml:"table_payflow"`
+		TablePromotionPlan string `yaml:"table_promotion_plan"`
+		TableSupplierItem  string `yaml:"table_supplier_item"`
+		TableBranchPrice   string `yaml:"table_branch_price"`
 		// TableMember 是会员卡档案表(t_rm_vip_info)。
 		// 实测 ysx/hbposv10 = 4128 行 / hbposv7/hbposepro = 2642 行。
 		TableMember string `yaml:"table_member"`
@@ -132,60 +135,20 @@ type appConfig struct {
 		// 上限过小会静默丢商品,表现为"部分条码扫不出来"且无任何报错。
 		RowLimits map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
-
-	// Refresh 是刷新策略(增量为主 + 夜间全量校准)。
-	Refresh struct {
-		// Incremental 是 model 名 → **源库侧**的增量时间列名(如 modify_date)。
-		//
-		// 用源库列名而非 canonical 名,因为 WHERE 打在源库上。
-		// 未列出的 model 自动走全量(例如 category 根本没有时间列)。
-		//
-		// 留空 map = 全部走全量,等于回到改造前的行为 —— 这是一个安全的退路,
-		// 不是错误配置。
-		Incremental map[string]string `yaml:"incremental"`
-		// IncrementalFallback 是 model 名 → 增量时间**回退列**(如 build_date),
-		// 拼成 `COALESCE(<incremental>, <fallback>) >= 水位`。
-		//
-		// 为什么需要:modify_date 为 NULL 意味着"建档后从未被修改过",那这条
-		// 记录最后一次被写入的时间就是 build_date。实测 ysx 近 7 天新建的 45 个
-		// 商品里 36 个 modify_date 是 NULL —— 单靠 modify_date 会漏掉它们。
-		// 实测 modify_date < build_date 的行数为 0,所以不会引入时间倒流。
-		//
-		// 留空 = 退化成单列比较,行为与配置前完全一致。
-		// ⚠️ 它**不能替代夜间全量校准**:hbposv7 有 12607 行商品两个时间列
-		//    同时为 NULL,那些行任何增量列都拉不到。
-		IncrementalFallback map[string]string `yaml:"incremental_fallback"`
-		// FullSchedule 是夜间全量校准的调度式,交给 Dapr 原样解析。
-		// 默认 "0 0 3 * * *"(6 字段 cron,每天 03:00:00)。
-		//
-		// ⚠️ 必须 6 个字段:2026-10-10 真机实测,5 字段会被 Dapr 拒绝
-		//    (HTTP 500: expected exactly 6 fields),而**启动不会因此失败**——
-		//    主 job 不受影响、mode 照样 dapr-job,只是夜间校准再也不会发生,
-		//    增量漏掉的数据永远没有兜底。refreshschedule.validateSchedule 会在
-		//    登记前拦一道,让这件事至少变成一条明确的启动日志。
-		//
-		// 为什么不用 "@every 24h":那是"从登记那一刻起每 24 小时",
-		// 进程重启就漂移,永远对不上"夜间 3 点"这个语义。
-		FullSchedule string `yaml:"full_schedule"`
-	} `yaml:"refresh"`
 }
 
-// fullSchedule 返回全量校准的调度式,未配置时给默认的每日 3 点。
-func (c appConfig) fullSchedule() string {
-	if s := strings.TrimSpace(c.Refresh.FullSchedule); s != "" {
-		return s
-	}
-	return refreshschedule.DefaultFullSchedule
-}
-
-// schemaMeta 是 dataloader.Meta 的本地别名 —— 真正的定义在共用包里,
-// 两个 family 用同一个类型,加载与重拉逻辑才不可能漂移。
-type schemaMeta = dataloader.Meta
-
-type modelFetcher struct {
-	name  string
-	fetch func(context.Context) ([]map[string]any, error)
-	build func(ctx context.Context, db *duckdb.Engine, rawSQL string) error
+// schemaMeta 是本实例的 model 元信息。
+//
+// ⚠️ 2026-10-23:去 DuckDB 之后**没有"物化出来的表"了** ⇒ 不再有列清单
+// (Columns)与预聚合物化器 —— 只剩 schema / 列名映射 / live 源。
+type schemaMeta struct {
+	Schema *cubeschema.Model
+	// Mapper 把 schema 的 canonical 列名反查成源库列名(live 透传时用)。
+	Mapper *fieldmapping.Mapper
+	// Live 为真表示该 model 不落盘,查询时透传源库。
+	Live bool
+	// SourceTable 是 live model 的源(表名 **或 SQL 片段**),来自实例 config。
+	SourceTable string
 }
 
 // /query 4xx 子码常量 —— gateway 据此映射到 apierror.Code。
@@ -211,7 +174,38 @@ func writeErr(c *gin.Context, status int, code, msg string, details map[string]a
 //
 // storage: live 的 model 不落 DuckDB,查询时把 schema 编译成 T-SQL 直接打源库。
 // 表名只可能来自 config —— 这是 family 私有事实,共享 schema 里不能有。
-func liveTables(cfg *appConfig) map[string]string {
+//
+// # ⚠️ 两种"源"形态
+//
+//   - **普通表名**(category / supplier / member_type / cust_type …):直接用。
+//   - **SQL 片段**(member / sale_way):整段 SQL,当**派生表**用。
+//     片段的列名必须是**源列名**(含 mapping 里的 memb_\* 派生别名),
+//     编译器会把 canonical 名重写成它们 ⇒ 列名对得上。
+func liveTables(cfg *appConfig) (map[string]string, error) {
+	// 会员模型:卡内余额 / 累计消费 / 消费次数是"主表 JOIN 三张流水表"算出来的,
+	// 源库里**没有这几列** ⇒ live 路必须用片段在源库侧算。
+	memberFragment, err := source.MemberFromFragment(source.MemberTables{
+		Member:               cfg.Source.TableMember,
+		Consume:              cfg.Source.TableMemberConsume,
+		Paylist:              cfg.Source.TableMemberPaylist,
+		SavingPlus:           cfg.Source.TableMemberSavingPlus,
+		StoredPayType:        cfg.Source.MemberStoredPayType,
+		PointsAccumulatedCol: cfg.Source.MemberPointsAccumulatedCol,
+		PointsUsedCol:        cfg.Source.MemberPointsUsedCol,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("member live 片段: %w", err)
+	}
+	// sale_way:t_bd_base_code 是**通用**基础代码字典(职称/民族/学历/品牌/销售方式…30+ 行),
+	// 而 code_id 在不同 type_no 下**会重复** ⇒ 不过滤的话 code_id→code_name 的
+	// 对应关系是错的(去 DuckDB 那条路是在 loader 里过滤的,live 路必须写在 SQL 里)。
+	//
+	// ⚠️ 用 `SELECT *` 而不是写死列名:code_id / code_name 是**源列名**,
+	// 两个 family 可能不同 ⇒ 由 mapping 去重写更稳。
+	saleWayFragment := ""
+	if t := strings.TrimSpace(cfg.Source.TableSaleWay); t != "" {
+		saleWayFragment = "(SELECT * FROM " + t + " WHERE type_no = 'SW')"
+	}
 	return map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLine,
@@ -228,12 +222,38 @@ func liveTables(cfg *appConfig) map[string]string {
 		"promotion":       cfg.Source.TablePromotion,
 		// 商品条码补充表(2026-10-21)。live model 不落 DuckDB,查询时透传源库。
 		"item_barcode": cfg.Source.TableItemBarcode,
-	}
+		// 商品档案(2026-10-22 改成 live)。
+		//
+		// ⚠️ 为什么必须 live:pkg/cubequery/join.go 的 checkStorage 拒绝任何
+		// 非 live 的 join 两侧,而后台的「商品销售流水」查询**同时**要
+		// sale_detail.* 与 product.* ⇒ sale_detail → product 必须 live → live。
+		// 顺带把 stock → product 这条 join 从「必然被拒」变成可用。
+		"product": cfg.Source.TableProduct,
+		// ---- 2026-10-22 新增的五个 live model ----
+		// 逐笔销售流水 / 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
+		//
+		// ⚠️ 键名必须与 model 名一致:少一条就是「该 model 静默不可查」
+		// (main.go 只打一行 Info 日志然后 continue,healthz 照样全绿)。
+		"sale_detail":    cfg.Source.TableSaleDetail,
+		"payflow":        cfg.Source.TablePayflow,
+		"promotion_plan": cfg.Source.TablePromotionPlan,
+		"supplier_item":  cfg.Source.TableSupplierItem,
+		"branch_price":   cfg.Source.TableBranchPrice,
+		// ---- 2026-10-23:最后 6 个 model 也改成 live ⇒ **一个都不落 DuckDB** ----
+		// 档案/字典类(供应商/分类/客户类别/会员类别)体量小(219~4128 行),
+		// 之前留 duck 只是因为"档案变化少"—— 而"变化少"恰恰是**最该实时**的
+		// (新建的商品/供应商要立刻能查到,不该等一次同步)。
+		"supplier":   cfg.Source.TableSupplier,
+		"category":   cfg.Source.TableCategory,
+		"cust_type":  cfg.Source.TableCustType,
+		"member_type": cfg.Source.TableMemberType,
+		"sale_way":   saleWayFragment,
+		// ⚠️ member 是**片段**不是表名(派生列要 JOIN 三张流水表)。
+		"member": memberFragment,
+	}, nil
 }
 
 func main() {
-	ctx := context.Background()
-
 	cfg, err := boot.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -276,7 +296,11 @@ func main() {
 	}
 	lg.Info("loading schemas", "origin", "embedded", "models", modelNames)
 	schemas := map[string]*schemaMeta{}
-	live := liveTables(&appCfg)
+	live, err := liveTables(&appCfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "live tables:", err)
+		os.Exit(1)
+	}
 	for _, name := range modelNames {
 		schemaBytes, err := models.ReadSchema(name)
 		if err != nil {
@@ -293,7 +317,7 @@ func main() {
 			lg.Info("mapping missing", "model", name)
 			continue
 		}
-		sm := &schemaMeta{Schema: schema, Columns: mapper.TargetsWithType(), Mapper: mapper}
+		sm := &schemaMeta{Schema: schema, Mapper: mapper}
 		if schema.EffectiveStorage() == cubeschema.StorageLive {
 			src := live[name]
 			if src == "" {
@@ -316,7 +340,6 @@ func main() {
 		TableCategory:   appCfg.Source.TableCategory,
 		TableCustType:   appCfg.Source.TableCustType,
 		TableSaleWay:    appCfg.Source.TableSaleWay,
-		TableSale:       appCfg.Source.TableSale,
 		TableMember:     appCfg.Source.TableMember,
 		TableMemberType: appCfg.Source.TableMemberType,
 		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
@@ -335,108 +358,28 @@ func main() {
 	defer conn.Close()
 	lg.Info("SQL Server connected")
 
-	duckPath := cfg.ResolveDuckDBPath()
-	if err := os.MkdirAll(filepath.Dir(duckPath), 0o755); err != nil {
-		lg.Info("mkdir data dir failed", "err", err.Error())
-	}
-	db, err := duckdb.Open(duckPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "open DuckDB:", err)
-		fmt.Fprintln(os.Stderr, "hint: install libduckdb and set DUCKDB_LIBRARY_PATH")
-		os.Exit(1)
-	}
-	defer db.Close()
-	lg.Info("DuckDB opened", "path", duckPath)
-
-	// 只有 storage: duck 的 model 才物化进 DuckDB。
-	// live 的(settlement / settlement_line / purchase_sheet / purchase_sheet_line /
-	// sale_day / stock)走 queryHandler 实时透传,**不做任何原始数据同步**。
-	specs := []dataloader.Spec{
-		{Name: "supplier", Fetch: conn.FetchSupplier, Build: suppliermodel.Build},
-		{Name: "product", Fetch: conn.FetchProduct, Build: productmodel.Build},
-		{Name: "category", Fetch: conn.FetchCategory, Build: categorymodel.Build},
-		{Name: "cust_type", Fetch: conn.FetchCustType, Build: custtypemodel.Build},
-		{Name: "sale_way", Fetch: conn.FetchSaleWay, Build: salewaymodel.Build},
-		{Name: "sale_detail", Fetch: conn.FetchSaleDetail, Build: salemodel.Build},
-		// 会员卡档案 + 会员类别字典(2026-10-21)。
-		// member 走增量(config.yaml 的 refresh.incremental.member = modify_date,
-		// 回退列 oper_date);member_type 没有可用时间列 ⇒ 走全量(才 3 行)。
-		{Name: "member", Fetch: conn.FetchMember, Build: membermodel.Build},
-		{Name: "member_type", Fetch: conn.FetchMemberType, Build: membertypemodel.Build},
-	}
-	// fresh 记录每次物化的成败,喂给 /healthz。
-	// duck model 是快照,不是实时透传 —— 所以"这份数据有多旧"是必须能被外部看见的事实。
-	fresh := freshness.New(cfg.RefreshInterval())
-
-	// ⚠️ 变量名不能叫 loader:本文件已有一个 fieldmapping.Loader(从 mapping 资产
-	// 构造列映射的那个),重名会让其中一个被悄悄换掉 —— 而且它们的方法名不重叠,
-	// 编译器不会报错,只会在运行期变成"某个 Fetch 不重命名了"。
-	incrCols := source.IncrColsFromConfig(appCfg.Refresh.Incremental, appCfg.Refresh.IncrementalFallback)
-	dl := dataloader.NewLoader(db, schemas, specs, conn, incrCols, lg, fresh)
-	incrementalReload := func() []string { return dl.Run(ctx, dataloader.ModeIncremental) }
-	fullReload := func() []string { return dl.Run(ctx, dataloader.ModeFull) }
-
-	// ⚠️ 启动必须走**全量**,哪怕 DuckDB 文件里已经有数据。
+	// ⚠️ 2026-10-23:**全仓去 DuckDB** —— 全部 model 都是 live(查询时透传源库),
+	// **不保留任何本地副本**,也不做任何原始数据同步(见 AGENTS.md §4.1)。
 	//
-	// 理由有三个,任何一个都足够:
-	//   1. 首次运行时连水位表都没有,没有基线可增量;
-	//   2. 水位表可能与 _raw 表**不同步** —— 比如上一版代码是全量刷的,
-	//      水位却停在很久以前,增量会把几万行重拉一遍;更糟的是水位**超前**,
-	//      那段时间的变更会被永久跳过,而且没有任何报错;
-	//   3. 部署之后就应该立刻拿到完整数据,而不是"等下一次增量补齐"。
-	// 全量成功后会顺带推进水位,后续增量才是快的那个。
-	registeredModels := fullReload()
-
-	// live model 不拉数据,但必须注册:它们是可查询的 model,
-	// 漏注册会让 gateway /healthz 与 MODEL_NOT_FOUND 响应暴露成"这个 source 没有该能力"。
+	// 以前这里是:开 .duckdb 文件 → 按 model 拉数物化 → 登记刷新 job → 夜间全量校准。
+	// 那些机制一个都不需要了,而且每一个都会"悄悄坏掉"
+	// (副本过期了而报告照样正常 —— 这是缓存最贵的一种失败)。
+	registeredModels := make([]string, 0, len(schemas))
 	for name, m := range schemas {
-		if m.Live {
-			lg.Info("live model, 查询时透传源库", "model", name, "source_table", m.SourceTable)
-			registeredModels = append(registeredModels, name)
-		}
+		// live model 不拉数据,但必须注册:它们是可查询的 model,
+		// 漏注册会让 gateway /healthz 与 MODEL_NOT_FOUND 响应暴露成"这个 source 没有该能力"。
+		lg.Info("live model, 查询时透传源库", "model", name, "source_table", m.SourceTable)
+		registeredModels = append(registeredModels, name)
 	}
 	sort.Strings(registeredModels)
-
-	// 定时刷新:dapr Scheduler 优先,登记失败自动回退进程内 ticker。
-	// 两种模式同时可用 —— 在途守卫保证不会重叠写 DuckDB。
-	//
-	// 两个 job:
-	//   cube-refresh       @every <间隔>   增量,只拉水位之后的变更行
-	//   cube-refresh-full  <full_schedule>  夜间全量校准,兜住增量天然会漏的那些
-	//
-	// 只有主 job(cube-refresh)决定 mode 与 ticker:校准 job 登记失败不该让
-	// 数据停止刷新,那属于 healthz 的 jobs 段要报告的事,不是 mode 的事。
-	jobs := []refreshschedule.JobSpec{
-		{
-			Name:     refreshschedule.DefaultJobName,
-			Schedule: "@every " + cfg.RefreshInterval().String(),
-			Reload:   incrementalReload,
-			Fallback: true,
-		},
-		{
-			Name:     refreshschedule.DefaultFullJobName,
-			Schedule: appCfg.fullSchedule(),
-			Reload:   fullReload,
-		},
-	}
-	sched := refreshschedule.Setup(ctx, cfg.SidecarHTTPURL, jobs, lg)
-	sched.Start(ctx, lg)
-	lg.Info("refresh driver ready",
-		"mode", string(sched.Mode()),
-		"incremental_models", len(appCfg.Refresh.Incremental),
-		"full_schedule", appCfg.fullSchedule())
 
 	go registerToGateway(cfg, registeredModels, lg)
 	go watchShutdown(cfg, lg)
 
 	engine := gin.New()
 	engine.Use(gin.Logger(), gin.Recovery())
-	engine.POST("/query", queryHandler(db, conn, schemas, registeredModels, cfg.AppID, lg))
-	engine.GET("/healthz", cfg.HealthHandler(registeredModels, fresh, sched.StatsAny))
-	// dapr Scheduler 在到点时 POST /job/<name> 触发刷新。
-	// **两种模式下都要注册**:job 记录存活于 Scheduler 的 etcd,跨重启仍在;
-	// 若这次启动登记失败,旧 job 仍会来触发,没有这个端点会持续 404。
-	engine.POST("/job/:jobName", sched.JobHandler())
+	engine.POST("/query", queryHandler(conn, schemas, registeredModels, cfg.AppID, lg))
+	engine.GET("/healthz", cfg.HealthHandler(registeredModels))
 	engine.GET("/meta", metaHandler(schemas, cfg.AppID, lg))
 
 	lg.Info("starting HTTP server", "addr", cfg.Port, "models", registeredModels)
@@ -512,7 +455,7 @@ func storageOf(m *schemaMeta) string {
 // queryHandler 完整版(支持多 measure / dimension / filter)。
 //
 // 4xx 响应一律带 "code" 子码,供 gateway 映射到 apierror.Code。
-func queryHandler(db *duckdb.Engine, conn liveQuerier, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
+func queryHandler(conn liveQuerier, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		body, err := c.GetRawData()
 		if err != nil {
@@ -546,22 +489,17 @@ func queryHandler(db *duckdb.Engine, conn liveQuerier, schemas map[string]*schem
 			return
 		}
 
-		// SQL 拼装走共用包,按 model 的 storage 分两条路径:
-		//   duck → cubequery.Build     查 DuckDB(枚举/档案类)
-		//   live → cubequery.BuildTSQL 编译成 T-SQL 直接打源库(明细/实时)
-		// 两条路径共用同一份 schema、同一套 filter 语义与 RTRIM 规则 ——
-		// 见 pkg/cubequery/build.go 顶部:这段逻辑曾各 family 各写一份,
-		// hbposv7 那份残缺实现会**静默丢弃 filters**,导致查询返回错误商品。
-		var built *cubequery.Result
-		if meta.Live {
-			// 传 registry 是为了支持跨 model 的 joins:查询里出现
-			// `settlement.document_type` 这样的成员时,编译器要能查到
-			// settlement 的 schema / 源表名 / mapping,才能把 JOIN 拼出来。
-			built, err = cubequery.BuildTSQLJoin(q, meta.Schema, meta.SourceTable, meta.Mapper,
-				registryOf(schemas, conn))
-		} else {
-			built, err = cubequery.Build(q, meta.Schema)
-		}
+		// SQL 拼装走共用包:live model 编译成 T-SQL 直接打源库。
+		//
+		// ⚠️ 2026-10-23 去 DuckDB 之后**只有这一条路**了 ——
+		// 以前是两条(duck → cubequery.Build 查 DuckDB,live → BuildTSQL 打源库),
+		// 现在统一走 BuildTSQLJoin。
+		//
+		// 传 registry 是为了支持跨 model 的 joins:查询里出现
+		// `settlement.document_type` 这样的成员时,编译器要能查到
+		// settlement 的 schema / 源表名 / mapping,才能把 JOIN 拼出来。
+		built, err := cubequery.BuildTSQLJoin(q, meta.Schema, meta.SourceTable, meta.Mapper,
+			registryOf(schemas, conn))
 		if err != nil {
 			var be *cubequery.BuildError
 			if errors.As(err, &be) {
@@ -609,23 +547,12 @@ func queryHandler(db *duckdb.Engine, conn liveQuerier, schemas map[string]*schem
 			return
 		}
 
-		var rows []map[string]any
-		if meta.Live {
-			rows, err = conn.QueryLive(c.Request.Context(), built.SQL, built.Args...)
-			if err != nil {
-				lg.Info("source query failed", "model", modelName, "sql", built.SQL, "err", err.Error())
-				writeErr(c, http.StatusInternalServerError, subCodeInternalError,
-					"source: "+err.Error(), map[string]any{"sql": built.SQL})
-				return
-			}
-		} else {
-			rows, err = db.QueryMap(built.SQL, built.Args...)
-			if err != nil {
-				lg.Info("duckdb query failed", "sql", built.SQL, "err", err.Error())
-				writeErr(c, http.StatusInternalServerError, subCodeInternalError,
-					"duckdb: "+err.Error(), map[string]any{"sql": built.SQL})
-				return
-			}
+		rows, err := conn.QueryLive(c.Request.Context(), built.SQL, built.Args...)
+		if err != nil {
+			lg.Info("source query failed", "model", modelName, "sql", built.SQL, "err", err.Error())
+			writeErr(c, http.StatusInternalServerError, subCodeInternalError,
+				"source: "+err.Error(), map[string]any{"sql": built.SQL})
+			return
 		}
 
 		lg.Info("query ok", "model", modelName, "storage", storageOf(meta), "sql", built.SQL, "rows", len(rows))

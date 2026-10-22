@@ -1,40 +1,118 @@
-# hbposv7 sale_detail mapping
+# sale_detail mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
 #
-# 注意:思迅7pro 的 t_rm_order_saleflow 没有 order_status 字段,
-#       schema.yaml 里 order_status dimension 用 SQL:
-#         CASE WHEN quantity < 0 THEN 'R' ELSE 'S' END
+# 源表 t_rm_saleflow —— 逐笔销售流水。
 #
-# amount 是 measure,用 SQL 算 SUM(unit_price * quantity),
-# 不在这里映射。
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      3,327,514 行 / 29 列
+#   hbposv7(hbposepro) 1,743,882 行 / 32 列
+#   共有 25 列,本文件**只映射共有列** ——
+#   少映射一列 → 该 family 查不了;多映射一列 → 另一边 column not found。
+#
+# ⚠️ 不共有的列(有意不映射):
+#   仅 ysx:n_stan / flowno_type / ret_qnty / cic_sheet_no
+#   仅 hbposv7:paysum_flag / voucher_no / pr_spec_* / ot_spec_* / item_no_Fresh
+#
+# ⚠️ 两库宽度不同的 char 列(都补空格,查询层统一 RTRIM):
+#   flow_no      ysx char(14) / hbposv7 char(20)
+#   flowno_rand  ysx char(14) / hbposv7 varchar(20)
+#   spec_sheet_no ysx char(14) / hbposv7 char(20)
+#   item_no      两库都是 char(20)(ysx 实测 13 字符 + 7 尾随空格)
+#
+# ⚠️ **type 写的是源库物理类型**,不是"业务类型":
+#   char/varchar → string;numeric → decimal / int;datetime → datetime。
+#   金额类带 unit: yuan。
 version: 1
 model: sale_detail
 
 mappings:
-  - source: flow_id             # 流水 ID numeric(主键)
+  - source: flow_id
     target: id
     type: int
 
-  - source: flow_no             # 流水号 char(单据号)
-    target: flow_no
+  - source: flow_no
+    target: order_no
     type: string
 
-  - source: branch_no           # 分店编号 char
-    target: branch_id
+  - source: flowno_rand
+    target: random_order_no
     type: string
 
-  - source: item_no             # 商品编号 char → 指向 product.id
+  - source: branch_no
+    target: branch_no
+    type: string
+
+  - source: item_no
     target: product_id
     type: string
 
-  - source: sale_price          # 售价 numeric
-    target: unit_price
+  # ---- 价与量(行上的价,不是聚合口径)----
+  - source: source_price
+    target: source_price
+    type: decimal
+
+  - source: sale_price
+    target: sale_price
     type: decimal
     unit: yuan
 
-  - source: sale_qnty           # 销售数量 numeric(负数=退货)
-    target: quantity
+  - source: sale_qnty
+    target: qty
     type: decimal
 
-  - source: oper_date           # 销售时间 datetime
+  - source: sale_money
+    target: sale_amount
+    type: decimal
+    unit: yuan
+
+  - source: pref_amt
+    target: discount_amount
+    type: decimal
+    unit: yuan
+
+  - source: in_price
+    target: cost_price
+    type: decimal
+    unit: yuan
+
+  # ---- 人 / 柜台 / 销售方式 ----
+  - source: sell_way
+    target: sale_way
+    type: string
+
+  - source: oper_id
+    target: cashier_id
+    type: string
+
+  - source: sale_man
+    target: salesman_id
+    type: string
+
+  - source: counter_no
+    target: counter_no
+    type: string
+
+  # ---- 时间 ----
+  - source: oper_date
     target: sold_at
+    type: datetime
+
+  # ---- 其它(两库共有)----
+  - source: remote_flag
+    target: online_flag
+    type: string
+
+  - source: shift_no
+    target: shift_no
+    type: string
+
+  - source: posid
+    target: pos_id
+    type: string
+
+  - source: spec_sheet_no
+    target: spec_sheet_no
+    type: string
+
+  - source: uptime
+    target: uptime
     type: datetime

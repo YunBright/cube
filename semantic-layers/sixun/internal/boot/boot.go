@@ -24,14 +24,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-
-	"github.com/YunBright/cube/semantic-layers/sixun/internal/freshness"
 )
 
 // appIDRE 限制 dapr app-id / CUBE_APP_ID 的字符集。
@@ -71,27 +68,7 @@ type Config struct {
 	// GatewayURL 是 cube-gateway 的 HTTP base URL(env CUBE_GATEWAY_URL);默认 http://localhost:8080。
 	GatewayURL string
 	// SidecarHTTPURL 是本机 dapr sidecar 的 HTTP base(env DAPR_HTTP_PORT)。
-	// 登记 dapr job 时要用 —— sidecar 的 jobs API 在它上面。
-	//
-	// 注意:这个端口**不是**应用端口。cube 的应用在 :8083,
-	// sidecar 的 jobs API 在 :3003。打错会拿到 connection refused。
 	SidecarHTTPURL string
-	// RefreshEvery 是 storage: duck 模型的定时重拉间隔(env CUBE_REFRESH_EVERY)。
-	//
-	// duck model 是**启动时的快照**,不重拉就一直是旧值(门店改了商品价、
-	// 改了供应商名都要重启才生效)。live model 查询时透传源库,本来就没有快照,
-	// 不参与这个间隔。
-	//
-	// 默认 30m;设 0 关闭定时重拉(退化成"只在启动时拉一次")。
-	RefreshEvery time.Duration
-}
-
-// RefreshInterval 返回重拉间隔;未配置时给一个合理的默认。
-func (c *Config) RefreshInterval() time.Duration {
-	if c.RefreshEvery == 0 {
-		return 30 * time.Minute
-	}
-	return c.RefreshEvery
 }
 
 // Load 读环境变量,校验,派生 Family/Version/Instance / DaprAppID。
@@ -158,39 +135,22 @@ func Load() (*Config, error) {
 	}
 
 	// dapr sidecar 的 HTTP 端口。dapr run 会注入 DAPR_HTTP_PORT;
-	// 非 dapr 环境(本地裸跑)没这个变量,留空 —— 刷新会自动退回进程内 ticker。
+	// 非 dapr 环境(本地裸跑)没这个变量,留空。
 	sidecarHTTPURL := ""
 	if p := strings.TrimSpace(os.Getenv("DAPR_HTTP_PORT")); p != "" {
 		sidecarHTTPURL = "http://127.0.0.1:" + p
 	}
 
-	// 重拉间隔。写成 duration("30m" / "1h");**配错必须报错**而不是退回默认 ——
-	// "我以为设了 1 小时,其实拼错了被忽略"会让人一直看着旧数据排查半天。
-	refreshEvery := 30 * time.Minute
-	if raw := strings.TrimSpace(os.Getenv("CUBE_REFRESH_EVERY")); raw != "" {
-		d, err := time.ParseDuration(raw)
-		if err != nil {
-			return nil, fmt.Errorf("boot: CUBE_REFRESH_EVERY %q 不是合法 duration(如 30m / 1h / 0): %w", raw, err)
-		}
-		if d < 0 {
-			return nil, fmt.Errorf("boot: CUBE_REFRESH_EVERY %q 不能为负(要关闭请显式写 0)", raw)
-		}
-		refreshEvery = d
-	}
-
 	return &Config{
-		AppID:      appID,
-		DaprAppID:  daprAppID,
-		Family:     parts[0],
-		Version:    parts[1],
-		Instance:   parts[2],
-		Port:       port,
-		DuckDBPath: os.Getenv("CUBE_DUCKDB_PATH"),
+		AppID:     appID,
+		DaprAppID: daprAppID,
+		Family:    parts[0],
+		Version:   parts[1],
+		Instance:  parts[2],
+		Port:      port,
 		GatewayURL: gatewayURL,
 
 		SidecarHTTPURL: sidecarHTTPURL,
-
-		RefreshEvery: refreshEvery,
 	}, nil
 }
 
@@ -206,40 +166,23 @@ func daprAppIDSource() string {
 	return "derived"
 }
 
-// DefaultDuckDBPath 返回默认 DuckDB 文件路径。
-//
-// 约定: ./data/<AppID>.duckdb,目录会在调用方负责创建(本函数只返回路径)。
-func (c *Config) DefaultDuckDBPath() string {
-	return filepath.Join("./data", c.AppID+".duckdb")
-}
-
-// ResolveDuckDBPath 优先用 CUBE_DUCKDB_PATH,空时退回 DefaultDuckDBPath。
-func (c *Config) ResolveDuckDBPath() string {
-	if c.DuckDBPath != "" {
-		return c.DuckDBPath
-	}
-	return c.DefaultDuckDBPath()
-}
-
 // HealthHandler 返回 gin GET /healthz handler,JSON 包含 source / family /
 // version / models / status,方便外部探活 + 调试。
 //
-// fresh 为 nil 时不输出 data 段(便于不依赖它的调用方 / 测试)。
-// refresh 是一个**每请求现取**的 provider(通常是 sched.Stats 方法值),
-// 返回 nil 时不输出 refresh 段。
+// # ⚠️ 2026-10-23:去 DuckDB 之后**没有"数据新鲜度"可言**
 //
-// 为什么必须是 func 而不是值:写成 `HealthHandler(..., sched.Stats())` 时,
-// Stats() 在 handler 构造那一刻就求值了,之后 healthz 里的
-// triggered / skipped / data_age 会**永久冻结在启动时的值** ——
-// 看起来完全正常,只是再也不反映运行期。2026-10-10 实测踩过:
-// 日志里明明有 "dapr job triggered",healthz 却显示 triggered:0。
-// 取 any 是为了让 boot 不反向依赖 internal/refreshschedule ——
-// boot 是最底层的启动辅助,不该被拖进 dapr 依赖树。
+// 以前这个 handler 带三段:
+//   - data    = 本地副本的物化状态与年龄(freshness.Tracker)
+//   - refresh = 刷新 job 的统计(refreshschedule.Stats)
+//   - status  = 由 fresh 决定(从没加载过 / 上次有 model 失败 / 数据太旧 ⇒ degraded)
 //
-// status 由 fresh 决定:数据从没成功加载过、最近一次刷新有 model 失败、
-// 或数据年龄超过重拉间隔两倍,都是 "degraded"。
-// **degraded 不改 HTTP 状态码**(仍 200)—— 数据旧 ≠ 服务不可用,
-// 返 503 会让 dapr / gateway 把它当宕机从而拒绝查询,把降级问题升级成不可用问题。
+// 现在**一个都不落 DuckDB** ⇒ 没有副本、没有物化、没有刷新 job
+// ⇒ 那两段永远是空,status 也永远是 "ok"。
+//
+// ⚠️ 留着它们会是**假信号**:一个恒为 "ok" 的健康检查会让人以为
+// "有人在管数据的新鲜度",而实际上数据是实时透传的(新鲜度由源库保证)。
+// ⇒ 与其留一个恒定的 degraded/ok,不如直接删掉,并在 docs 里写清
+// "本实例不持有副本,数据新鲜度 = 源库的新鲜度"。
 //
 // wire / dapr 两套 id 同时回(运维需要):
 //   - source      == c.AppID    (URL / /register 用)
@@ -248,7 +191,7 @@ func (c *Config) ResolveDuckDBPath() string {
 // 想要"过期就硬失败"(拒绝对不健康 app 的 invoke),用 dapr 的
 // `--enable-app-health-check --app-health-check-path /healthz`,
 // 那是显式的运维选择,不是这里的默认行为。
-func (c *Config) HealthHandler(registeredModels []string, fresh *freshness.Tracker, refresh func() any) gin.HandlerFunc {
+func (c *Config) HealthHandler(registeredModels []string) gin.HandlerFunc {
 	startedAt := time.Now()
 	return func(ctx *gin.Context) {
 		body := gin.H{
@@ -258,20 +201,9 @@ func (c *Config) HealthHandler(registeredModels []string, fresh *freshness.Track
 			"version":     c.Version,
 			"models":      registeredModels,
 			"uptime":      time.Since(startedAt).String(),
-			"status":      "ok",
-		}
-		if fresh != nil {
-			snap := fresh.Snapshot()
-			body["status"] = snap.Status
-			if snap.Reason != "" {
-				body["reason"] = snap.Reason
-			}
-			body["data"] = snap
-		}
-		if refresh != nil {
-			if v := refresh(); v != nil {
-				body["refresh"] = v
-			}
+			// ⚠️ 恒为 "ok":本实例**不持有任何数据副本**,查询实时透传源库
+			// ⇒ 没有"数据过期"这回事。
+			"status": "ok",
 		}
 		ctx.JSON(200, body)
 	}

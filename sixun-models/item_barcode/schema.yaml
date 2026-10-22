@@ -1,0 +1,49 @@
+# item_barcode model - 思迅家族**商品条码补充表**(t_bd_item_barcode)
+#
+# # 这是什么
+#
+# 一个货号可以对应**多个条码**(一品多码)。本表专门维护这层关系:
+# item_barcode(条码)/ item_no(货号)/ other1(口味·规格变体说明)。
+#
+# 实测两库都有该表且同表同列;2026-10-21 实测 ysx 153 行
+# (只覆盖极少数商品 —— 绝大多数商品的条码就是 item_no 本身),
+# 所以本 model 是**补充**而不是全部。
+#
+# ⚠️ RTRIM:item_no / item_barcode 都是 char(20) 且**补空格规则两库不一致**
+#   (hbposv7 补、ysx 不补)⇒ 过滤条件必须包 RTRIM,否则静默漏命中。
+#
+# ⚠️ 本仓的 barcode 一词指**这件事**;而 product.sub_code(自编码/助记码)
+#   是**另一件事** —— 两者来源表、唯一性、维护方都不同,不要混用。
+#
+# # 为什么是 storage: live
+#
+# 商品条码随时会增删(改包装换码),落快照 = "某次刷新时刻的条码表",
+# 扫新包装码就会"查不到商品"。⇒ live。
+name: item_barcode
+sql_table: item_barcode
+storage: live
+
+dimensions:
+  - name: barcode
+    sql: RTRIM(barcode)
+    type: string
+    title: 条码
+    description: 源列 item_barcode(char(20))
+
+  - name: product_id
+    sql: RTRIM(product_id)
+    type: string
+    title: 货号
+    description: 源列 item_no(char(20))。与 product.id 同一套编码
+
+  - name: label
+    sql: RTRIM(label)
+    type: string
+    title: 说明
+    description: 源列 other1(varchar)。实测值是口味/规格变体说明('草莓味'/'桔子味')
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 条码行数

@@ -1,32 +1,50 @@
-# bearer-auth: JWT Bearer 验证中间件
+# ⚠️ 墓碑:本文件已在生产移除,**不要**放回 components 目录。
 #
-# 由 userd 的 sidecar 加载。所有到 userd 的请求都过这个中间件再转发到 app。
-# 配置 jwksURL 让 sidecar 自动拉公钥、验签、校验 exp/nbf/iss/aud。
+# ── 生产位置 ───────────────────────────────────────────────
+# 服务器：gyy (172.12.1.5)
+# 原路径：/opt/YunBright/cube/components/bearer-auth.yaml
+# 现位置：/opt/YunBright/cube/components/deprecated/bearer-auth.yaml.REMOVED-20261012-*
+# 真实内容留档见 deployer 仓 dapr/gyy/cube/components/deprecated/bearer-auth.yaml.REMOVED-20261012
+# 同步时间：2026-10-20
 #
-# ⚠️ 重要：Dapr middleware.http.bearer 只支持非对称算法 (RS256/ES256/...)。
-#    HS256 不能用。
+# ── 为什么它必须离开 components 目录 ───────────────────────
 #
-# 拆分模式注意（推荐）：userd 进程 + daprd sidecar 必须能在启动时拉到 jwksURL。
-#   - dev（本文件默认）：http://localhost:8081/.well-known/jwks.json
-#       —— 配合 `make login`（终端 A）+ `make dapr-userd`（终端 B）
-#   - prod k8s：用 kustomize/envsubst 把下面 value 替换成 authd-login Service DNS
-#       http://authd-login.default.svc.cluster.local:8081/.well-known/jwks.json
-#     部署清单见 deployments/deployment-example.yaml。
-apiVersion: dapr.io/v1alpha1
-kind: Component
-metadata:
-  name: auth-validator
-  namespace: default
-spec:
-  type: middleware.http.bearer
-  version: v1
-  metadata:
-    # JWKS 端点（login 服务暴露；拆分模式下走 authd-login Service）
-    - name: jwksURL
-      value: "http://172.12.1.1:8081/.well-known/jwks.json"
-    # token 的 iss 必须等于这个值
-    - name: issuer
-      value: "https://yb.baiyuan.com"
-    # token 的 aud 必须包含这个值
-    - name: audience
-      value: "userd"
+# 1. sidecar 的 `middleware.http.bearer` 组件 2026-10-12 移除 ——
+#    它会打断 pubsub 的 /dapr/subscribe(订阅发现)。
+#    应用层验签(authkit/authn)已经接管。
+#
+# 2. 它是**自动加载**的:components 目录里任何 Component YAML 都会被 daprd 加载,
+#    不需要任何 unit 显式引用它 ⇒ 只要文件还在目录里,sidecar 就会去拉 JWKS。
+#
+# 3. 拉不到 JWKS = **daprd 直接 fatal 退出**:
+#      "Fatal error from runtime: process component auth-validator error:
+#       ... failed to fetch JWKS: <旧 auth-login 端口 :8081 上的 jwks.json>:
+#       connection refused"
+#    ⇒ 整个 cube app 跟着死 ⇒ systemd 反复重启(实测 30 秒一轮)。
+#
+# ── 2026-10-20 实测事故 ──────────────────────────────────
+#
+# auth 合并(auth-login 进程退出,app 端口 8081 → 8082)之后,这个文件里的
+# jwksURL 指向了**已经不存在的 :8081** ⇒ cube 三个服务
+# (cube-gateway / cube-sixun-ysx / cube-sixun-hbposv7)集体崩溃循环,
+# catalog / inventory / sales-agg 的契约测试全线 502。
+#
+# ⇒ 修法不是"把 URL 改对",而是**把这个组件从 components 目录里移出去**
+#   (与 supertrade 其它服务已有的 .REMOVED-...GONE 留档同一处理)。
+#
+# ── 本文件为什么还留在仓里 ─────────────────────────────────
+#
+# 它是**墓碑**:即使有人把仓里的 components 目录整体同步回服务器,
+# 这个文件也**不是**合法的 Dapr Component(没有 apiVersion/kind),
+# daprd 会跳过它 ⇒ 不会把那个 fatal 组件复活。
+#
+# ⚠️⚠️ **本仓(cube)的那一份尤其要改**:
+# cube 的 goreleaser 归档里**包含** `components/` 目录 ⇒ 每次部署 cube
+# 都会把归档里的 components 覆盖到服务器 ⇒ 只要归档里还是活组件,
+# **每次部署都会把 cube 再打死一次**。
+# (2026-10-20 实测:部署 → components 被覆盖 → cube 三个服务崩溃循环。)
+#
+# 回归锁:deployer 仓 tests/config/dapr_sync_test.go
+#   · TestNoBearerComponentInComponentsDir —— components 目录里不许有 middleware.http.bearer
+#   · TestNoComponentReferencesDeadAuthPort —— components 目录里不许指向已下线的 :8081
+# ──────────────────────────────────────────────────────────

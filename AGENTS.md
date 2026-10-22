@@ -79,12 +79,76 @@ cube/
 | 增量开关配置位置 | 增量列在 **`config.yaml` 的 `refresh.incremental`**(源库列名),主键在 **schema.yaml 的 `primary_key`**(canonical 名)。两者职责分离,且两个 family 的 config 独立 | ❌ 写进 mapping.yaml(那只是字段映射)、❌ 两个 family 漏改一个 |
 | 启动首次加载 | **启动必须走全量**(三个理由:首次无水位、水位表可能与 `_raw` 不同步导致超前=永久跳过、部署后应立刻有完整数据);无水位时增量会**自动 bootstrap 全量**并写回水位 | ❌ 启动直接走增量(超前水位 = 永久丢数据) |
 | char 补空格 | 在**查询层**统一 `RTRIM`(SELECT 与 filter 两侧都包,GROUP BY 用裸列),已固化在 `pkg/cubequery` | ❌ 加载层 trim、❌ 调用方 LIKE/trim 兜底 |
-| 存储分层 | schema.yaml 里 `storage: live` = **透传源库不落盘**,`storage: duck` = 物化进 DuckDB。**明细/实时(settlement、settlement_line、purchase_sheet(_line)、sale_day、stock)走 live;product / supplier / category / sale_detail 留 duck** | ❌ cube 做原始数据同步、❌ 把明细灌进 DuckDB(cube 只存聚合结果 + 枚举/档案) |
+| 存储分层 | **全部 model 一律 `storage: live`**(2026-10-23 起):查询时把 schema 编译成 T-SQL 直打源库,**不落任何本地副本**。live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 新增 `storage: duck` 的 model、❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
+| 增量刷新 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准" | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加 DuckDB 水位表 |
 | live 表名来源 | live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
 | join 解析 | **只走 schema 显式声明的 joins**,BFS 找最短路径;链深度不限;列名必须 model 别名限定(`settlement_line.id`);`live → duck` 不可 join,编译期拒绝 | ❌ JIT 自动关联、❌ 把 model 名当物理表名(2026-10-09 真库验证抓到:JOIN 用了 model 名当表名,而单测的假 registry 恰好同名,所以 40+ 单测全绿) |
 | 扇出防护 | join 链上存在 `one_to_many` 时,**被放大一侧的 measure → 400**,错误信息指出该用多的那一侧;**不做链式传播**(曾误加,把唯一正确的用法一起拦了) | ❌ 静默返回翻倍的数字 |
 | 旧版 SQL Server 兼容 | **能力探测而非配置**:`source.DetectLegacyTSQL` 读 `SERVERPROPERTY('ProductMajorVersion')`,< 12 走 2008 方言(`DATEADD(month, DATEDIFF(month,0,d),0)` + `ROW_NUMBER()`),探测失败保守返 true | ❌ 硬编码 `DATEFROMPARTS` / `OFFSET-FETCH`(两个生产库都是 **2008 R2**,直接语法错)、❌ 用配置开关描述能力(配置会骗人) |
 | 只读约束 | `QueryLive` 前置 `source.AssertReadOnly`;live model 的 `preagg.Build` 是显式守卫,永远返错 | ❌ 给 live model 接 fetchers(会静默同步百万行) |
+
+## 4.1 ⛔ 禁止的架构:不要给 cube 加数据缓存 / 原始数据同步
+
+> **这是硬规矩,不是建议。**
+> 本节写给**后来的每一个 AI / 人**:你要动 cube 的存储层之前,先把这一节读完。
+
+### 4.1.1 规矩本身
+
+| ❌ 不许做 | 为什么 |
+|---|---|
+| 新增 `storage: duck` 的 model | cube 只做**语义层**:查询时把 schema 编译成 T-SQL 直打源库 |
+| 给 cube 加任何**本地数据副本**(DuckDB / SQLite / 内存表 / 本地文件) | 副本 = 第二份真相 = 必然滞后 |
+| 给 cube 加**原始数据同步**(定时拉源表 → 落盘) | cube 不是数仓;源库是**生产库、只读**,不该被无谓地压 |
+| 加"增量刷新 job / 水位表 / 夜间全量校准 / 启动全量重拉" | 全部 model 都 live ⇒ 没有副本 ⇒ 这些机制**一个都不需要** |
+| 给 live model 加 `preagg.go`(预聚合物化) | 同上;预聚合是副本的一种 |
+| 把"提速"当理由引入缓存 | 实测源库直查的延迟**已经够用**(见 4.1.2) |
+
+### 4.1.2 为什么(2026-10-22/23 真源库实测,别再重复测一遍)
+
+| 查询 | 直查源库 | 曾经走 DuckDB | 结论 |
+|---|---|---|---|
+| product 按主键 | **6ms** | ~6ms | 无差别 |
+| product 关键词全表扫 | **66ms** | 8~13ms | 差 5~8 倍,但**绝对值仍然是个位数到几十毫秒** |
+| member 四表 JOIN(余额) | **73ms** | ~1ms(副本已算好) | 会员支付路径可接受(用户 2026-10-23 拍板 a1) |
+| member 单表 / COUNT(*) | **1ms / 24ms** | — | 可忽略 |
+
+⇒ **缓存换来的是毫秒级,付出的是一整套会腐烂的机制。**
+
+### 4.1.3 缓存真正带来的代价(这才是决定性的)
+
+1. **两份真相,而且错得无声**:
+   思迅改了价 → cube 的副本还是旧的 → POS 按旧价收银 → **没有一行报错**。
+   (2026-10-23 实测:product 改 live 后,导出侧的 decimal 从明文 number 变成 base64,
+   一条**没解码**的链路就让 27569 行价格全部"没维护价"——副本式链路根本不会暴露这种错。)
+2. **同步就是原始数据同步**:
+   思迅源表 2.7~4.4 万行,全量重拉是**把源库当数据源反复搬**——生产库只读,这是压力,不是设计。
+3. **复杂度爆炸**:
+   预聚合 + 水位 + 校准 job + 启动全量 + "增量 0 行 vs 全量 0 行"两套语义 + 健康检查里的 fresh 段。
+   全 live 之后**一次都不需要**,而它们每一个都是能悄悄坏掉的地方。
+4. **增量水位纪律的连锁**:
+   只要有一份本地副本,"源数据滞后"就成了必须跟踪的量(漏算 ⇒ 永久漏数据且零报错)。
+   没有副本 ⇒ `ChangedMemberLag` 恒为 0 ⇒ 这类 bug 整类消失。
+
+### 4.1.4 合规的加 model 姿势
+
+1. `sixun-models/<model>/schema.yaml` 写 `storage: live` + 维度/度量(只用 canonical 名);
+2. `semantic-layers/sixun/cmd/<family>/mapping/mapping-<model>.yaml` 写 **源列名 → canonical 名**;
+3. `cmd/<family>/config.yaml` 加 `table_<model>: <源表名>`(family 私有事实,两个 family 各自配);
+4. `cmd/<family>/main.go` 的 `liveTables()` 挂上 model → 源表名;
+5. 需要**派生列 / 行过滤**时,用 **FROM 片段**(`table_<model>` 写一段 `(SELECT … )` 子查询,
+   片段输出**必须是 canonical 名**),**不要**为了省事去物化一份副本。
+
+### 4.1.5 如果你仍然想引入缓存(不推荐,但要过这道门槛)
+
+必须先回答清楚这四个问题,并把答案写进 PR 描述:
+
+1. 源库直查的**实测**延迟是多少(真机跑,不是估算)?
+2. 副本的**刷新延迟**是多少秒?这个延迟换算成业务语义是什么(收银按旧价?库存对不上?)
+3. 副本失效时,**谁**会发现、多久发现?(现在的答案是"没人会发现")
+4. 这个副本要新增哪些常驻组件(文件/水位/校准 job/健康检查/告警)?
+
+⚠️ **历史教训(2026-10-22)**:DuckDB 层的失效模式是"**报告照样成功、结果悄悄是旧的**"。
+这种故障比崩溃贵得多。**除非你能说清副本失效时谁会发现,否则不要加副本。**
 
 ## 5. 编码约束
 

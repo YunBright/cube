@@ -262,7 +262,13 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 	// 同时写 TOP 和 FETCH NEXT 会被 SQL Server 判为语法错。
 	baseAlias := jp.Aliases[modelName]
 	from := sourceTable
-	if len(jp.Edges) > 0 {
+	// ⚠️ **片段(= 派生表)必须带别名**:T-SQL 的派生表**强制**要求别名,
+	// 写成 `FROM (SELECT ...)` 会报 "An object or column name is missing or empty"。
+	//
+	// 片段用于"源库里没有这一列、但能在源库侧算出来"的 model
+	// (见 internal/source/member_sql.go 的 MemberFromFragment:
+	//  会员余额 = 充值 − 储值支付,要 JOIN 三张流水表)。
+	if len(jp.Edges) > 0 || isFromFragment(sourceTable) {
 		from = sourceTable + " AS " + baseAlias
 	}
 	var sql string
@@ -445,6 +451,32 @@ func joinClauses(jp *joinPlan, reg ModelRegistry) (string, error) {
 			" AS " + jp.Aliases[e.To] + on)
 	}
 	return b.String(), nil
+}
+
+// isFromFragment 判断 live model 的"源"是不是一段 **SQL 片段**(派生表)。
+//
+// # 约定
+//
+// 源字符串以 "(" 开头 ⇒ 它是派生表(`(SELECT … )`),
+// 不是表名。
+//
+// # 为什么需要它
+//
+// 有些列**在源库里不存在**,但能在源库侧算出来:
+// 会员卡内余额 = Σ充值 − Σ储值支付(要 JOIN 三张流水表)。
+// live 路没有"先把表物化下来再算"这一步 ⇒ 这类列必须由**片段**在源库侧算。
+//
+// ⚠️ 片段的列名必须是**源列名**(含 mapping 里的 memb_* 派生别名):
+// 编译器会把 canonical 名重写成源列名,列名对得上。
+//
+// # 为什么用 "(" 判断而不是另加一个字段
+//
+// 源表名是**配置**来的(config.yaml 的 table_<model>),
+// 而"这一项是表名还是片段"是**同一个配置槽位**的事 ——
+// 让配置自己说明白,比再加一个平行字段更不容易配错
+// (配错的表现是 SQL 语法错,一眼能看出来,而不是静默查错数据)。
+func isFromFragment(source string) bool {
+	return strings.HasPrefix(strings.TrimSpace(source), "(")
 }
 
 // rewriteColumns 把 SQL 表达式里的 canonical 列名替换成源库列名。

@@ -29,6 +29,11 @@
 # 但它**不是** App 的"供应商类别"。
 name: sale_way
 sql_table: sale_way
+# 2026-10-23:改成 live(全仓去 DuckDB)。
+# ⚠️ 源表 t_bd_base_code 是**通用**基础代码字典(30+ 行,code_id 跨 type_no 重复),
+#    所以 live 的源不是表名而是**带 type_no='SW' 过滤的片段**
+#    (见 cmd/sixun-*/main.go 的 liveTables)。
+storage: live
 
 dimensions:
   - name: id

@@ -17,7 +17,14 @@ source:
   table_supplier: t_bd_supcust_info
   table_product:  t_bd_item_info
   table_category: t_bd_item_cls
-  table_sale:     t_mp_saleflow    # ⚠️ 实测 0 行空表,历史配置,勿依赖
+  # ⚠️ 旧的 `table_sale` 键已退役(2026-10-22):它配的 t_mp_saleflow 实测 **0 行**
+  #   (hbposv7 的 t_rm_order_saleflow 连表都不存在)⇒ 两个库都取不到数据。
+  #   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐。
+  table_sale_detail:   t_rm_saleflow       # 逐笔销售流水(实测 3327514 行)
+  table_payflow:       t_rm_payflow        # 收银流水(实测 1143219 行)
+  table_promotion_plan: t_pub_plan_master  # 促销方案头(实测 2646 行)
+  table_supplier_item: t_bd_supcust_item   # 商品供货信息(实测 43751 行)
+  table_branch_price:  t_pc_branch_price   # 商品档案价格(实测 27569 行)
   table_stock:    t_im_branch_stock
 
   # 会员卡档案(t_rm_vip_info)+ 会员类别字典(t_rm_vip_type)。

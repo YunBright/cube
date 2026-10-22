@@ -65,6 +65,7 @@ func (c *HTTPClient) InvokeMethod(ctx context.Context, targetAppID, method strin
 	}
 	url := fmt.Sprintf("%s/v1.0/invoke/%s/method/%s", c.SidecarAddr, targetAppID, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	setAPIToken(req)
 	if err != nil {
 		return nil, fmt.Errorf("daprclient http: new request: %w", err)
 	}
@@ -99,6 +100,7 @@ func (c *HTTPClient) PublishToPubSub(ctx context.Context, pubsub, topic string, 
 	}
 	url := fmt.Sprintf("%s/v1.0/publish/%s/%s", c.SidecarAddr, pubsub, topic)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	setAPIToken(req)
 	if err != nil {
 		return fmt.Errorf("daprclient http: new publish request: %w", err)
 	}
@@ -133,6 +135,7 @@ func (c *HTTPClient) GetState(ctx context.Context, store, key string) ([]byte, b
 	}
 	url := fmt.Sprintf("%s/v1.0/state/%s/%s", c.SidecarAddr, store, key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	setAPIToken(req)
 	if err != nil {
 		return nil, false, fmt.Errorf("daprclient http: new get-state request: %w", err)
 	}
@@ -181,6 +184,7 @@ func (c *HTTPClient) SaveState(ctx context.Context, store, key string, value []b
 	}
 	body, _ := json.Marshal(items)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	setAPIToken(req)
 	if err != nil {
 		return fmt.Errorf("daprclient http: new save-state request: %w", err)
 	}
@@ -221,6 +225,7 @@ func (c *HTTPClient) DeleteState(ctx context.Context, store, key string) error {
 	}
 	url := fmt.Sprintf("%s/v1.0/state/%s/%s", c.SidecarAddr, store, key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	setAPIToken(req)
 	if err != nil {
 		return fmt.Errorf("daprclient http: new delete-state request: %w", err)
 	}

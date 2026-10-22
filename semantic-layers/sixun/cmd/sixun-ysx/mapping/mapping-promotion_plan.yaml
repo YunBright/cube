@@ -1,0 +1,71 @@
+# promotion_plan mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
+#
+# 源表 t_pub_plan_master —— 促销方案**头**。
+#
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      2,646 行 / 45 列
+#   hbposv7(hbposepro)     **0 行** / 51 列(表在,但是空表 —— 源库事实)
+#   共有 45 列,本文件**只映射共有列**。
+#
+# ⚠️ 仅 hbposv7 有(有意不映射):web_flag / is_vip_day / vip_day_list /
+#   is_spec_day / spec_day_type / spec_valid_type
+#
+# ⚠️ approve_flag **原样映射**(不做任何翻译):
+#   源值 varchar(1),实测 "1"(ysx 2504 行)/ "2"(142 行,已审核)。
+#   业务词(draft/approved/stopped)由消费方翻译 —— 见 schema 顶部说明。
+version: 1
+model: promotion_plan
+
+mappings:
+  - source: plan_no
+    target: plan_no
+    type: string
+
+  - source: plan_name
+    target: plan_name
+    type: string
+
+  - source: plan_memo
+    target: plan_memo
+    type: string
+
+  - source: begin_date
+    target: begin_date
+    type: datetime
+
+  - source: end_date
+    target: end_date
+    type: datetime
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  - source: oper_man
+    target: created_by
+    type: string
+
+  - source: confirm_date
+    target: approved_at
+    type: datetime
+
+  - source: confirm_man
+    target: approved_by
+    type: string
+
+  - source: stop_date
+    target: stopped_at
+    type: datetime
+
+  - source: stop_man
+    target: stopped_by
+    type: string
+
+  # ⚠️ 审核状态**源码**透出(不预翻译),见文件头说明
+  - source: approve_flag
+    target: approve_flag
+    type: string
+
+  - source: vip_type
+    target: member_level
+    type: string

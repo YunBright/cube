@@ -1,0 +1,153 @@
+# payflow model - 思迅家族**收银流水**(t_rm_payflow)
+#
+# # 这是什么
+#
+# 一笔**销售**对应 1~N 行收银流水(实付金额按付款方式拆开:
+# 现金 / 储值 / 积分抵扣 / 微信 …),所以 payflow 是"收款侧"的事实表,
+# sale_detail 是"销售侧"的事实表。
+# 两张表用**同一套单号**对齐:flow_no + flowno_rand(实测同一笔单的
+# sale_detail 与 payflow 行的 flow_no/flowno_rand 完全相同)。
+#
+# 实测行数(2026-10-22,两库真库):
+#   ysx(hbposv10)      1,143,219 行
+#   hbposv7(hbposepro)   550,213 行
+#
+# ⚠️ 两库列**不等**(ysx 34 列 / hbposv7 26 列),共有 26 列;
+#   只映射共有列(少一列另一边 column not found)。
+#   仅 ysx:ciceroni_no / ciceroni_id / flowno_type / trans_type /
+#         up_batchno / up_vipacc / remark / cash_no / checkdata
+#
+# # 为什么是 storage: live
+#
+# 同 sale_detail:明细 + 每天增长 + cube 不做原始数据同步(AGENTS.md §4)。
+# 收款流水是**刚发生的钱**,落快照等于"某次刷新时刻的钱",对账会差。
+#
+# # ⚠️ pay_amount 有负数行 —— 那是**冲销/退款**
+#
+# 实测 ysx 1361 行 / hbposv7 2237 行 pay_amount < 0(最小 -0.05)。
+# 本 model **不做**任何过滤,负数原样透出(负数=冲销),
+# 由消费方按业务口径决定要不要排除。
+# 共享 schema 里**没有**"单据类型"列(两库的 flowno_type 只有 ysx 有)。
+name: payflow
+sql_table: payflow
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: number
+    title: 流水 ID
+    description: 源列 flow_id(numeric)
+
+  - name: order_no
+    sql: RTRIM(order_no)
+    type: string
+    title: 单号
+    description: |
+      源列 flow_no。⚠️ 两库宽度不同:ysx char(14) / hbposv7 char(20),
+      hbposv7 实测 "0003202610220156    "(4 个尾随空格)⇒ 必须 RTRIM。
+
+  - name: random_order_no
+    sql: RTRIM(random_order_no)
+    type: string
+    title: 随机单号
+    description: 源列 flowno_rand(ysx char(14) / hbposv7 varchar(20))
+
+  - name: branch_no
+    sql: RTRIM(branch_no)
+    type: string
+    title: 分店号
+    description: 源列 branch_no(char(6))。⚠️ 两库字面值不可跨库比较(ysx "0001" / v7 "000001")
+
+  - name: sale_way
+    sql: RTRIM(sale_way)
+    type: string
+    title: 销售方式
+    description: 源列 sell_way(char(1))。实测 A / B / C
+
+  - name: pay_way
+    sql: RTRIM(pay_way)
+    type: string
+    title: 付款方式
+    description: |
+      源列 pay_way(char(3))。实测两库取值:
+      SWX(思迅Pay-微信)/ CHG / LEP / SZF(储值)/ GIF / SUP / SAV / RMB。
+      ⚠️ **不要**在 schema 里翻译成中文:枚举归一化是 BI 层的事(AGENTS.md §4)。
+
+  - name: card_no
+    sql: RTRIM(card_no)
+    type: string
+    title: 付款卡(券)号
+    description: 源列 card_no(varchar(20))。实测最近几行为空串
+
+  - name: vip_no
+    sql: RTRIM(vip_no)
+    type: string
+    title: 会员卡号
+    description: 源列 vip_no(varchar(20))。实测最近几行为空串,偶有 801635 这类会员卡号
+
+  - name: exchange_rate
+    sql: exchange_rate
+    type: number
+    title: 汇率
+    description: |
+      源列 coin_rate(numeric)。实测恒 1.0000,币种恒 RMB(coin_no)。
+      ⚠️ coin_no 两库都有但**不在本 contract 的维度清单**里,未映射。
+
+  - name: pay_amount
+    sql: pay_amount
+    type: number
+    title: 付款金额
+    description: 源列 pay_amount(numeric)。⚠️ 实测有负数行(冲销/退款)
+
+  - name: sale_amount
+    sql: sale_amount
+    type: number
+    title: 单据金额
+    description: 源列 sale_amount(numeric)。同一笔单的多行 payflow 共享它
+
+  - name: paid_at
+    sql: paid_at
+    type: time
+    title: 收款时间
+    description: 源列 oper_date(datetime)
+
+  - name: cashier_id
+    sql: RTRIM(cashier_id)
+    type: string
+    title: 收银员编码
+    description: 源列 oper_id(char(4))
+
+  - name: salesman_id
+    sql: RTRIM(salesman_id)
+    type: string
+    title: 营业员编码
+    description: 源列 sale_man(char(4))
+
+  - name: counter_no
+    sql: RTRIM(counter_no)
+    type: string
+    title: 柜台号
+    description: 源列 counter_no(char(4))
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 收款流水笔数
+
+  - name: total_pay_amount_yuan
+    sql: "SUM(pay_amount)"
+    type: number
+    title: 付款金额合计(元)
+    format: "0.00"
+    description: 源列 pay_amount。⚠️ 含负数行(冲销),净额口径请由消费方自行剔除
+
+  - name: total_sale_amount_yuan
+    sql: "SUM(sale_amount)"
+    type: number
+    title: 单据金额合计(元)
+    format: "0.00"
+    description: |
+      ⚠️ **同一笔单有多行 payflow**(按付款方式拆行)⇒ 这个合计会**重复计数**,
+      它不是"单据金额合计"。要单据金额请按 order_no 去重后再取 sale_amount。

@@ -63,7 +63,6 @@ type config struct {
 		TableSupplier      string `yaml:"table_supplier"`
 		TableProduct       string `yaml:"table_product"`
 		TableCategory      string `yaml:"table_category"`
-		TableSale          string `yaml:"table_sale"`
 		TableStock         string `yaml:"table_stock"`
 		TableSettlement    string `yaml:"table_settlement"`
 		TableSettlementLn  string `yaml:"table_settlement_line"`
@@ -77,6 +76,19 @@ type config struct {
 		TableItemCls       string `yaml:"table_item_cls"`
 		TableItemClsParent string `yaml:"table_item_cls_parent"`
 		TablePromotion     string `yaml:"table_promotion"`
+		// 商品条码补充表(2026-10-21)。与 cmd/sixun-<family>/main.go 的 liveTables
+		// 是**同一个集合的第三份拷贝**(见 loadSchemas 里 srcTables 的注释)。
+		TableItemBarcode string `yaml:"table_item_barcode"`
+		// ---- 2026-10-22:逐笔销售流水 / 收银流水 / 促销方案头 / 供货信息 / 档案价格 ----
+		//
+		// ⚠️ 旧的 `table_sale`(ysx t_mp_saleflow / hbposv7 t_rm_order_saleflow)
+		//    已退役:前者实测 0 行、后者表根本不存在 ⇒ 两个库都取不到数据。
+		//    live model 的源表名一律按 `table_<model>` 命名(见 loadSchemas 的 srcTables)。
+		TableSaleDetail    string `yaml:"table_sale_detail"`
+		TablePayflow       string `yaml:"table_payflow"`
+		TablePromotionPlan string `yaml:"table_promotion_plan"`
+		TableSupplierItem  string `yaml:"table_supplier_item"`
+		TableBranchPrice   string `yaml:"table_branch_price"`
 	} `yaml:"source"`
 }
 
@@ -663,6 +675,171 @@ func buildCases() []checkCase {
 				Limit:      lim(5),
 			},
 		},
+		// ====== 商品条码补充表(2026-10-21)======
+		// 验证的是**整条链**:canonical 名 → mapping 翻译 → 真实列名 → RTRIM。
+		{
+			name: "商品条码-全量抽样", base: "item_barcode",
+			desc: "条码 / 货号 / 说明三列都要能查出来。" +
+				"⚠️ 源表只有 153 行(绝大多数商品的条码就是 item_no 本身)," +
+				"所以这个 model 是**补充**而不是全部。",
+			query: &cubequery.Query{
+				Measures:   []string{"item_barcode.count"},
+				Dimensions: []string{"item_barcode.barcode", "item_barcode.product_id", "item_barcode.label"},
+				Limit:      lim(5),
+			},
+		},
+		{
+			// RTRIM 的真正价值在这一条:上游传**不带尾随空格**的条码。
+			// 若 RTRIM 没落到 WHERE 上,hbposv7 那种补空格的库会返回 0 行且不报错。
+			name: "商品条码-按条码精确查(验证 RTRIM 落到 WHERE)", base: "item_barcode",
+			desc: "用 ysx 实测存在的条码查;命中即证明 RTRIM 在过滤侧生效",
+			query: &cubequery.Query{
+				Measures:   []string{"item_barcode.count"},
+				Dimensions: []string{"item_barcode.barcode", "item_barcode.product_id", "item_barcode.label"},
+				Filters: []cubequery.Filter{
+					{Member: "item_barcode.barcode", Operator: "equals",
+						Values: []any{"6908946288183"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// 负向:wrong member prefix 必须被拒,而不是静默返回 unnamed 的一坨。
+			name: "商品条码-错前缀应被拒", base: "item_barcode", wantErr: true,
+			desc: "product.id 不是 item_barcode 的成员",
+			query: &cubequery.Query{
+				Measures:   []string{"item_barcode.count"},
+				Dimensions: []string{"product.id"},
+				Limit:      lim(5),
+			},
+		},
+		// ====== 2026-10-22:逐笔销售流水 / 收银流水 / 促销方案头 / 供货信息 / 档案价格 =====
+		// 这一组是**后台四个新域**的数据底座(商品销售流水 / 收银流水 /
+		// 促销方案 / 商品档案供货信息与价格),每条都打真实源库。
+		{
+			name: "销售流水-维度抽样", base: "sale_detail",
+			desc: "单号 / 货号 / 金额 / 销售时间四列都要过 mapping 翻成源列名。" +
+				"⚠️ 源表实测 ysx 3327514 行 / hbposv7 1743882 行。",
+			query: &cubequery.Query{
+				Measures: []string{"sale_detail.count"},
+				Dimensions: []string{
+					"sale_detail.order_no", "sale_detail.random_order_no",
+					"sale_detail.product_id", "sale_detail.sale_amount",
+					"sale_detail.qty", "sale_detail.sold_at",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// RTRIM 落到 WHERE 的验证:上游传不带尾随空格的单号。
+			name: "销售流水-按销售方式过滤(验证 RTRIM 落到 WHERE)", base: "sale_detail",
+			desc: "sell_way 实测两库都有 A/B/C;过滤命中即证明 RTRIM 在过滤侧生效",
+			query: &cubequery.Query{
+				Measures:   []string{"sale_detail.count"},
+				Dimensions: []string{"sale_detail.sale_way"},
+				Filters: []cubequery.Filter{
+					{Member: "sale_detail.sale_way", Operator: "equals", Values: []any{"A"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// ⚠️ 这是后台「商品销售流水」查询的**真实形状**:
+			// 同一查询里同时要 sale_detail.* 与 product.* 两组维度。
+			// ⇒ 走 pkg/cubequery/join.go 的 live→live join 路径;
+			// product 原先是 duck,那时 checkStorage 会在**编译期**直接拒绝
+			// ("joins are live-only")⇒ 这条用例同时锁住"product 必须也是 live"。
+			name: "销售流水-join 商品档案(live→live)", base: "sale_detail",
+			desc: "后台的「商品销售流水」查询形状:sale_detail.* + product.* 同一查询。" +
+				"product 2026-10-22 改成 live 之前,这条在编译期就会被拒。",
+			query: &cubequery.Query{
+				Measures: []string{"sale_detail.count"},
+				Dimensions: []string{
+					"sale_detail.order_no", "sale_detail.product_id",
+					"product.id", "product.name", "product.brand_name",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "收银流水-维度抽样", base: "payflow",
+			desc: "单号 / 付款方式 / 汇率 / 付款金额 / 收款时间。" +
+				"⚠️ pay_amount 实测有负数行(冲销/退款),原样透出。",
+			query: &cubequery.Query{
+				Measures: []string{"payflow.count"},
+				Dimensions: []string{
+					"payflow.order_no", "payflow.pay_way", "payflow.sale_way",
+					"payflow.exchange_rate", "payflow.pay_amount", "payflow.paid_at",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "收银流水-按付款方式过滤", base: "payflow",
+			desc: "pay_way 实测两库都有 SWX / CHG / LEP / SZF / GIF / SUP / SAV / RMB",
+			query: &cubequery.Query{
+				Measures:   []string{"payflow.count"},
+				Dimensions: []string{"payflow.pay_way"},
+				Filters: []cubequery.Filter{
+					{Member: "payflow.pay_way", Operator: "equals", Values: []any{"SWX"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "促销方案-维度抽样", base: "promotion_plan",
+			desc: "方案号 / 名称 / 起止 / 制单审核 / 状态码。" +
+				"⚠️ approve_flag 是**原始状态码**(实测 1=未审核 2=已审核),翻译在消费方。" +
+				"⚠️ hbposv7 的 t_pub_plan_master 是**空表**(实测 0 行)⇒ 那边 rows=0 是源库事实。",
+			query: &cubequery.Query{
+				Measures: []string{"promotion_plan.count"},
+				Dimensions: []string{
+					"promotion_plan.plan_no", "promotion_plan.plan_name",
+					"promotion_plan.begin_date", "promotion_plan.end_date",
+					"promotion_plan.approve_flag", "promotion_plan.member_level",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "商品供货-维度抽样", base: "supplier_item",
+			desc: "货号 / 供应商 / 约定价 / 最高价 / 最低价 / 最近价 / 合同有效期。" +
+				"⚠️ appointed_price 实测恒 0.0000(真实价在 top/bottom/last)。",
+			query: &cubequery.Query{
+				Measures: []string{"supplier_item.count"},
+				Dimensions: []string{
+					"supplier_item.item_no", "supplier_item.supplier_id",
+					"supplier_item.appointed_price_yuan", "supplier_item.top_price_yuan",
+					"supplier_item.bottom_price_yuan", "supplier_item.last_price_yuan",
+					"supplier_item.contract_date",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "商品档案价-维度抽样", base: "branch_price",
+			desc: "进价 / 批发价 / 零售价 / 会员价四列(源列 base_price/price/sale_price/vip_price)。" +
+				"⚠️ 源列名与语义相反,靠 canonical 名钉住语义;会员价实测恒 0.0000。",
+			query: &cubequery.Query{
+				Measures: []string{"branch_price.count"},
+				Dimensions: []string{
+					"branch_price.item_no", "branch_price.supcust_no",
+					"branch_price.cost_yuan", "branch_price.wholesale_yuan",
+					"branch_price.retail_yuan", "branch_price.member_price_yuan",
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			name: "商品档案-品牌维度(2026-10-22 新增)", base: "product",
+			desc: "brand_name ← 源列 item_brandname。✅ 实测两库覆盖率 100%。" +
+				"⚠️ 但整库只有 1 个取值(\"PM\")⇒ 区分度为零,这是源库事实。",
+			query: &cubequery.Query{
+				Measures:   []string{"product.count"},
+				Dimensions: []string{"product.id", "product.name", "product.brand_name"},
+				Limit:      lim(5),
+			},
+		},
 	}
 }
 
@@ -696,6 +873,19 @@ func loadSchemas(mappingDir string, cfg *config) (
 		"item_cls":            cfg.Source.TableItemCls,
 		"item_cls_parent":     cfg.Source.TableItemClsParent,
 		"promotion":           cfg.Source.TablePromotion,
+		"item_barcode":        cfg.Source.TableItemBarcode,
+		// 商品档案(2026-10-22 改成 live)。
+		"product": cfg.Source.TableProduct,
+		// ---- 2026-10-22 新增的五个 live model ----
+		// 逐笔销售流水 / 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
+		//
+		// ⚠️ 键名必须与 model 名一致:少一条就是「该 model 静默不可查」
+		// (本工具只打一行 WARN 然后跳过,而最后照样打印 "N passed")。
+		"sale_detail":    cfg.Source.TableSaleDetail,
+		"payflow":        cfg.Source.TablePayflow,
+		"promotion_plan": cfg.Source.TablePromotionPlan,
+		"supplier_item":  cfg.Source.TableSupplierItem,
+		"branch_price":   cfg.Source.TableBranchPrice,
 	}
 
 	names, err := models.ModelNames()

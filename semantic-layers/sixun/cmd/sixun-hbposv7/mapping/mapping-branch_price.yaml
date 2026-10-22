@@ -1,0 +1,55 @@
+# branch_price mapping(ysx / hbposv7 **列名完全相同**,故两个 family 内容一致)
+#
+# 源表 t_pc_branch_price —— 商品档案的四档价(进价 / 批发价 / 零售价 / 会员价)。
+#
+# ✅ 实测(2026-10-22,两库真库):
+#   ysx(hbposv10)      27,569 行 / 18 列
+#   hbposv7(hbposepro) 44,623 行 / 29 列
+#   共有 18 列,本文件**只映射共有列**。
+#
+# ⚠️ 仅 hbposv7 有(有意不映射):direct / auto_flag / main_sale_flag /
+#   p_com_flag / dept_clsno / trans_price / modify_date / spandistr_flag /
+#   quick_clear / time_stamp / tare_weight
+#
+# ⚠️ **源列名与语义相反,靠 canonical 名钉住语义**:
+#   base_price → cost_yuan(进价)
+#   price      → wholesale_yuan(批发价)
+#   sale_price → retail_yuan(零售价)
+#   vip_price  → member_price_yuan(会员价)
+#   实测货号 00001 / 供应商 019:4.9600 / 3.6000 / 4.7600 / 0.0000
+#   ⇒ vip_price 实测**恒 0.0000**(不是 NULL),"没有会员价"是消费方的口径。
+version: 1
+model: branch_price
+
+mappings:
+  - source: item_no
+    target: item_no
+    type: string
+
+  - source: supcust_no
+    target: supcust_no
+    type: string
+
+  - source: sale_way
+    target: sale_way
+    type: string
+
+  - source: base_price
+    target: cost_yuan
+    type: decimal
+    unit: yuan
+
+  - source: price
+    target: wholesale_yuan
+    type: decimal
+    unit: yuan
+
+  - source: sale_price
+    target: retail_yuan
+    type: decimal
+    unit: yuan
+
+  - source: vip_price
+    target: member_price_yuan
+    type: decimal
+    unit: yuan

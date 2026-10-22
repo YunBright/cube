@@ -1,0 +1,104 @@
+# supplier_item model - 思迅家族**商品供货信息**(t_bd_supcust_item)
+#
+# # 这张表是"商品 ↔ 供应商"的供货关系与价格
+#
+# 实测行数(2026-10-22,两库真库):
+#   ysx(hbposv10)      43,751 行
+#   hbposv7(hbposepro) 45,275 行
+#
+# ⚠️ **订正一条过期结论**:cube 仓 sales_report/schema.yaml:70-71 写着
+#   「实测无商品-供应商关联表」——**该结论已过期**。
+#   表名是 t_bd_supcust_item,不是 t_bd_item_supply / t_bd_supply。
+#   (下一个人不用再重新找一遍。)
+#
+# # 粒度(实测)
+#
+# 实测 (item_no, supcust_no, sale_way) 三元组**唯一**:
+#   ysx     43751 行 / 43751 个不同三元组
+#   hbposv7 45275 行 / 45275 个不同三元组
+# ⇒ 一个货号可以有多行(多个供应商),后台按供应商分页展示。
+#
+# 实测 branch_no **只有一个取值**(两库都是 "00" = 总部),
+# 所以它不参与唯一性;但仍然保留为维度 —— 分店供货价将来一定会分店,
+# 届时不用改 schema。
+#
+# # 金额是**行上的价**,不是聚合口径 ⇒ 维度而不是度量
+#
+# appointed_price(约定价)/ top_price(最高价)/ bottom_price(最低价)/
+# last_price(最近价)描述的是"(这个货号,这个供应商)这一行"的价格,
+# 对它们求和没有业务含义。⇒ 全部做成 type: number 的维度。
+#
+# ⚠️ 实测 appointed_price **恒 0.0000**(抽样前 5 行全是 0),
+#   真实价在 top/bottom/last 三列。原样透出,不猜、不清零。
+#
+# # 为什么是 storage: live
+#
+# 供货价是**会变的业务事实**(签约、改价、换供应商),
+# 落 DuckDB 快照 = "某次刷新时刻的供货价"。
+# 后台商品档案页要的是当前价 ⇒ live。
+name: supplier_item
+sql_table: supplier_item
+storage: live
+
+dimensions:
+  - name: item_no
+    sql: RTRIM(item_no)
+    type: string
+    title: 货号
+    description: 源列 item_no(char(20))。与 product.id 同一套编码
+
+  - name: branch_no
+    sql: RTRIM(branch_no)
+    type: string
+    title: 分店号
+    description: 源列 branch_no(char(6))。实测两库恒 "00"(总部)
+
+  - name: supplier_id
+    sql: RTRIM(supplier_id)
+    type: string
+    title: 供应商编码
+    description: 源列 supcust_no(char(8))。与 supplier.id 同一套编码
+
+  - name: sale_way
+    sql: RTRIM(sale_way)
+    type: string
+    title: 经营方式
+    description: 源列 sale_way(char(1))。实测恒 "A"。⚠️ 与 sale_detail.sale_way(销售方式)同名字不同语义
+
+  - name: appointed_price_yuan
+    sql: appointed_price_yuan
+    type: number
+    title: 约定价格(元)
+    description: 源列 appointed_price(numeric)。⚠️ 实测抽样恒 0.0000
+
+  - name: top_price_yuan
+    sql: top_price_yuan
+    type: number
+    title: 最高价(元)
+    description: 源列 top_price(numeric)
+
+  - name: bottom_price_yuan
+    sql: bottom_price_yuan
+    type: number
+    title: 最低价(元)
+    description: 源列 bottom_price(numeric)
+
+  - name: last_price_yuan
+    sql: last_price_yuan
+    type: number
+    title: 最近价(元)
+    description: 源列 last_price(numeric)。实测这条最接近实际成交价(如货号 00001 / 供应商 019 = 3.60)
+
+  - name: contract_date
+    sql: contract_date
+    type: time
+    title: 合同有效期
+    description: |
+      源列 contract_date(**datetime**,不是日期字符串)。
+      实测值形如 2026-10-24 00:00:00 ⇒ 声明成 time,时间过滤会 CAST 成 DATETIME。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 供货关系行数
