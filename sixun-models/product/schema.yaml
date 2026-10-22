@@ -53,6 +53,31 @@ dimensions:
     type: time
     title: 建档时间
 
+  # updated_at = "这一行最后一次被写入的时间"。
+  #
+  # ⚠️ **为什么必须用 COALESCE,不能直接用 modify_date**
+  #   源库 `t_bd_item_info.modify_date` 有 **25%~28% 的行是 NULL**,
+  #   而**新建商品 80% 是 NULL**(思迅建档不写 modify_date)。
+  #   ⇒ 直接按 modify_date 过滤 ⇒ **新商品永远导不出去**
+  #   ⇒ POS 搜不到新上的货,而且**零报错**。
+  #   ⇒ 用 COALESCE(modify_date, created_at):新建商品用建档时间兜底。
+  #
+  #   实测(2026-10-22 真库):ysx 27569 行 / 6816 NULL(25%);
+  #   hbposv7 44623 行 / 12607 NULL(28%)。
+  #
+  # ⚠️ **type 必须是 time**(不是 string):
+  #   live 路径会把时间列 CAST 成 DATETIME 比较(保留时分秒);
+  #   若声明成 string,比较会退化成文本比较 ⇒ 字典序 ≠ 时间序 ⇒ 过滤静默出错。
+  - name: updated_at
+    sql: "COALESCE(modify_date, created_at)"
+    type: time
+    title: 最后变动时间
+    description: |
+      增量导出的过滤维度(cube-router 的 products / prices scope 用它加 `gt` 过滤)。
+
+      ⚠️ 它**只用于增量过滤**,不是业务字段 ——
+      业务上的"商品上架时间"仍然是 created_at。
+
 measures:
   - name: count
     sql: "COUNT(*)"
