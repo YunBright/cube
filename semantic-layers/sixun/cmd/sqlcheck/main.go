@@ -759,6 +759,38 @@ func buildCases() []checkCase {
 			},
 		},
 		{
+			// ⚠️ 这条用例是**消费方的完整维度清单**(2026-10-23 补)。
+			//
+			// 为什么必须有它:之前每条用例各挑几个维度 ⇒ **少了哪一列都发现不了**。
+			// 实例:sale_detail 的分支号维度写成了旧名 branch_id(mapping 的 target
+			// 是 branch_no)⇒ 后端"商品销售流水"的整条查询 400
+			// (dimension not found: branch_no),而单测与既有 sqlcheck 用例**全绿**。
+			//
+			// ⇒ 判据从"这条用例能跑"升级成"**消费方要的那一组列**能跑"。
+			name: "销售流水-后端完整维度清单", base: "sale_detail",
+			desc: "后端 /transaction/transactions/sales 真正 SELECT 的那一组维度(必须一次全过)。" +
+				"⚠️ 少一列的后果是**整条查询 400**(dimension not found),而不是少一个字段。",
+			query: &cubequery.Query{
+				Measures: []string{"sale_detail.count"},
+				Dimensions: []string{
+					"sale_detail.id", "sale_detail.order_no", "sale_detail.random_order_no",
+					"sale_detail.branch_no", "sale_detail.product_id",
+					"sale_detail.source_price", "sale_detail.sale_price", "sale_detail.qty",
+					"sale_detail.sale_amount", "sale_detail.sale_way",
+					"sale_detail.cashier_id", "sale_detail.salesman_id", "sale_detail.counter_no",
+					"sale_detail.sold_at", "sale_detail.online_flag", "sale_detail.discount_amount",
+					// product join 的那几列(同一个查询里要一起取)
+					"product.sub_code", "product.name", "product.spec",
+					"product.unit", "product.brand_name",
+				},
+				Filters: []cubequery.Filter{{
+					Member: "sale_detail.branch_no", Operator: "equals", Values: []any{"0001"},
+				}},
+				Order: []cubequery.Order{{ID: "sale_detail.order_no", Order: "desc"}},
+				Limit: lim(3),
+			},
+		},
+		{
 			name: "销售流水-维度抽样", base: "sale_detail",
 			desc: "单号 / 货号 / 金额 / 销售时间四列都要过 mapping 翻成源列名。" +
 				"⚠️ 源表实测 ysx 3327514 行 / hbposv7 1743882 行。",

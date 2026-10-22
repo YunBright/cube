@@ -30,10 +30,10 @@ dimensions:
     type: number
     title: 流水 ID
 
-  - name: flow_no
-    sql: flow_no
-    type: string
-    title: 流水号
+  # ⚠️ 这里**没有** flow_no 维度:mapping 里 flow_no 的 target 是 **order_no**
+  # (它就是"单号"本身)⇒ 再声明一个 flow_no 维度,它的列名会被编译器
+  # 重写不成任何东西 ⇒ 源库报"列名 flow_no 无效"。
+  # ⇒ 要单号就用 order_no(随机单号是 random_order_no)。
 
   # ⚠️ order_no / sale_way 是**销售流水查询的必备维度**(销售报表与 POS 回放都要):
   # 少了任何一个,查询会 400 "dimension not found: order_no (on model sale_detail)"
@@ -62,10 +62,13 @@ dimensions:
       源列 sell_way(char(1)):A=购销 / B=代销 / C=联营 …
       销售报表按它分组。
 
-  - name: branch_id
-    sql: branch_id
+  # ⚠️ canonical 名是 **branch_no**(不是 branch_id)——
+  # mapping 的 target 就是 branch_no(源列也是 branch_no)。
+  # 写成 branch_id ⇒ 编译器重写不到 ⇒ 源库直接报"列名 branch_id 无效"。
+  - name: branch_no
+    sql: branch_no
     type: string
-    title: 分店 ID
+    title: 分店号
 
   - name: product_id
     sql: product_id

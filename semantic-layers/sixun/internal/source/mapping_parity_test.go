@@ -120,6 +120,15 @@ func TestSchemaMeasureColumnsAreMapped(t *testing.T) {
 		"ISNUMERIC": true, "DISTINCT": true, "TOP": true, "BY": true,
 		"ORDER": true, "GROUP": true, "DESC": true, "ASC": true, "OFFSET": true,
 		"FETCH": true, "OVER": true, "PARTITION": true, "UNION": true,
+		// ⚠️ **类型名**也不是列(2026-10-23 补)。
+		// promotion 的 begin_day/end_day 用 `CONVERT(varchar(10), begin_date, 23)`
+		// 把日期转成 ISO 文本 ⇒ "varchar" 被当成了列名 ⇒ 误报。
+		"CHAR": true, "NCHAR": true, "VARCHAR": true, "NVARCHAR": true,
+		"TEXT": true, "NTEXT": true, "DATE": true, "TIME": true,
+		"DATETIME": true, "DATETIME2": true, "SMALLDATETIME": true,
+		"DECIMAL": true, "NUMERIC": true, "FLOAT": true, "REAL": true,
+		"BIGINT": true, "SMALLINT": true, "TINYINT": true, "INT": true,
+		"BIT": true, "MONEY": true, "SMALLMONEY": true, "UNIQUEIDENTIFIER": true,
 	}
 
 	entries, err := os.ReadDir(modelsDir)
@@ -154,6 +163,19 @@ func TestSchemaMeasureColumnsAreMapped(t *testing.T) {
 		}
 		for _, ms := range model.Measures {
 			checkSQLColumns(t, model.Name, "measure "+ms.Name, ms.SQL, targets, stringLitRE, identRE, sqlKeywords)
+		}
+		// ⚠️ **维度也要查**(2026-10-23 补)。
+		//
+		// 之前这里只查 measure ⇒ 维度里写错 canonical 名没人拦。
+		// 实例:sale_detail 的维度写成了 `branch_id`(旧名),
+		// 而 mapping 的 target 是 `branch_no` ⇒ 编译器重写不到
+		// ⇒ 源库直接报"列名 branch_id 无效" ⇒ **后端的销售流水查询整条 400**。
+		//
+		// ⚠️ 为什么单测没抓到:那条维度的 SQL 恰好只有一个标识符,
+		// 而"维度名"本身不参与重写 ⇒ 只有真源库执行才暴露。
+		// ⇒ 维度的 SQL 里的列名必须是 mapping 的 target。
+		for _, d := range model.Dimensions {
+			checkSQLColumns(t, model.Name, "dimension "+d.Name, d.SQL, targets, stringLitRE, identRE, sqlKeywords)
 		}
 		// segment 的 SQL 同样会被原样内联进 WHERE,并且同样要经过列名重写
 		// (见 pkg/cubequery/tsql.go 的 expandSegments 调用),所以它和 measure
