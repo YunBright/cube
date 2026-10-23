@@ -37,7 +37,7 @@ func ExtractTotal(rows []map[string]any, want bool) (int, []map[string]any) {
 
 // normalizeCount 把驱动返回的计数归一成 int。
 //
-// go-mssqldb 与 duckdb 驱动返回的数值类型并不一致(可能是 int64、[]byte、
+// 不同 SQL 驱动返回的数值类型并不一致(可能是 int64、[]byte、
 // json.Number 甚至 float64),之前的 source.ScanRows 就踩过 numeric 被当成
 // []byte 打印成字节码的坑。这里宁可多写几行也不能让 total 变成 "[49 48]"。
 func normalizeCount(v any) int {

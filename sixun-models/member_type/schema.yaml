@@ -15,9 +15,9 @@
 #   - discount 是 numeric,原样给(不做 100 倍换算、不做四舍五入)
 name: member_type
 sql_table: member_type
-# 2026-10-23:改成 live(全仓去 DuckDB)。会员类别字典只有 3 行,落副本纯亏。
+# 2026-10-23:改成 live(全仓去掉本地副本)。会员类别字典只有 3 行,落副本纯亏。
 storage: live
-# 增量刷新按主键 upsert(见 internal/dataloader)。
+# ⚠️ 2026-10-23:增量刷新(按主键 upsert 进本地副本)已删除,primary_key 现在**没有读取方**;字段保留只为不再让已有 schema 里的 primary_key: id 变成被静默忽略的僵尸配置。
 # ✅ 实测 type_id 两库各自唯一(3 行 3 个不同 id)。
 primary_key: id
 
@@ -47,7 +47,7 @@ dimensions:
       源列 discount(numeric(5,4))。
       ⚠️ **type 必须与物理列一致(= number)**（2026-10-21 生产实测踩到）：
       查询构造器按 dimension 的 type 决定要不要包 RTRIM，而
-      **DuckDB 的 RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报错 ⇒ 整个查询 500。
+      **RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报错 ⇒ 整个查询 500。
       （"下游拿到字符串"由**导出层**负责，不在 schema 这一层。）
       ⚠️ 实测三行**都是 1.0000**(即不打折),两库相同。
       换算口径留给下游 —— cube 不替下游乘 100 或取整。

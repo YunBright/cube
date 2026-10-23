@@ -4,7 +4,9 @@
 每个 (family, version) → 一个 binary,
 每个 store/instance(门店 / 租户)→ 一个由 `CUBE_APP_ID` 驱动的 dapr cube app 进程。
 对外暴露 Cube.js 兼容 API(`/v1/source/{source}/load` + `/v1/sources`),
-内部用 DuckDB 做预聚合 + L1/L2 缓存。所有非 2xx 响应返回统一错误信封。
+内部**不做任何数据缓存、不落任何本地副本** —— 查询时把 schema 编译成 T-SQL 直打源库
+(全部 model 都是 `storage: live`,见 AGENTS.md §4.1)。gateway 侧另有 L1 缓存。
+所有非 2xx 响应返回统一错误信封。
 
 ## 仓库结构
 

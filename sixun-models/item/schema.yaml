@@ -12,13 +12,13 @@
 # 所以引用 `product.*` 会被明确报 "not available (duck model 或未加载)"。
 #
 # → 这不是重复建模的疏忽,是 live JOIN 这条链路的硬约束。
-#   代价是 t_bd_item_info 现在有两个模型:`product`(duck,给枚举/档案查询)
+#   代价是 t_bd_item_info 现在有两个模型:`product`(给枚举/档案查询)
 #   与 `item`(live,给销售报表 JOIN)。
 #
-# # storage: live 而不是物化进 DuckDB
+# # storage: live 而不是物化进本地副本
 #
 # ✅ 实测 hbposepro 44369 行 / ysx 27299 行。这个量级本身不大,
-# 但它每天都随商品建档/改价变动,而 DuckDB 侧的 product 已有增量刷新机制。
+# 但它每天都随商品建档/改价变动,而旧副本侧的 product 曾经有增量刷新机制。
 # 这里保持 live 是为了**不引入第二份需要同步的快照** —— 一旦有人给 live
 # 模型加上物化,它就会变成第二套可能与源库不一致的数据源。
 name: item

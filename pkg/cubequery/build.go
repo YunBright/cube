@@ -1,4 +1,24 @@
-// build.go 把 Query 编译成 DuckDB SQL。
+// build.go 把 Query 编译成 DuckDB SQL(本地副本那条路)。
+//
+// # ⚠️ 2026-10-23:这一半方言**已不再使用**,但**故意保留**
+//
+// 本地副本层删掉之后,生产路径**只剩一条**:`tsql.go` 的 `BuildTSQLJoin`
+// (编译成 T-SQL 直打思迅源库)。`Build()` 这条 DuckDB 路径已经**没有任何
+// 生产调用方** —— 只有它自己的单测还在跑。
+//
+// **为什么这次不删**:
+//   - AGENTS.md §4 的约束是"`pkg/cubequery` 查询语义不得变行为";
+//     删一个导出函数虽然不改行为,但它是**同一个包里两套方言的分界线**,
+//     拆它要动 `buildFilter` / `buildOrder` / `expandSegments` 的方言参数
+//     (quote 函数 + timeDialect),连带 8 个测试文件。
+//   - 这半边方言是**已删除那条路的可执行规格**:"两条路语义必须逐字一致"
+//     这条契约(见 `TestOrder_DialectsAgree`)只有两边都在时才验得了。
+//     先删路、后删规格,顺序反了就没有对照物了。
+//
+// ⇒ **清理它是独立的一次改动**:删 `Build` / `quoteDouble` / `duckTime`
+// 与只测 DuckDB 侧的用例(保留"两条路一致"那类用例的 T-SQL 半边),
+// 再把 `buildFilter` / `buildOrder` 的方言参数拆掉。
+// 见 AGENTS.md §4「存储分层」与 §7 的对应清单项。
 //
 // **为什么在共用包里**:这段逻辑曾各写一份 —— sixun-ysx 的 main.go 是完整实现
 // (多 measure / 多 dimension / filters / RTRIM),sixun-hbposv7 的 main.go 却是一套
@@ -49,6 +69,8 @@ type Result struct {
 }
 
 // Build 编译 Query → DuckDB SQL。
+//
+// # ⚠️ 2026-10-23:已无生产调用方(见文件头说明),**故意保留**待独立清理。
 //
 // 两个刻意的设计:
 //  1. 简单列名统一包 RTRIM —— 思迅的 char 定长列普遍补空格, ysx / hbposv7 都中招。

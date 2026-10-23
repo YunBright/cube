@@ -51,10 +51,10 @@ func TestHealthHandler_ReportsModels(t *testing.T) {
 
 // TestHealthHandler_NoCopySegments 锁"healthz 里**没有**副本相关的那两段"。
 //
-// ⚠️ 2026-10-23 去 DuckDB:以前 healthz 里有
+// ⚠️ 2026-10-23 去掉本地副本:以前 healthz 里有
 //   - data    = 本地副本的物化状态与年龄
 //   - refresh = 刷新 job 的统计
-// 现在**一个都不落 DuckDB** ⇒ 没有副本、没有物化、没有刷新 job
+// 现在**一个都不落本地副本** ⇒ 没有副本、没有物化、没有刷新 job
 // ⇒ 那两段永远是空,而且**留着它们是假信号**:
 // 一个恒为 "ok" 的健康检查会让人以为"有人在管数据的新鲜度",
 // 而实际上数据新鲜度 = 源库的新鲜度。

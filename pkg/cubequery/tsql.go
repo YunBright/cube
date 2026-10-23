@@ -1,8 +1,8 @@
 // tsql.go 把 cube Query 编译成 **T-SQL**,用于 storage: live 的 model
-// 直接查思迅源库 —— 不落 DuckDB。
+// 直接查思迅源库 —— 不落任何本地副本。
 //
 // 为什么不复用 Build 的输出再字符串替换:
-// 那会踩两个坑。一是要把 DuckDB 的 `LIMIT n` 挪到 `SELECT TOP n`,
+// 那会踩两个坑。一是要把旧副本路的 `LIMIT n` 挪到 `SELECT TOP n`,
 // 二是 schema 里的列名是 family 无关的 canonical 名(goods_amount),
 // 而源库里是 family 私有列名(hbposv7 = Goods_amt / ysx = sheet_amt)。
 // 所以这里从一开始就按"列名要解析、方言是 T-SQL"来编译。
@@ -57,8 +57,8 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 	if schema == nil {
 		return nil, &BuildError{Kind: "model", Msg: "schema is nil"}
 	}
-	if schema.EffectiveStorage() != cubeschema.StorageLive {
-		return nil, &BuildError{Kind: "model", Msg: fmt.Sprintf("model %q is not a live model (storage=%s)", schema.Name, schema.EffectiveStorage())}
+	if schema.Storage != cubeschema.StorageLive {
+		return nil, &BuildError{Kind: "model", Msg: fmt.Sprintf("model %q is not a live model (storage=%s)", schema.Name, schema.Storage)}
 	}
 	if strings.TrimSpace(sourceTable) == "" {
 		return nil, &BuildError{Kind: "model", Msg: "live model requires a source table name (config table_*)"}
@@ -197,12 +197,23 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter dimension not found: " + ref + " (on model " + mn + ")"}
 		}
-		// ⚠️ trimAsString=true：T-SQL 路径**保持今天的行为**（一律包 RTRIM）。
+		// ⚠️ **过滤侧按类型决定要不要 RTRIM**(2026-10-23 改)。
 		//
-		//	MSSQL 的 RTRIM 会把数字隐式转文本，所以 live 模型的数值维度
-		//	返回的是字符串 —— 改了会让下游的返回类型从字符串变成数字。
-		//	（只有 DuckDB 路径需要按类型区分，见 build.go 的 trimForType。）
-		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate, d.Type == cubeschema.TypeTime, true, f.Operator, f.Values, tsqlTime)
+		// 之前这里恒传 true(一律包 RTRIM)⇒ 数值列的过滤变成**文本比较**:
+		//	WHERE RTRIM(sale_qnty) >= @p1 AND RTRIM(sale_qnty) < @p2
+		// 实测(2026-10-23,ysx 源库):同样条件的
+		//	源库**数值**比较 = 82950 行;cube 的过滤只命中 73026 行 ⇒ **漏 12%**。
+		// ⇒ 任何"按数值区间筛"的查询都会给错答案(而且**零报错**)。
+		//
+		// 现在:number 列**不包** RTRIM ⇒ 过滤是数值比较 ✅。
+		//
+		// ⚠️ **只改过滤侧,SELECT 侧照旧**(仍包 RTRIM):
+		//	返回值保持"明文文本"(如 "1.0000"),下游一个都不用改 ——
+		//	number 维度的返回值若变成 base64,`cuberead.Str(r, "sale_detail.id")`
+		//	这种用法会拿到 base64 串 ⇒ **列表去重会失效**(全变同一个 key ⇒ 只剩 1 行)。
+		//	实测审计:没有任何地方用 Str() 读数值**金额**列(都用 Dec/DecPtr)✅。
+		expr, args, err := buildFilter(rewriteMember(mn, e, alias, d.SQL), d.CharDate,
+			d.Type == cubeschema.TypeTime, trimForLiveFilter(d.Type), f.Operator, f.Values, tsqlTime)
 		if err != nil {
 			return nil, &BuildError{Kind: "filter", Ref: ref,
 				Msg: "filter: " + err.Error()}
@@ -477,6 +488,37 @@ func joinClauses(jp *joinPlan, reg ModelRegistry) (string, error) {
 // (配错的表现是 SQL 语法错,一眼能看出来,而不是静默查错数据)。
 func isFromFragment(source string) bool {
 	return strings.HasPrefix(strings.TrimSpace(source), "(")
+}
+
+// trimForLiveFilter 决定 live(T-SQL)路径的**过滤侧**要不要给列包 RTRIM。
+//
+// # 为什么 number 列不包
+//
+// MSSQL 的 RTRIM 会把数字**隐式转成文本** ⇒ 列表达式变成 varchar
+// ⇒ 与参数比较时走的是**文本比较**(字典序)而不是数值比较。
+//
+// 实测(2026-10-23,ysx 源库 t_rm_saleflow,条件 qty >= 2 AND qty < 3):
+//
+//	源库**数值**比较       = 82,950 行
+//	源库**文本**比较       = 84,613 行
+//	cube 的过滤(之前恒包)  = 73,026 行
+//
+// ⇒ 数值区间过滤**与源库不等价**,而且**零报错**。
+//
+// # 为什么其它类型照旧
+//
+//   - string:char 列带尾随空格 ⇒ 不 RTRIM 就匹配不上(" 801598" ≠ "801598")。
+//   - time  :RTRIM(datetime) 的文本会被 buildFilter 再 CAST 回 DATETIME
+//     (见 buildFilter 的 target 逻辑)⇒ 值不变 ⇒ 保留 RTRIM 无害。
+//
+// # 为什么只改过滤侧、不改 SELECT 侧
+//
+// SELECT 侧仍包 RTRIM ⇒ **返回值保持明文文本**("1.0000")⇒ 下游零改动。
+// 若 SELECT 侧也不包,number 维度会变成 base64(驱动给 []byte)
+// ⇒ `cuberead.Str(r, "sale_detail.id")` 这类用法会拿到 base64 串
+// ⇒ **列表去重失效**(不同行变成同一个 key ⇒ 只剩 1 行)。
+func trimForLiveFilter(t cubeschema.DataType) bool {
+	return t != cubeschema.TypeNumber
 }
 
 // rewriteColumns 把 SQL 表达式里的 canonical 列名替换成源库列名。

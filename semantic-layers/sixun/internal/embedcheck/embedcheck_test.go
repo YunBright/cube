@@ -100,3 +100,54 @@ func fillValidMappings(t *testing.T, fsys fstest.MapFS, skip string) {
 		fsys["mapping-"+m+".yaml"] = &fstest.MapFile{Data: []byte(body)}
 	}
 }
+
+// schemaWithStorage 造一份"只差 storage"的最小 schema。
+//
+// 用来证明 **storage 契约这道门真的会红** ——
+// 2026-10-23 之前没有这道门:`storage: duck` 的 schema **静默加载成功**,
+// 直到查询那一刻才炸 "model X is not a live model"。
+func schemaWithStorage(storage string) []byte {
+	return []byte("name: demo\nsql_table: demo\n" + storage +
+		"dimensions:\n  - name: id\n    sql: id\n    type: string\n")
+}
+
+// TestCheckSchema_RejectsNonLiveStorage 锁住"非 live 的 storage 被抓住"。
+func TestCheckSchema_RejectsNonLiveStorage(t *testing.T) {
+	for _, storage := range []string{"storage: duck\n", "storage: postgres\n", ""} {
+		problems := checkSchema("demo", schemaWithStorage(storage))
+		if len(problems) == 0 {
+			t.Fatalf("storage=%q 必须被抓住(否则它会静默加载成功,直到查询才炸)", storage)
+		}
+		if !strings.Contains(problems[0], "demo") {
+			t.Errorf("错误信息应指出是哪个 model,实际: %s", problems[0])
+		}
+	}
+}
+
+// TestCheckSchema_AcceptsLiveStorage 锁住"live 通过"。
+func TestCheckSchema_AcceptsLiveStorage(t *testing.T) {
+	if problems := checkSchema("demo", schemaWithStorage("storage: live\n")); len(problems) != 0 {
+		t.Fatalf("storage: live 必须通过,实际: %v", problems)
+	}
+}
+
+// TestCheck_AllEmbeddedSchemasAreLive 锁住"内嵌的 24 个 schema 全部是 live 且能解析"。
+//
+// 这条是**永远会跑**的那道门(两个 family 的 embed_test.go 各跑一次)——
+// 不像 config_test.go 那样"机器上没有 config.yaml 就 skip"。
+func TestCheck_AllEmbeddedSchemasAreLive(t *testing.T) {
+	names := allModelNames(t)
+	if len(names) == 0 {
+		t.Fatal("一个内嵌 schema 都没有")
+	}
+	for _, name := range names {
+		b, err := models.ReadSchema(name)
+		if err != nil {
+			t.Errorf("读 schema %q 失败: %v", name, err)
+			continue
+		}
+		if problems := checkSchema(name, b); len(problems) > 0 {
+			t.Errorf("内嵌 schema 不合规: %v", problems)
+		}
+	}
+}

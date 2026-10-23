@@ -23,7 +23,7 @@
 # 金额**不做 dimension**:pkg/cubequery 对所有维度无条件套 RTRIM,
 # 数值维度会被转成字符串。要按单据取金额请带上 dimensions: [settlement.id]
 # (GROUP BY id 后 SUM 就是该单金额),这与 stock / product 现有约定一致。
-# storage: live —— **不落 DuckDB**,查询时由 cube app 实时编译成 T-SQL 打源库。
+# storage: live —— **不落本地副本**,查询时由 cube app 实时编译成 T-SQL 打源库。
 #   cube 不做原始数据同步;sql_table 在 live 下无意义,真正的 FROM 来自
 #   各实例 config.yaml 的 table_settlement(源表名是 family 私有事实,不写进共享 schema)。
 #   透传时 schema 里的 canonical 列名经 mapping.yaml 反查成该 family 的源列名。

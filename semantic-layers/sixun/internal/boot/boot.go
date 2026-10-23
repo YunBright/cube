@@ -6,16 +6,20 @@
 //   - family / version 由 app_id 拆分得到(不需单独环境变量)
 //     例:sixun-ysx-00 → family="sixun", version="ysx", instance="00"
 //   - DSN 通过 ./config.yaml 的 source.dsn 读(保持兼容旧部署);
-//     DUCKDB / MAPPING / PORT 全部走环境变量,这样同 binary 多次复用
+//     PORT / GATEWAY_URL 走环境变量,这样同 binary 多次复用
+//
+// ⚠️ 2026-10-23:本地副本层删除后,**没有 DuckDB 路径这个概念了**
+// (env CUBE_DUCKDB_PATH 与 Config.DuckDBPath 一并删除):
+// 实例不持有任何数据副本,数据新鲜度 = 源库的新鲜度。
 //
 // 启动流程(由 cmd/{sixun-ysx,sixun-hbposv7}/main.go 编排):
 //
 //	cfg, err := boot.Load()           // 读 env,校验
 //	if err != nil { os.Exit(1) }
 //	lg := log.New(cfg.AppID)
-//	// 加载 mapping / schema / duckdb ...
+//	// 加载 mapping / schema ...
 //	engine.POST("/query", queryHandler(...))
-//	engine.GET("/healthz", cfg.HealthHandler(supportedModels, fresh))
+//	engine.GET("/healthz", cfg.HealthHandler(supportedModels))
 //	go registerToGateway(cfg.RegisterBody(supportedModels))
 //	engine.Run(cfg.Port)
 package boot
@@ -62,9 +66,6 @@ type Config struct {
 
 	// Port 是 gin engine 监听端口。默认 ":8080"。
 	Port string
-	// DuckDBPath 是本地 DuckDB 文件路径(env CUBE_DUCKDB_PATH);空时按
-	// DefaultDuckDBPath() 退到 ./data/<AppID>.duckdb。
-	DuckDBPath string
 	// GatewayURL 是 cube-gateway 的 HTTP base URL(env CUBE_GATEWAY_URL);默认 http://localhost:8080。
 	GatewayURL string
 	// SidecarHTTPURL 是本机 dapr sidecar 的 HTTP base(env DAPR_HTTP_PORT)。
@@ -79,7 +80,6 @@ type Config struct {
 //     下启动时 dapr 自动 set;非 dapr 环境下为空)
 //   - CUBE_DAPR_APP_ID  — 手动覆盖,优先级低于 DAPR_APP_ID,空字符串视为未设
 //   - CUBE_PORT=":8080"
-//   - CUBE_DUCKDB_PATH
 //   - CUBE_GATEWAY_URL="http://localhost:8080"
 //
 // 注意:schema.yaml 与 mapping.yaml 都用 go:embed 编译进二进制,不再有
@@ -169,14 +169,14 @@ func daprAppIDSource() string {
 // HealthHandler 返回 gin GET /healthz handler,JSON 包含 source / family /
 // version / models / status,方便外部探活 + 调试。
 //
-// # ⚠️ 2026-10-23:去 DuckDB 之后**没有"数据新鲜度"可言**
+// # ⚠️ 2026-10-23:去掉本地副本之后**没有"数据新鲜度"可言**
 //
 // 以前这个 handler 带三段:
-//   - data    = 本地副本的物化状态与年龄(freshness.Tracker)
-//   - refresh = 刷新 job 的统计(refreshschedule.Stats)
+//   - data    = 本地副本的物化状态与年龄(已删除的 freshness 包)
+//   - refresh = 刷新 job 的统计(已删除的 refreshschedule 包)
 //   - status  = 由 fresh 决定(从没加载过 / 上次有 model 失败 / 数据太旧 ⇒ degraded)
 //
-// 现在**一个都不落 DuckDB** ⇒ 没有副本、没有物化、没有刷新 job
+// 现在**一个都不落本地副本** ⇒ 没有副本、没有物化、没有刷新 job
 // ⇒ 那两段永远是空,status 也永远是 "ok"。
 //
 // ⚠️ 留着它们会是**假信号**:一个恒为 "ok" 的健康检查会让人以为

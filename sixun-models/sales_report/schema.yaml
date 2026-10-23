@@ -11,10 +11,10 @@
 #   - 所以这里另起一个**以日结表为基表**的 live model,顺着
 #     item → item_cls → item_cls_parent 一路 JOIN 到父类别。
 #
-# # storage: live —— 绝不落 DuckDB
+# # storage: live —— 绝不落本地副本
 #
 # ✅ 实测 hbposepro t_rm_daysum 598068 行 / ysx 1208328 行,且**每天都在增长**。
-# DuckDB 只放"常用且更新不频繁的基础/聚合数据"(见 sale_day 顶部同款说明),
+# 旧设计里副本只放"常用且更新不频繁的基础/聚合数据"(见 sale_day 顶部同款说明),
 # 把销售流水静默同步进去就是最大的坑:一次全量拉取就是百万行级写放大,
 # 而症状只是"启动慢了一点"。
 #

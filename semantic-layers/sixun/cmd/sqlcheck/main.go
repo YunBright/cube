@@ -164,7 +164,7 @@ func main() {
 	}
 	liveOnly := map[string]cubequery.ModelEntry{}
 	for name, e := range entries {
-		if e.Schema != nil && e.Schema.EffectiveStorage() == cubeschema.StorageLive {
+		if e.Schema != nil && e.Schema.Storage == cubeschema.StorageLive {
 			liveOnly[name] = e
 		}
 	}
@@ -409,7 +409,7 @@ func buildCases() []checkCase {
 		},
 		{
 			name: "timeDimensions-按月", base: "sale_day",
-			desc: "DATEFROMPARTS(T-SQL 粒度,不是 DuckDB 的 DATE_TRUNC)",
+			desc: "DATEFROMPARTS(T-SQL 粒度,不是本地副本那条路的 DATE_TRUNC)",
 			query: &cubequery.Query{
 				Measures: []string{"sale_day.net_sale_quantity"},
 				TimeDimensions: []cubequery.TimeDim{
@@ -1044,7 +1044,7 @@ func loadSchemas(mappingDir string, cfg *config) (
 			}
 		}
 		mappers[name] = mp
-		if m.EffectiveStorage() != cubeschema.StorageLive {
+		if m.Storage != cubeschema.StorageLive {
 			continue
 		}
 		src := srcTables[name]

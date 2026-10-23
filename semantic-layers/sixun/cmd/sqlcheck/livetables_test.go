@@ -45,7 +45,7 @@ func liveModelNames(t *testing.T) []string {
 		if err != nil {
 			t.Fatalf("Load(%s): %v", n, err)
 		}
-		if m.EffectiveStorage() == cubeschema.StorageLive {
+		if m.Storage == cubeschema.StorageLive {
 			live = append(live, n)
 		}
 	}

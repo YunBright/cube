@@ -1,6 +1,6 @@
 # 语义层设计
 
-> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> ⚠️ **2026-10-23:本文档里关于本地副本 / 预聚合 / 刷新 job / 水位 的部分已作废。**
 > 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
 > **不保留任何本地副本、不做任何原始数据同步**。
 > 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
@@ -16,8 +16,7 @@
 family (思迅 / 粮油 / 生鲜)
 ├── sixun-models/                  共享 schema(Go module)
 │   ├── supplier/
-│   │   ├── schema.yaml            cube 风格 schema
-│   │   └── preagg.go              DuckDB 预聚合
+│   │   └── schema.yaml            cube 风格 schema
 │   ├── product/
 │   └── sale_detail/
 │
@@ -56,7 +55,7 @@ cube app 启动时 dapr 自动注入 `DAPR_APP_ID` 环境变量,cube app 读后�
 ## mapping.yaml 语义(P1-5 选 A)
 
 > 动手前先读 **[数据源勘察与 mapping 编写手册](data-source-mapping-playbook.md)** ——
-> 里面有勘察数据源的 5 个必查项、共享 schema 的连带影响、row_limit 的实测依据,
+> 里面有勘察数据源的 5 个必查项、共享 schema 的连带影响、列名重写的坑,
 > 以及本次「商品单位」打通的完整过程。
 
 ```yaml
@@ -76,17 +75,21 @@ mappings:
 
 ### mapping 是白名单(高频踩坑)
 
-DuckDB 里一张表**有哪些列,完全由该 model 的 mapping 决定**(不是 `SELECT *`)。
+一个 model 的列**完全由该 model 的 mapping 决定**(不是 `SELECT *`)。
 所以:
 
 - ✅ 加字段 = schema.yaml 加 dimension **+** mapping.yaml 加映射
-- ❌ 只改 schema → schema 里有 `unit`,但 DuckDB 表里没这列 → 查询报 column not found
+- ❌ 只改 schema → schema 里有 `unit`,但 mapping 里没有对应条目
+  → 编译期把 canonical 名重写成源列名时找不到 ⇒ 源库报 column not found
 
-> 实例实测:`product` 的 DuckDB 表**当前 9 列**
+> ⚠️ 现在的硬约束:**mapping 的 target 集合必须与 schema 的 dimension 集合逐字相等**。
+> `mapping_parity_test.go` 对两个 family 都断言这一条(少一条 / 多一条都红)。
+>
+> 历史(2026-10-09,当时还有本地副本):`product` 的副本表是 9 列
 > (`id / name / category_id / supplier_id / unit / price_yuan / cost_yuan / status / created_at`),
-> 其中 `unit` 是 2026-10-09 新增的(加之前 8 列)。
-> 注意 schema.yaml 里 dimension + measure 的条数(13)≠ DuckDB 表的列数(9),
-> 因为 measure 是查询时聚合出来的,不对应物理列。
+> 而 schema.yaml 里 dimension + measure 一共 13 条 —— 差的 4 条是 measure,
+> 它们是查询时聚合出来的,不对应物理列。
+> ⇒ 同一个道理今天仍然成立:dimension = 物理列,measure = 聚合表达式。
 
 ### 共享 schema 的连带影响
 
@@ -122,26 +125,28 @@ dimensions:
       - { value: "生鲜", label: 生鲜 }
 ```
 
-## DuckDB 预聚合(P0-3)
+## 本地预聚合(P0-3)—— **已删除**
 
-每个 instance 独立 .duckdb 文件(挂载 PV 持久化),命名规则:
-
-```
-data/
-├── sixun-ysx-00.duckdb             ← CUBE_APP_ID=sixun-ysx-00(默认路径)
-├── sixun-ysx-baiyuan1.duckdb       ← CUBE_APP_ID=sixun-ysx-baiyuan1
-├── sixun-hbposv7-jiale.duckdb      ← CUBE_APP_ID=sixun-hbposv7-jiale
-└── liangyou-v1.duckdb              ← 未来(占位)
-```
-
-`boot.Config.ResolveDuckDBPath()` 默认 `./data/<app_id>.duckdb`;可用 `CUBE_DUCKDB_PATH` 覆盖。
-
-预聚合表名见 `sixun-models/<model>/preagg.go` 的 `PreAggName` 常量,与 schema.yaml 的 `sql_table` 对齐。
+> ⚠️ **2026-10-23:整节作废。**
+>
+> 当时的设计是"每个 instance 一个独立 .duckdb 文件(挂 PV 持久化),
+> 把 model 物化进去,查询打副本",配套还有 `boot.Config.ResolveDuckDBPath()`、
+> `CUBE_DUCKDB_PATH` 环境变量、`sixun-models/<model>/preagg.go` 的 `PreAggName`。
+>
+> 这些**全部删除**:副本 = 第二份真相 = 必然滞后,而它的失效模式最贵
+> ——"报告照样成功、结果悄悄是旧的"(2026-10-22 生产实测教训)。
+> 规矩与实测代价见 **AGENTS.md §4.1 / §4.1.2**。
+>
+> 今天的数据流只有一条:
+> `config.yaml → mapping-*.yaml + sixun-models schema → cubequery.BuildTSQLJoin → 源库`。
 
 ## 查询语义由共用包统一提供
 
-`Query → SQL` 的编译**只有一份物理实现**:`pkg/cubequery.Build`。
+`Query → SQL` 的编译**只有一份物理实现**:`pkg/cubequery.BuildTSQLJoin`。
 `cmd/sixun-ysx/main.go` 与 `cmd/sixun-hbposv7/main.go` 都调用它。
+
+> ⚠️ 2026-10-23 之前还有第二条路(`pkg/cubequery.Build`,打本地副本);
+> 副本层删除后只剩 `BuildTSQLJoin` 一条 —— 语义统一,少一套方言。
 
 > 2026-10-09 之前,两个 main.go 各写了一份 `queryHandler`,其中 hbposv7 那份
 > **完全忽略 filters**、只取单个 measure/dimension、LIMIT 硬编码、无 RTRIM。

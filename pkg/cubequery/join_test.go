@@ -233,7 +233,7 @@ func TestJoin_UndeclaredJoinIsRejected(t *testing.T) {
 // 同时查两个引擎,必须明确拒绝而不是生成半对的 SQL。
 func TestJoin_CrossStorageJoinIsRejected(t *testing.T) {
 	duck := &cubeschema.Model{
-		Name: "product", SQLTable: "product", // storage 默认 duck
+		Name: "product", SQLTable: "product", // storage 未声明 ⇒ 非 live
 		Dimensions: []cubeschema.Dimension{
 			{Name: "id", SQL: "id", Type: cubeschema.TypeString},
 		},
@@ -256,7 +256,7 @@ func TestJoin_CrossStorageJoinIsRejected(t *testing.T) {
 	_, err := BuildTSQLJoin(q, duck, "product", nil, reg)
 	var be *BuildError
 	if !errors.As(err, &be) {
-		t.Fatalf("duck model 的 join 应被拒绝,got %v", err)
+		t.Fatalf("非 live model 的 join 应被拒绝,got %v", err)
 	}
 	if !strings.Contains(be.Msg, "live") {
 		t.Errorf("错误信息要说清限制来自 storage,got: %s", be.Msg)
@@ -267,7 +267,7 @@ func TestJoin_CrossStorageJoinIsRejected(t *testing.T) {
 // 输出。这条很重要:一旦单表 SQL 也变了,所有既有的行为锁就失效了。
 //
 // 比的是两条 **T-SQL** 路径(旧的单表入口 vs 新的 registry 入口)——
-// DuckDB 路径的 SQL 本来就不同(引号/别名/无重写),拿它们比没有意义。
+// 本地副本那条路的 SQL 本来就不同(引号/别名/无重写),拿它们比没有意义。
 func TestJoin_SingleTableSQLIsByteIdentical(t *testing.T) {
 	q := &Query{
 		Measures:   []string{"sale_day.sale_qty"},

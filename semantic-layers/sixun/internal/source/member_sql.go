@@ -98,25 +98,6 @@ const (
 	MemberRemainingPointsAlias = "memb_remaining_points"
 )
 
-// MemberSQL 构造 member 模型的取数 SQL(带三张派生表的 JOIN)。
-//
-// ⚠️ 这条 SQL 是**落 DuckDB 那条路**用的(loader 拉全表 → 建 _raw 表)。
-// live 路(实时透传源库)用 MemberFromFragment。
-//
-// ⚠️ 表名来自 config.yaml(不是用户输入),但仍做一次**标识符白名单校验**:
-// 表名会拼进 SQL 文本,配置写错时宁可报错也不要拼出坏 SQL。
-func MemberSQL(t MemberTables, limit int) (string, error) {
-	body, err := memberSelectBody(t)
-	if err != nil {
-		return "", err
-	}
-	if limit <= 0 {
-		limit = DefaultRowLimit
-	}
-	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
-	return fmt.Sprintf("SELECT TOP %d\n%s", limit, body), nil
-}
-
 // MemberFromFragment 构造 member 模型的 **live 取数片段**(派生表)。
 //
 // # 为什么需要它
@@ -136,10 +117,11 @@ func MemberSQL(t MemberTables, limit int) (string, error) {
 //
 // ⇒ **片段的列名 = 源列名(含 memb_\* 别名)**,不需要另造一套 canonical 名。
 //
-// # 与 MemberSQL 的差别
+// # ⚠️ 2026-10-23:这里原来还有一条"落副本"的路(MemberSQL)
 //
-//   - 没有 TOP(分页由 cube 的 limit/offset 负责);
-//   - 整体包在括号里 ⇒ 它在 SQL 里是**派生表**,不是表名。
+// MemberSQL 会给同一段 SELECT 加上 `TOP n`(拉一页回来物化进本地副本)。
+// 副本层删除后,那条路没有调用方了 ⇒ 连同 `DefaultRowLimit` 一起删掉。
+// 留下的**只有**本函数(片段)—— 它是 live 路唯一用得上的形态。
 func MemberFromFragment(t MemberTables) (string, error) {
 	body, err := memberSelectBody(t)
 	if err != nil {
@@ -153,9 +135,10 @@ func MemberFromFragment(t MemberTables) (string, error) {
 
 // memberSelectBody 构造 member 取数 SQL 的 SELECT + FROM 部分(不含 TOP)。
 //
-// ⚠️ 落 DuckDB(去 DuckDB 之前)与 live 片段**共用这一段** ——
-// 两边一旦分叉,同一张卡的余额就会在"物化副本"与"实时透传"里对不上,
-// 而这种不一致**没有任何一行报错**。
+// ⚠️ 2026-10-23:落副本那条路(带 TOP)已经删掉了,现在**只有** live 片段用它。
+// 保留成独立函数是为了让"片段"这一件事在代码里只有一个实现 ——
+// 以前是"落副本"与"live 片段"共用它,两边一旦分叉,同一张卡的余额就会在
+// "物化副本"与"实时透传"里对不上,而这种不一致**没有任何一行报错**。
 func memberSelectBody(t MemberTables) (string, error) {
 	for name, v := range map[string]string{
 		"table_member":            t.Member,
@@ -201,7 +184,8 @@ func memberSelectBody(t MemberTables) (string, error) {
 		// 前者照实给 NULL,后者会让整张 model 查不了。
 		remainingExpr = fmt.Sprintf(",\n  NULL AS %s", MemberRemainingPointsAlias)
 	}
-	// ⚠️ LIMIT 用 TOP:源库是 SQL Server 2008(不能 OFFSET-FETCH)。
+	// ⚠️ 这里**不带 TOP**:分页由 cube 的 limit/offset 负责,
+	// 片段里带 TOP 会把行数**静默**截断(少了很多行,没有任何报错)。
 	return fmt.Sprintf(`  v.*,
   c.vip_cons_amount AS %s,
   c.cons_count AS %s,

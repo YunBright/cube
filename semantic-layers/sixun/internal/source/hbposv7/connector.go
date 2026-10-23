@@ -1,10 +1,13 @@
 // Package hbposv7 是思迅 7pro 数据源 connector。
 //
-// 数据流:
+// # 2026-10-23:只剩"透传源库"这一条路
 //
-//	思迅 7pro DB → hbposv7.Connector.Fetch* → 原始 rows
-//	→ 经 cmd/sixun-hbposv7/mapping.yaml 映射
-//	→ 写 DuckDB 预聚合表(supplier / product / order_fact)
+// 以前这里是:思迅 7pro DB → Fetch*(拉全量)→ mapping.yaml 映射
+// → 写本地副本(预聚合表)。这条链在 2026-10-23 **整个删掉**了
+// (见 AGENTS.md §4.1):24 个 model 都是 storage: live,
+// 查询时把 schema 编译成 T-SQL 直打源库,不落任何本地副本。
+//
+// ⇒ Connector 现在只做三件事:连库、探版本、发一条**只读** SQL。
 package hbposv7
 
 import (
@@ -20,72 +23,19 @@ import (
 // Connector 实现 source.Connector,接思迅 7pro DB。
 type Connector struct {
 	// legacyTSQL	true = 目标实例是 SQL Server 2008 及更早(见 internal/source/legacy.go)
-	legacyTSQL      bool
-	db              *sql.DB
-	tableSupplier   string
-	tableProduct    string
-	tableCategory   string
-	tableCustType   string
-	tableSaleWay    string
-	tableSale       string
-	tableMember     string
-	tableMemberType string
-	// 会员模型的**派生列**来源表(余额 / 累计消费 / 消费次数)。
-	// ⚠️ 会员档案主表里的 residual_amt / consum_amt / consum_count
-	// 都不是会员的真实值,详见 source.MemberSQL 的注释。
-	memberConsume    string
-	memberPaylist    string
-	memberSavingPlus string
-	// memberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
-	// ⚠️ 不区分它 ⇒ 非储值的消费行会被当成储值消费扣掉 ⇒ 余额算成负数。
-	memberStoredPayType string
-	// memberPointsAccCol / memberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
-	// 用来派生「剩余积分」。**本库没有这两列** ⇒ 留空 ⇒ 不派生(恒 NULL)。
-	memberPointsAccCol  string
-	memberPointsUsedCol string
-	rowLimits           *source.RowLimits
+	legacyTSQL bool
+	db         *sql.DB
 }
 
 // Options 构造参数。
+//
+// ⚠️ 2026-10-23:以前这里有一长串 Table*(表名)与 RowLimits(行数上限),
+// 它们**只**服务于"把 model 拉下来物化进本地副本"。
+// 副本层删除后,表名由**编译器**从实例 config.yaml 的 table_* 取
+// (见 cmd/sixun-hbposv7/main.go 的 liveTables()),行数由查询里的 limit 决定 ⇒
+// 两者都不再是 connector 的责任。
 type Options struct {
-	DSN           string
-	TableSupplier string
-	TableProduct  string
-	TableCategory string
-	// TableCustType 是供应商/客户类别字典表(t_bd_cust_type)。
-	// 行数极小(实测 ysx 4 行 / hbposv7 0 行),但字典表被截断
-	// = 某些供应商查不到自己的类别。
-	TableCustType string
-	// TableSaleWay 是「销售方式」字典表(t_bd_base_code)。
-	//
-	// ⚠️ 这张表是**通用**基础代码字典,含职称/民族/学历/企业类型/品牌/单位/
-	// 销售方式… 共 30+ 行;只取 type_no='SW' 的子集(见 FetchSaleWay)。
-	TableSaleWay string
-	TableSale    string
-	// TableMember 是会员卡档案表(t_rm_vip_info)。
-	// 实测 hbposv7/hbposepro = 2642 行 / ysx/hbposv10 = 4128 行。
-	TableMember string
-	// TableMemberType 是会员类别字典表(t_rm_vip_type)。
-	// 实测两个库各 3 行;字典表被截断 = 某些会员类别查不到自己的类别。
-	TableMemberType string
-	// TableMemberConsume 是会员消费汇总表(t_rm_vip_consume):
-	// 累计消费金额(vip_cons_amount)与消费次数(cons_count)的**唯一来源**。
-	TableMemberConsume string
-	// TableMemberPaylist 是储值卡支付流水(t_rm_card_paylist):
-	// 卡内余额 = Σ充值 − Σ支付,支付额从这张表来。
-	TableMemberPaylist string
-	// TableMemberSavingPlus 是储值充值记录(t_rm_saving_plus_record):
-	// 充值金额(plus_count)从这张表来。
-	TableMemberSavingPlus string
-	// MemberStoredPayType 是 paylist.card_type 里表示"储值支付"的取值(默认 2)。
-	// 空 = 用 source.DefaultStoredPayType。
-	MemberStoredPayType string
-	// MemberPointsAccumulatedCol / MemberPointsUsedCol 是"累计积分 / 已用积分"的源列名,
-	// 用来派生「剩余积分」。**本库没有这两列** ⇒ 留空 ⇒ 不派生(该列恒 NULL)。
-	MemberPointsAccumulatedCol string
-	MemberPointsUsedCol        string
-	// RowLimits 按角色的拉取行数上限;nil 时全部回落到 source.DefaultRowLimit。
-	RowLimits *source.RowLimits
+	DSN string
 }
 
 // New 构造 Connector,做 ping 校验 DSN 通。
@@ -107,192 +57,20 @@ func New(opts Options) (*Connector, error) {
 		legacy = true // 探测失败保守处理:老方言在任何版本都能跑
 	}
 	return &Connector{
-		db:                  db,
-		legacyTSQL:          legacy,
-		tableSupplier:       opts.TableSupplier,
-		tableProduct:        opts.TableProduct,
-		tableCategory:       opts.TableCategory,
-		tableCustType:       opts.TableCustType,
-		tableSaleWay:        opts.TableSaleWay,
-		tableSale:           opts.TableSale,
-		tableMember:         opts.TableMember,
-		tableMemberType:     opts.TableMemberType,
-		memberConsume:       opts.TableMemberConsume,
-		memberPaylist:       opts.TableMemberPaylist,
-		memberSavingPlus:    opts.TableMemberSavingPlus,
-		memberStoredPayType: opts.MemberStoredPayType,
-		memberPointsAccCol:  opts.MemberPointsAccumulatedCol,
-		memberPointsUsedCol: opts.MemberPointsUsedCol,
-		rowLimits:           opts.RowLimits,
+		db:         db,
+		legacyTSQL: legacy,
 	}, nil
 }
 
-// FetchSupplier 拉供应商原始数据(思迅7pro 原始字段名)。
-func (c *Connector) FetchSupplier(ctx context.Context) ([]map[string]any, error) {
-	if c.tableSupplier == "" {
-		return nil, fmt.Errorf("hbposv7: table_supplier not configured")
-	}
-	return c.fetchTable(ctx, c.tableSupplier, source.RoleSupplier)
-}
-
-// FetchProduct 拉商品原始数据。
-func (c *Connector) FetchProduct(ctx context.Context) ([]map[string]any, error) {
-	if c.tableProduct == "" {
-		return nil, fmt.Errorf("hbposv7: table_product not configured")
-	}
-	return c.fetchTable(ctx, c.tableProduct, source.RoleProduct)
-}
-
-// FetchCategory 拉商品分类数据。
-func (c *Connector) FetchCategory(ctx context.Context) ([]map[string]any, error) {
-	if c.tableCategory == "" {
-		return nil, fmt.Errorf("hbposv7: table_category not configured")
-	}
-	return c.fetchTable(ctx, c.tableCategory, source.RoleCategory)
-}
-
-// FetchCustType 拉供应商/客户类别字典(t_bd_cust_type)。
-//
-// 行数极小(实测 ysx 4 行),但它**独立于 supplier 表**:
-// supplier.cust_clsno 指向的是本表的 type_id,两张表都要拉。
-func (c *Connector) FetchCustType(ctx context.Context) ([]map[string]any, error) {
-	if c.tableCustType == "" {
-		return nil, fmt.Errorf("hbposv7: table_cust_type not configured")
-	}
-	return c.fetchTable(ctx, c.tableCustType, source.RoleCustType)
-}
-
-// FetchSaleWay 拉「销售方式」字典(t_bd_base_code 中 type_no='SW' 的行)。
-//
-// ⚠️ **必须过滤**:t_bd_base_code 是通用基础代码字典(职称/民族/学历/企业类型/
-// 品牌/单位/销售方式…共 30+ 行),而 code_id 在不同 type_no 下**会重复**
-// ('1' 在职称/民族/学历里都有)。整张表灌进 sale_way model,primary_key 撞车
-// ⇒ 某些行被静默吞掉,查出来的 code_id→code_name 对应关系是错的。
-//
-// 过滤放在这里而不是 mapping:mapping 只做列名重写,不做行过滤;
-// 而 fetchTable 只能 `SELECT TOP n * FROM <表>`,没有 WHERE。
-func (c *Connector) FetchSaleWay(ctx context.Context) ([]map[string]any, error) {
-	if c.tableSaleWay == "" {
-		return nil, fmt.Errorf("hbposv7: table_sale_way not configured")
-	}
-	rows, err := c.fetchTable(ctx, c.tableSaleWay, source.RoleSaleWay)
-	if err != nil {
-		return nil, err
-	}
-	return source.RequireRows(source.RoleSaleWay,
-		source.FilterRowsByColumn(rows, "type_no", "SW"))
-}
-
-// FetchMember 拉会员卡档案(t_rm_vip_info)+ 三张派生表(余额 / 消费)。
-//
-// ⚠️ 表名只来自 config.yaml(source.table_member*):它们是 family 私有事实,
-// 不能写进共享的 sixun-models/schema.yaml。
-//
-// ⚠️ 这里**不是** `SELECT TOP n * FROM t_rm_vip_info`:
-// 主表里的 residual_amt(余额)是脏字符串、consum_amt / consum_count 几乎全空,
-// 真值在另外三张表里 ⇒ 取数 SQL 走 source.MemberSQL(带 JOIN)。
-// 口径与证据见 source/member_sql.go 的注释。
-//
-// ⚠️ 本库的 t_rm_vip_info **没有 acc_num / dec_num 两列**(只有 now_acc_num,
-// 且 2642 行全为 NULL)⇒ member model 的 points_accumulated / points_used
-// 两列恒为 NULL。这是**源库事实**,照实映射,不在 cube 层补数、不清洗。
-func (c *Connector) FetchMember(ctx context.Context) ([]map[string]any, error) {
-	if c.tableMember == "" {
-		return nil, fmt.Errorf("hbposv7: table_member not configured")
-	}
-	q, err := source.MemberSQL(source.MemberTables{
-		Member:               c.tableMember,
-		Consume:              c.memberConsume,
-		Paylist:              c.memberPaylist,
-		SavingPlus:           c.memberSavingPlus,
-		StoredPayType:        c.memberStoredPayType,
-		PointsAccumulatedCol: c.memberPointsAccCol,
-		PointsUsedCol:        c.memberPointsUsedCol,
-	}, c.rowLimits.For(source.RoleMember))
-	if err != nil {
-		return nil, fmt.Errorf("hbposv7: %w", err)
-	}
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("hbposv7: query member: %w", err)
-	}
-	return source.ScanRows(rows)
-}
-
-// FetchMemberType 拉会员类别字典(t_rm_vip_type)。
-//
-// 实测 hbposv7 3 行('0'=会员卡 / '1'=储值卡 / 'wx'=微信会员),
-// 独立于 member 表:member.card_type 指向本表的 type_id,两张表都要拉。
-func (c *Connector) FetchMemberType(ctx context.Context) ([]map[string]any, error) {
-	if c.tableMemberType == "" {
-		return nil, fmt.Errorf("hbposv7: table_member_type not configured")
-	}
-	return c.fetchTable(ctx, c.tableMemberType, source.RoleMemberType)
-}
-
-// FetchSaleDetail 拉销售明细(含销售退货)。
-func (c *Connector) FetchSaleDetail(ctx context.Context) ([]map[string]any, error) {
-	if c.tableSale == "" {
-		return nil, fmt.Errorf("hbposv7: table_sale not configured")
-	}
-	return c.fetchTable(ctx, c.tableSale, source.RoleSale)
-}
-
-// duckTarget 把 model 名映射到 (源库表名, 行数角色)。
-//
-// 与 ysx 的同名方法逐字一致 —— 两个 family 的 Connector 结构相同,
-// 增量 SQL 构造共用 source.FetchSince,这里只做 model→表 的映射。
-// 复制粘贴时若某个 family 漏了这个方法,它会变成"编译不过"而不是
-// "静默只支持全量"。
-func (c *Connector) duckTarget(model string) (table, role string, ok bool) {
-	switch model {
-	case "product":
-		return c.tableProduct, source.RoleProduct, true
-	case "supplier":
-		return c.tableSupplier, source.RoleSupplier, true
-	case "category":
-		return c.tableCategory, source.RoleCategory, true
-	case "cust_type":
-		return c.tableCustType, source.RoleCustType, true
-	case "sale_way":
-		return c.tableSaleWay, source.RoleSaleWay, true
-	case "sale_detail":
-		return c.tableSale, source.RoleSale, true
-	case "member":
-		return c.tableMember, source.RoleMember, true
-	case "member_type":
-		return c.tableMemberType, source.RoleMemberType, true
-	}
-	return "", "", false
-}
-
-// FetchSince 增量拉取(见 source.FetchSince 的时区与边界说明)。
-func (c *Connector) FetchSince(ctx context.Context, model string, cols source.IncrementalCols, since string) ([]map[string]any, error) {
-	table, role, ok := c.duckTarget(model)
-	if !ok {
-		return nil, fmt.Errorf("hbposv7: 未知 model %q,无法增量拉取", model)
-	}
-	if table == "" {
-		return nil, fmt.Errorf("hbposv7: model %s 的 table_* 未配置", model)
-	}
-	return source.FetchSince(ctx, c.db, table, cols, since, c.rowLimits.For(role))
-}
-
-// SourceNow 返回源库当前时间作为增量水位。
-func (c *Connector) SourceNow(ctx context.Context) (string, error) {
-	return source.SourceNow(ctx, c.db)
-}
-
-// FetchStock 拉库存数据。
-// QueryLive 把只读 SQL 直接发给源库(storage: live 的 model 用)。
-//
-// live 的 model: settlement / settlement_line / purchase_sheet /
-// purchase_sheet_line / sale_day / stock —— cube 不做原始数据同步,
-// 它们没有 Fetch* 方法,只在查询时经这条路实时打源库。
 // LegacyTSQL 报告目标实例是否为 SQL Server 2008 及更早。
 // 供编译器选择日期截断与分页写法(DATEFROMPARTS / OFFSET-FETCH 都是 2012+)。
 func (c *Connector) LegacyTSQL() bool { return c.legacyTSQL }
 
+// QueryLive 把只读 SQL 直接发给源库(storage: live 的 model 用)。
+//
+// live 的 model(全部 24 个):settlement / settlement_line / purchase_sheet /
+// purchase_sheet_line / sale_day / stock / sale_detail / payflow / …
+// —— cube 不做原始数据同步,它们只在查询时经这条路实时打源库。
 func (c *Connector) QueryLive(ctx context.Context, query string, args ...any) ([]map[string]any, error) {
 	// 源库是生产库:只读校验放在这里,而不仅依赖"编译器不生成写语句"。
 	if err := source.AssertReadOnly(query); err != nil {
@@ -311,43 +89,6 @@ func (c *Connector) Close() error {
 		return nil
 	}
 	return c.db.Close()
-}
-
-// fetchTable 通用 SELECT TOP <role 上限> * 拉数据。
-//
-// 行数上限来自配置(source.row_limit / source.row_limits),不再硬编码:
-// 硬编码 TOP 10000 会静默截断大表(hbposv10 的 t_bd_item_info 实测 27299 行),
-// 表现为"部分商品查不到"且无任何报错。生产上若单表超出上限,应先确认是否需要
-// 改为 cursor / 分页,而不是靠调小 limit 掩盖。
-func (c *Connector) fetchTable(ctx context.Context, table, role string) ([]map[string]any, error) {
-	limit := c.rowLimits.For(role)
-	q := fmt.Sprintf("SELECT TOP %d * FROM %s", limit, table)
-	rows, err := c.db.QueryContext(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("hbposv7: query %s: %w", table, err)
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("hbposv7: cols %s: %w", table, err)
-	}
-	out := make([]map[string]any, 0, 256)
-	for rows.Next() {
-		vals := make([]any, len(cols))
-		ptrs := make([]any, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			return nil, fmt.Errorf("hbposv7: scan %s: %w", table, err)
-		}
-		row := make(map[string]any, len(cols))
-		for i, c := range cols {
-			row[c] = vals[i]
-		}
-		out = append(out, row)
-	}
-	return out, rows.Err()
 }
 
 // Compile-time check:实现 source.Connector

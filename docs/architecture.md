@@ -1,6 +1,6 @@
 # 架构
 
-> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> ⚠️ **2026-10-23:本文档里关于本地副本 / 预聚合 / 刷新 job / 水位 的部分已作废。**
 > 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
 > **不保留任何本地副本、不做任何原始数据同步**。
 > 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
@@ -40,8 +40,8 @@
  │  不同 DSN    │   │  不同 DSN    │           │  另一 binary │
  │              │   │              │           │  各自一份    │
  │ • mapping    │   │ • mapping    │           │ • mapping    │
- │ • DuckDB     │   │ • DuckDB     │           │ • DuckDB     │
- │   (独立)     │   │   (独立)     │           │   (独立)     │
+ │ (无本地副本)│   │ (无本地副本)│           │ (无本地副本)│
+ │              │   │              │           │              │
  │ • L2 缓存    │   │ • L2 缓存    │           │ • L2 缓存    │
  │ • 细粒度权限 │   │ • 细粒度权限 │           │ • 细粒度权限 │
  └──────┬───────┘   └──────┬───────┘           └──────┬───────┘
@@ -76,7 +76,7 @@
 | gateway / compiler 固定 id | P0-1 | [dapr-app-contract.md](dapr-app-contract.md) |
 | source = app_id,1:1 寻址 | v2 | [dapr-app-contract.md](dapr-app-contract.md) |
 | 多版本共享 schema | P0-2 | [semantic-layer-design.md](semantic-layer-design.md) |
-| 每 instance 独立 DuckDB | P0-3 | [semantic-layer-design.md](semantic-layer-design.md) |
+| 每 instance 独立本地副本 | **已作废**(P0-3,2026-10-23 删除) | [AGENTS.md §4.1](../AGENTS.md) |
 | env 驱动 instance 配置 | v2 | [runtime-ops.md](runtime-ops.md) |
 | 部署模式 | P0-4 | [runtime-ops.md](runtime-ops.md) |
 | mapping.yaml 语义 | P1-5 | [semantic-layer-design.md](semantic-layer-design.md) |

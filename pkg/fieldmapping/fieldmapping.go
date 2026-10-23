@@ -149,7 +149,7 @@ func (m *Mapper) Resolve(target string) (string, bool) {
 	return def.Source, true
 }
 
-// TargetsWithType 返回所有 target 字段及其类型(用于 DuckDB 建表)。
+// TargetsWithType 返回所有 target 字段及其类型(用于核对一个 model 的物理列集合)。
 func (m *Mapper) TargetsWithType() []FieldDef {
 	out := make([]FieldDef, 0, len(m.targets))
 	for _, name := range m.targets {
@@ -304,7 +304,7 @@ func convert(v any, t FieldType) (any, error) {
 		}
 		return nil, fmt.Errorf("cannot convert %T to bool", v)
 	case TypeDatetime:
-		// DuckDB 直接识别 time.Time;此处原样返回,由 driver 层保证类型正确
+		// 源库驱动(mssql)直接识别 time.Time;此处原样返回,由 driver 层保证类型正确
 		return v, nil
 	}
 	return nil, fmt.Errorf("unknown field type %q", t)

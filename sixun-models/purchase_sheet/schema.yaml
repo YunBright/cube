@@ -31,7 +31,7 @@
 # 金额不做 dimension(理由同 settlement):带 dimensions: [purchase_sheet.id] 取单据金额。
 name: purchase_sheet
 sql_table: purchase_sheet
-storage: live  # 不落 DuckDB:刚收货的单要立刻可查,落盘快照会漏(见 settlement/schema.yaml 顶部说明)
+storage: live  # 不落本地副本:刚收货的单要立刻可查,落盘快照会漏(见 settlement/schema.yaml 顶部说明)
 
 dimensions:
   - name: id
@@ -125,6 +125,33 @@ dimensions:
     type: string
     title: 备注
     description: 源列 other1。实测装的是异常说明文本(如"破损、被偷"、"食品破包")
+
+  # amount 是**单据金额**(源列 sheet_amt)。
+  #
+  # ⚠️ 为什么它必须是**维度**而不是只有度量:
+  #   金额本来是度量(total_amount_yuan = SUM(amount))⇒ 度量**不能被过滤**
+  #   (cube 的 filter 只作用于维度)⇒ "金额 ≥ X"就没法表达。
+  #   而 purchase_sheet 是**单据头表,一行一单** ⇒ 金额就是行上的列
+  #   ⇒ 把它同时暴露成维度,过滤就等价于 SQL 的 HAVING。
+  #
+  # ⚠️ 源列是 numeric ⇒ 过滤走**数值比较**(live 路径的 number 列不包 RTRIM,
+  #   否则会变成字典序比较 ⇒ 漏行)。
+  - name: amount
+    sql: amount
+    type: number
+    title: 单据金额(元)
+    description: |
+      源列 sheet_amt(单据金额)。
+
+      ⚠️ 采购侧**退货单是正数** ⇒ 这一列对 RO 也是正的
+      (净额是另一列 total_net_amount_yuan,RO 才是负的)。
+
+  - name: order_amount
+    sql: order_amount
+    type: number
+    title: 订单金额(元)
+    description: |
+      源列 order_amt(下单金额,与单据金额可能不同)。
 
 measures:
   - name: count

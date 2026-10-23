@@ -1,5 +1,11 @@
 // time.go 时间维度(timeDimensions)与日期过滤的编译。
 //
+// # ⚠️ 2026-10-23:`duckTime` 这一半方言**已不再使用**,但**故意保留**
+//
+// 本地副本层删掉之后,生产路径只剩 `tsqlTime`(T-SQL)。
+// `duckTime` 已无生产调用方,只被自己的单测覆盖 —— 原因与后续清理步骤见
+// **build.go 的文件头说明**。
+//
 // **为什么单独成文件**:dateRange / granularity 都要用到"按方言生成日期表达式",
 // 而 DuckDB 与 T-SQL 的写法完全不同(DATE_TRUNC vs DATEFROMPARTS、
 // now() vs GETDATE())。这些差异必须收敛在这里,由 build.go / tsql.go 各自
@@ -42,6 +48,9 @@ type timeDialect struct {
 	legacy bool
 }
 
+// duckTime 是**已删除的本地副本那条路**的日期方言。
+//
+// ⚠️ 2026-10-23:已无生产调用方,**故意保留**待独立清理(见文件头说明)。
 var duckTime = timeDialect{
 	name:    "duckdb",
 	nowExpr: "CURRENT_DATE",

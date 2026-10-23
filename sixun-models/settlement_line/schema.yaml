@@ -19,7 +19,7 @@
 #   审批"逐个拆开核对采购进货"对联营单据不适用。
 name: settlement_line
 sql_table: settlement_line
-storage: live  # 不落 DuckDB,查询时实时透传源库(见 sixun-models/settlement/schema.yaml 顶部说明)
+storage: live  # 不落本地副本,查询时实时透传源库(见 sixun-models/settlement/schema.yaml 顶部说明)
 
 dimensions:
   - name: id

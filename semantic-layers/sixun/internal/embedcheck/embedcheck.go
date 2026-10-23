@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/YunBright/cube/pkg/cubeschema"
 	"github.com/YunBright/cube/pkg/fieldmapping"
 
 	models "github.com/YunBright/cube/sixun-models"
@@ -34,10 +35,11 @@ import (
 // 为直接子文件的那一层)。
 //
 // 校验项:
-//  1. 每个 model 都能读到 schema 且能解析;
-//  2. 每个 model 都有 mapping(缺 → 该 model 静默不可查);
-//  3. 每个 mapping 至少映射了一个字段(空 mapping = 列名一个没重写);
-//  4. 反向:每个 mapping-*.yaml 都对应一个存在的 schema(防孤儿 mapping,
+//  1. 每个 model 都能读到 schema 且能解析(解析失败 ⇒ 报出**原因**);
+//  2. 每个 schema 的 storage 都是 live(2026-10-23 去本地副本之后唯一的合法值);
+//  3. 每个 model 都有 mapping(缺 → 该 model 静默不可查);
+//  4. 每个 mapping 至少映射了一个字段(空 mapping = 列名一个没重写);
+//  5. 反向:每个 mapping-*.yaml 都对应一个存在的 schema(防孤儿 mapping,
 //     拼错 model 名会命中这条)。
 func Check(mappingFS fs.FS) error {
 	names, err := models.ModelNames()
@@ -66,6 +68,22 @@ func Check(mappingFS fs.FS) error {
 		}
 		if len(strings.TrimSpace(string(b))) == 0 {
 			problems = append(problems, fmt.Sprintf("schema %s 是空文件", name))
+			continue
+		}
+
+		// ⚠️ 2026-10-23:schema 必须**解析得过**,而且 storage 必须是 live。
+		//
+		// 这条以前是**没有**的 ⇒ 有人写 `storage: duck` 时 schema **静默加载成功**,
+		// 直到查询那一刻才炸 "model X is not a live model" —— 报错点离真正的原因
+		// 隔了"加载 → 注册 → 编译 → 打源库"整条链路。
+		//
+		// 现在 cubeschema.Load() 会在**加载期**就拒掉非 live 的 storage,
+		// 而这里是**第二道**:把这条约束钉进**永远会跑的**测试
+		// (cmd/sixun-*/embed_test.go 两个 family 各跑一次),
+		// 而不是只在"机器上有 config.yaml"时才生效的 config_test.go 里。
+		schemaProblems := checkSchema(name, b)
+		problems = append(problems, schemaProblems...)
+		if len(schemaProblems) > 0 {
 			continue
 		}
 
@@ -98,6 +116,26 @@ func Check(mappingFS fs.FS) error {
 
 	if len(problems) > 0 {
 		return fmt.Errorf("内嵌资产不完整:\n  - %s", strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
+// checkSchema 校验一个 schema 的字节:能解析 + storage 是 live。
+//
+// 独立成函数是为了**可测**:Check() 读的是**内嵌**资产(今天全是好的),
+// 想证明"坏 schema 会被抓住"就得能喂坏的进来 —— 所以测试直接调它。
+//
+// 返回空切片 = 这个 schema 没问题。
+func checkSchema(name string, b []byte) []string {
+	schema, err := cubeschema.Load(b)
+	if err != nil {
+		return []string{fmt.Sprintf(
+			"schema %s 不合法: %v —— **测试不过**,而不是运行期才炸", name, err)}
+	}
+	if schema.Storage != cubeschema.StorageLive {
+		return []string{fmt.Sprintf(
+			"model %q 的 storage=%q —— 全仓去掉本地副本之后**只有** live 可用",
+			name, schema.Storage)}
 	}
 	return nil
 }

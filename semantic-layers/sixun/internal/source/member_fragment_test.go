@@ -85,7 +85,7 @@ func TestMemberFromFragmentRejectsBadTableName(t *testing.T) {
 
 // TestMemberFragmentHasNoTop 锁"片段里没有 TOP"。
 //
-// TOP 是**落 DuckDB 那条路**的(loader 一次拉一页);
+// TOP 是**已删除的本地副本那条路**的(loader 一次拉一页);
 // live 路的分页由 cube 的 limit/offset 负责 ⇒ 片段里带 TOP 会把行数**截断**,
 // 而且是静默的(少了很多行,没有任何报错)。
 func TestMemberFragmentHasNoTop(t *testing.T) {

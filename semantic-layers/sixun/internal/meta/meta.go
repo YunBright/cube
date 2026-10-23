@@ -17,7 +17,7 @@ import (
 type ModelInfo struct {
 	Name        string          `json:"name"`
 	Title       string          `json:"title,omitempty"`
-	Storage     string          `json:"storage"`                // duck | live
+	Storage     string          `json:"storage"`                // 恒为 "live"(本地副本层已于 2026-10-23 删除)
 	SourceTable string          `json:"source_table,omitempty"` // 仅 live:实例 config 里的源表名
 	Dimensions  []DimensionInfo `json:"dimensions"`
 	Measures    []MeasureInfo   `json:"measures"`
@@ -65,7 +65,7 @@ func Build(models map[string]ModelSource) []ModelInfo {
 		}
 		info := ModelInfo{
 			Name:    m.Name,
-			Storage: string(m.EffectiveStorage()),
+			Storage: string(m.Storage),
 			// SourceTable 是 family 私有事实,只在这里出现,不进共享 schema。
 			SourceTable: src.SourceTable,
 		}

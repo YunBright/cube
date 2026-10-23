@@ -7,13 +7,18 @@ package source_test
 // 前面那些单测证明的是"我们生成了我们以为会生成的映射";而会员这块有三个
 // 事实只能在**真库**上验出来:
 //
-//  1. **行数没有被 row_limit 截断**。
+//  1. **行数没有因为截断而少**。
 //     截断是**静默**的:`SELECT TOP n *` 没有 ORDER BY,丢的是随机行,
 //     表现是"某些会员查不到",而 healthz 全绿、没有任何报错。
 //     历史上商品表就因为硬编码 TOP 10000 丢过 63%(ysx)/ 77%(hbposv7)。
 //
+//     ⚠️ 2026-10-23:本地副本层删掉后,行数不再由"拉取上限"决定,
+//     而是由**查询里的 limit/offset** 决定。会员的 live 片段
+//     (source.MemberFromFragment)**不带 TOP** ⇒ 它必须返回源库的全部行。
+//     这条断言现在守的是"片段里别偷偷加 TOP"。
+//
 //  2. **一行都没被 mapping 转换失败而丢掉**。
-//     dataloader.mapRows 对转换失败的行是**静默丢弃**的(continue,不是报错),
+//     旧的物化器(mapRows)对转换失败的行是**静默丢弃**的(continue,不是报错),
 //     而 member 的 balance_yuan 源列 residual_amt 是带脏值的 varchar
 //     ('20,,' / ':84420..' / '86220.-')—— 若把它按 decimal 处理,
 //     ParseFloat 报错 ⇒ 整张表的行数会悄悄少一大截。
@@ -67,11 +72,14 @@ type liveConfig struct {
 		TableMember     string `yaml:"table_member"`
 		TableMemberType string `yaml:"table_member_type"`
 		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
-		TableMemberConsume    string         `yaml:"table_member_consume"`
-		TableMemberPaylist    string         `yaml:"table_member_paylist"`
-		TableMemberSavingPlus string         `yaml:"table_member_savingplus"`
-		RowLimit              int            `yaml:"row_limit"`
-		RowLimits             map[string]int `yaml:"row_limits"`
+		TableMemberConsume    string `yaml:"table_member_consume"`
+		TableMemberPaylist    string `yaml:"table_member_paylist"`
+		TableMemberSavingPlus string `yaml:"table_member_savingplus"`
+		// MemberStoredPayType 是 paylist.card_type 里"储值支付"的那个取值。
+		MemberStoredPayType string `yaml:"member_stored_pay_type"`
+		// MemberPointsAccumulatedCol / MemberPointsUsedCol 是积分列名(派生剩余积分用)。
+		MemberPointsAccumulatedCol string `yaml:"member_points_accumulated_col"`
+		MemberPointsUsedCol        string `yaml:"member_points_used_col"`
 	} `yaml:"source"`
 }
 
@@ -80,20 +88,20 @@ type memberFamily struct {
 	name string
 	// cmdDir 是 cmd/sixun-<name> 相对 internal/source 的路径。
 	cmdDir string
-	// memberRows / memberTypeRows 是 2026-10-21 对**生产源库**实测的 COUNT(*)。
-	memberRows     int
-	memberTypeRows int
+	// memberRowsFloor / memberTypeRows 是 2026-10-21 对**生产源库**实测的 COUNT(*)。
+	//
+	// ⚠️ memberRowsFloor 是**下限**,不是精确值:
+	// t_rm_vip_info 是**会持续增长**的表(每开一次卡就多一行),
+	// 2026-10-23 实测已经是 4133 行(比 4128 多 5 行)。
+	// 所以断言写成"不得少于实测下限"而不是"必须等于" ——
+	// 断言的重点是"**没被截断**"(片段里带 TOP 就会少一大截),
+	// 不是"源库今天恰好有多少行"。
+	memberRowsFloor int
+	memberTypeRows  int
 	// hostPortEnv 是覆盖 DSN host:port 的环境变量名(ssh 隧道用)。
 	hostPortEnv string
 	// newConn 构造该 family 的 connector。
-	newConn func(liveConfig, *source.RowLimits) (memberFetcher, error)
-}
-
-// memberFetcher 是两个 connector 共用的最小接口。
-type memberFetcher interface {
-	FetchMember(ctx context.Context) ([]map[string]any, error)
-	FetchMemberType(ctx context.Context) ([]map[string]any, error)
-	Close() error
+	newConn func(liveConfig) (source.Connector, error)
 }
 
 func TestMemberLiveAgainstSource(t *testing.T) {
@@ -101,40 +109,21 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 		{
 			name:           "ysx",
 			cmdDir:         filepath.Join("..", "..", "cmd", "sixun-ysx"),
-			memberRows:     4128,
-			memberTypeRows: 3,
-			hostPortEnv:    "CUBE_TEST_YSX_HOSTPORT",
-			newConn: func(cfg liveConfig, rl *source.RowLimits) (memberFetcher, error) {
-				return ysx.New(ysx.Options{
-					DSN:             cfg.Source.DSN,
-					TableMember:     cfg.Source.TableMember,
-					TableMemberType: cfg.Source.TableMemberType,
-					// ⚠️ 派生列来源表:缺任何一张 ⇒ 余额/消费算不出来
-					// (MemberSQL 会直接报错,不会"悄悄少一列")。
-					TableMemberConsume:    cfg.Source.TableMemberConsume,
-					TableMemberPaylist:    cfg.Source.TableMemberPaylist,
-					TableMemberSavingPlus: cfg.Source.TableMemberSavingPlus,
-					RowLimits:             rl,
-				})
+			memberRowsFloor: 4128,
+			memberTypeRows:  3,
+			hostPortEnv:     "CUBE_TEST_YSX_HOSTPORT",
+			newConn: func(cfg liveConfig) (source.Connector, error) {
+				return ysx.New(ysx.Options{DSN: cfg.Source.DSN})
 			},
 		},
 		{
 			name:           "hbposv7",
 			cmdDir:         filepath.Join("..", "..", "cmd", "sixun-hbposv7"),
-			memberRows:     2642,
-			memberTypeRows: 3,
-			hostPortEnv:    "CUBE_TEST_HBPOSV7_HOSTPORT",
-			newConn: func(cfg liveConfig, rl *source.RowLimits) (memberFetcher, error) {
-				return hbposv7.New(hbposv7.Options{
-					DSN:             cfg.Source.DSN,
-					TableMember:     cfg.Source.TableMember,
-					TableMemberType: cfg.Source.TableMemberType,
-					// ⚠️ 派生列来源表:缺任何一张 ⇒ 余额/消费算不出来。
-					TableMemberConsume:    cfg.Source.TableMemberConsume,
-					TableMemberPaylist:    cfg.Source.TableMemberPaylist,
-					TableMemberSavingPlus: cfg.Source.TableMemberSavingPlus,
-					RowLimits:             rl,
-				})
+			memberRowsFloor: 2642,
+			memberTypeRows:  3,
+			hostPortEnv:     "CUBE_TEST_HBPOSV7_HOSTPORT",
+			newConn: func(cfg liveConfig) (source.Connector, error) {
+				return hbposv7.New(hbposv7.Options{DSN: cfg.Source.DSN})
 			},
 		},
 	}
@@ -159,7 +148,7 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 				t.Fatalf("%s 缺少 source.table_member / table_member_type —— "+
 					"该 model 会静默不可查", cfgPath)
 			}
-			// ⚠️ 派生列来源表缺一列 ⇒ MemberSQL 直接报错(不会"悄悄少一列"),
+			// ⚠️ 派生列来源表缺一列 ⇒ 片段构造直接报错(不会"悄悄少一列"),
 			//   但错误信息只说"哪个表没配" ⇒ 这里先自己查清楚,报错才指得准。
 			for name, v := range map[string]string{
 				"source.table_member_consume":    cfg.Source.TableMemberConsume,
@@ -172,7 +161,7 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 				}
 			}
 
-			conn, err := fam.newConn(cfg, source.NewRowLimits(cfg.Source.RowLimit, cfg.Source.RowLimits))
+			conn, err := fam.newConn(cfg)
 			if err != nil {
 				t.Skipf("连不上源库(没起隧道?): %v", err)
 			}
@@ -182,23 +171,43 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 			memberMapper := loadMapper(t, fam.cmdDir, "member")
 			typeMapper := loadMapper(t, fam.cmdDir, "member_type")
 
-			// ---- member:行数必须等于实测值(没被 row_limit 截断)----
-			rows, err := conn.FetchMember(ctx)
+			// ---- member:跑**生产同款**的 live 片段,行数必须等于实测值 ----
+			//
+			// ⚠️ 这里刻意走 source.MemberFromFragment(而不是自己拼 SQL):
+			// 它就是 cmd/sixun-<family>/main.go 的 liveTables() 挂给
+			// table_member 的那段文本 ⇒ 验的就是生产真正发出去的那条 SQL。
+			frag, err := source.MemberFromFragment(source.MemberTables{
+				Member:               cfg.Source.TableMember,
+				Consume:              cfg.Source.TableMemberConsume,
+				Paylist:              cfg.Source.TableMemberPaylist,
+				SavingPlus:           cfg.Source.TableMemberSavingPlus,
+				StoredPayType:        cfg.Source.MemberStoredPayType,
+				PointsAccumulatedCol: cfg.Source.MemberPointsAccumulatedCol,
+				PointsUsedCol:        cfg.Source.MemberPointsUsedCol,
+			})
 			if err != nil {
-				t.Fatalf("FetchMember: %v", err)
+				t.Fatalf("构造 member live 片段失败: %v", err)
 			}
-			if len(rows) != fam.memberRows {
-				t.Fatalf("member 拉到 %d 行,实测是 %d 行 —— "+
-					"等于某个整数上限就说明被 row_limit 截断了(静默,零报错)",
-					len(rows), fam.memberRows)
+			// ⚠️ 派生表**必须带别名** —— SQL Server 报 "Each derived table must
+			// have its own alias"(缺别名时报 "'(' 附近有语法错")。
+			// 生产里的别名是 t0(编译器给的),这里给同一个,免得验的不是同一条 SQL。
+			rows, err := conn.QueryLive(ctx, "SELECT * FROM "+frag+" AS t0")
+			if err != nil {
+				t.Fatalf("查 member live 片段: %v", err)
 			}
-			t.Logf("%s member: 拉到 %d 行(与源库实测一致,未截断)", fam.name, len(rows))
+			if len(rows) < fam.memberRowsFloor {
+				t.Fatalf("member 片段返回 %d 行,2026-10-21 实测下限是 %d 行 —— "+
+					"少于实测值说明被截断了(片段里带 TOP 就会这样,且零报错)",
+					len(rows), fam.memberRowsFloor)
+			}
+			t.Logf("%s member: 片段返回 %d 行(≥ 2026-10-21 实测下限 %d,未截断)",
+				fam.name, len(rows), fam.memberRowsFloor)
 
 			// ---- member:一行都不能被 mapping 转换失败丢掉 ----
 			mapped := mapRowsForTest(t, memberMapper, rows)
 			if len(mapped) != len(rows) {
-				t.Fatalf("mapping 转换后只剩 %d 行(拉回来 %d 行)—— "+
-					"有行被 fieldmapping.convert 拒绝了(dataloader.mapRows 是静默丢行的)",
+				t.Fatalf("mapping 转换后只剩 %d 行(查回来 %d 行)—— "+
+					"有行被 fieldmapping.convert 拒绝了(旧物化器 mapRows 是静默丢行的)",
 					len(mapped), len(rows))
 			}
 
@@ -209,17 +218,17 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 			assertMemberNotNormalized(t, mapped)
 
 			// ---- member_type ----
-			typeRows, err := conn.FetchMemberType(ctx)
+			typeRows, err := conn.QueryLive(ctx, "SELECT * FROM "+cfg.Source.TableMemberType)
 			if err != nil {
-				t.Fatalf("FetchMemberType: %v", err)
+				t.Fatalf("查 member_type: %v", err)
 			}
 			if len(typeRows) != fam.memberTypeRows {
-				t.Fatalf("member_type 拉到 %d 行,实测是 %d 行", len(typeRows), fam.memberTypeRows)
+				t.Fatalf("member_type 返回 %d 行,实测是 %d 行", len(typeRows), fam.memberTypeRows)
 			}
-			t.Logf("%s member_type: 拉到 %d 行", fam.name, len(typeRows))
+			t.Logf("%s member_type: 返回 %d 行", fam.name, len(typeRows))
 			typeMapped := mapRowsForTest(t, typeMapper, typeRows)
 			if len(typeMapped) != len(typeRows) {
-				t.Fatalf("member_type mapping 转换后只剩 %d 行(拉回来 %d 行)",
+				t.Fatalf("member_type mapping 转换后只剩 %d 行(查回来 %d 行)",
 					len(typeMapped), len(typeRows))
 			}
 			assertTargetsCoverSchema(t, "member_type", typeMapper, typeRows[0], typeMapped[0])
@@ -230,12 +239,12 @@ func TestMemberLiveAgainstSource(t *testing.T) {
 
 // assertTargetsCoverSchema 断言 mapping 的 target 集合 == schema 的 dimension 名集合。
 //
-// 少一条 ⇒ DuckDB 里没有那一列 ⇒ 查询报 column not found;
-// 多一条 ⇒ DuckDB 里多一列,schema 却不认识它。
+// 少一条 ⇒ 源库里没有那一列 ⇒ 查询报 column not found;
+// 多一条 ⇒ 源库里多一列,schema 却不认识它。
 //
 // 抽样行里某个 dimension 没有键,是**允许**的:前提是它的源列在源库里不存在
 // (hbposv7 的 t_rm_vip_info 没有 acc_num / dec_num ⇒ points_accumulated /
-// points_used 恒为 NULL)。DuckDB 那一列仍然存在(由 mapping 的 target 建出来),
+// points_used 恒为 NULL)。这一列仍然存在(由 mapping 的 target 建出来),
 // 只是值恒为 NULL —— 这正是"照实映射"要的结果。
 func assertTargetsCoverSchema(t *testing.T, model string, m *fieldmapping.Mapper,
 	rawRow, mappedRow map[string]any) {
@@ -262,7 +271,7 @@ func assertTargetsCoverSchema(t *testing.T, model string, m *fieldmapping.Mapper
 		t.Fatalf("model %q 的 mapping target 与 schema dimension 不一致:\n  schema    = %v\n  mapping  = %v",
 			model, want, got)
 	}
-	// 源列存在的 dimension,抽样行里必须有键(否则会被写成 NULL)。
+	// 源列存在的 dimension,抽样行里必须有键(否则会被当成 NULL)。
 	for _, name := range want {
 		if _, ok := mappedRow[name]; ok {
 			continue
@@ -338,7 +347,7 @@ func assertMemberNotNormalized(t *testing.T, rows []map[string]any) {
 		raw, ok := r["residual_amt_raw"].(string)
 		if !ok {
 			t.Errorf("residual_amt_raw 不是字符串(%T)—— 源列 residual_amt 是 varchar,"+
-				"且带脏值,按 decimal 处理会让 mapRows 静默丢行", r["residual_amt_raw"])
+				"且带脏值,按 decimal 处理会让旧物化器静默丢行", r["residual_amt_raw"])
 		} else {
 			if _, err := strconv.ParseFloat(raw, 64); err != nil {
 				dirtyRaw++
@@ -363,7 +372,7 @@ func assertMemberNotNormalized(t *testing.T, rows []map[string]any) {
 	}
 }
 
-// assertMemberTypeNotNormalized 锁住会员类别字典"原样给"。
+// assertMemberTypeNotNormalized 锁会员类别字典"原样给"。
 func assertMemberTypeNotNormalized(t *testing.T, rows []map[string]any) {
 	t.Helper()
 	for _, r := range rows {
@@ -394,14 +403,14 @@ func assertMemberTypeNotNormalized(t *testing.T, rows []map[string]any) {
 	}
 }
 
-// mapRowsForTest 复刻 dataloader.mapRows 的行为,但把"丢行"变成显式失败。
+// mapRowsForTest 把 mapping 的丢行行为变成显式失败。
 func mapRowsForTest(t *testing.T, m *fieldmapping.Mapper, rows []map[string]any) []map[string]any {
 	t.Helper()
 	out := make([]map[string]any, 0, len(rows))
 	for i, row := range rows {
 		mr, err := m.Apply(row)
 		if err != nil {
-			t.Fatalf("第 %d 行 mapping 转换失败:%v —— dataloader 会**静默丢**这一行", i, err)
+			t.Fatalf("第 %d 行 mapping 转换失败:%v —— 旧物化器会**静默丢**这一行", i, err)
 		}
 		out = append(out, mr)
 	}

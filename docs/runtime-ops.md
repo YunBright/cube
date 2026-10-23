@@ -1,6 +1,6 @@
 # 运行时运维(P0-4)
 
-> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> ⚠️ **2026-10-23:本文档里关于本地副本 / 预聚合 / 刷新 job / 水位 / 行数上限 的部分已作废。**
 > 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
 > **不保留任何本地副本、不做任何原始数据同步**。
 > 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
@@ -33,7 +33,7 @@ dapr run --app-id cube-compiler -- \
 
 ### 启动 cube app 实例(v2 — env 驱动)
 
-> **核心变化**:cube app 的所有差异(数据源 DSN / 端口 / DuckDB / 注册地址)
+> **核心变化**:cube app 的所有差异(数据源 DSN / 端口 / 注册地址)
 > 都通过 **环境变量** 注入,同一份 binary 可以服务多个 instance(门店)。
 
 #### 通用环境变量(`boot.Load()` 读取)
@@ -44,9 +44,12 @@ dapr run --app-id cube-compiler -- \
 | `DAPR_APP_ID`     |   | (dapr 自动注入) | dapr sidecar app-id。**首选源** — dapr 启动时自动注入。/register body 用此上报给 gateway 当 dapr app-id |
 | `CUBE_DAPR_APP_ID`|   | `"cube-" + CUBE_APP_ID` | 手动覆盖 dapr app-id。空值走推导默认值。**通常不需要设** |
 | `CUBE_PORT`       |   | `:8080` | gin 监听端口 |
-| `CUBE_DUCKDB_PATH`|   | `./data/<app_id>.duckdb` | 本地 DuckDB 文件 |
 | `CUBE_GATEWAY_URL`|   | `http://localhost:8080` | cube-gateway HTTP base |
-| `CUBE_REFRESH_EVERY`|  | `30m` | duck 模型定时重拉间隔;`0` 关闭 |
+
+> ⚠️ **2026-10-23:两个 env 一起删掉了** ——
+> `CUBE_DUCKDB_PATH`(本地副本文件路径)与 `CUBE_REFRESH_EVERY`(副本定时重拉间隔)。
+> 没有副本 ⇒ 既没有路径也没有"重拉"这回事。
+> 留着它们会让人以为实例还在自己维护一份数据副本。
 
 > **没有** `CUBE_MODELS_DIR` / `CUBE_MAPPING_DIR` —— schema 与 mapping 都用
 > `go:embed` 编译进二进制了(2026-10-09 改动)。曾经有,已删,理由见下方
@@ -156,71 +159,20 @@ curl -s http://localhost:8080/v1/sources | jq
 #   ] }
 ```
 
-### DuckDB 运行时依赖(P0-3 + go-pduckdb)
+### 本地副本运行时依赖 —— **已删除**
 
-`pkg/duckdb` 用 **`github.com/fpt/go-pduckdb`**(纯 Go DuckDB driver),**不需 gcc / MinGW**。
-但**运行时**机器上要有 `libduckdb` 共享库(.so / .dylib / .dll)。
-
-#### 安装(本地 dev)
-
-**Windows**:
-```powershell
-# 1. 下载 DuckDB Windows release(选 v1.5.4 或更新)
-curl -L -o duckdb.zip `
-  "https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-windows-amd64.zip"
-Expand-Archive duckdb.zip -DestinationPath C:\tools\duckdb
-
-# 2. 库路径加到环境变量
-$env:DUCKDB_LIBRARY_PATH = "C:\tools\duckdb\duckdb.dll"
-$env:PATH += ";C:\tools\duckdb"
-
-# 3. 验证
-CUBE_APP_ID=sixun-ysx-00 go run ./cmd/sixun-ysx
-# 应该看到 "SQL Server connected" + "loaded model=supplier rows=N"
-```
-
-**macOS**:
-```bash
-brew install duckdb
-# libduckdb 自动装到 /opt/homebrew/lib/libduckdb.dylib
-CUBE_APP_ID=sixun-ysx-00 go run ./cmd/sixun-ysx
-```
-
-**Linux (Ubuntu/Debian)**:
-```bash
-curl -sSL \
-  "https://github.com/duckdb/duckdb/releases/download/v1.5.4/libduckdb-linux-amd64.zip" \
-  -o /tmp/libduckdb.zip
-sudo unzip -j /tmp/libduckdb.zip libduckdb.so -d /usr/local/lib/
-sudo ldconfig
-```
-
-#### 库路径查找优先级(go-pduckdb)
-
-1. 环境变量 `DUCKDB_LIBRARY_PATH`(绝对路径)
-2. macOS: `DYLD_LIBRARY_PATH` 目录
-3. Linux: `LD_LIBRARY_PATH` 目录
-4. 系统标准库目录
-
-#### Docker(k8s)
-
-`semantic-layers/sixun/Dockerfile.template` 多阶段 build:
-- Stage 1: `golang:1.25-alpine` + `CGO_ENABLED=0` 编译(纯 Go,无需 gcc)
-- Stage 2: `alpine:3.20` + 下载 `libduckdb-linux-amd64.zip` 放到 `/usr/local/lib/`
-
-```bash
-docker build \
-  --build-arg INSTANCE=sixun-hbposv7 \
-  -t cube-sixun-hbposv7 .
-```
-
-#### 测试集成
-
-```bash
-# 装好 libduckdb 后:
-cd pkg && go test ./duckdb/...
-# 期望看到 3 个 PASS(原来是 SKIP)
-```
+> ⚠️ **2026-10-23:整节作废。**
+>
+> 当时 `pkg/duckdb` 用 `github.com/fpt/go-pduckdb`(纯 Go driver),
+> 运行期还要在机器上装 `libduckdb` 共享库(Windows / macOS / Linux 三套安装步骤),
+> Docker 镜像也要多一个下载 stage。
+>
+> 这些**全部删除**:`pkg/duckdb` 包没了,依赖 `go-pduckdb` 也从
+> `pkg/go.mod` 移除了(2026-10-23 `go mod tidy`)。
+>
+> ⇒ **现在没有任何 DuckDB 运行时依赖** —— 只剩 `go-mssqldb`(直连思迅源库)。
+> 机器上不需要装任何额外的共享库,镜像也不需要额外的下载 stage。
+> 规矩与理由见 **AGENTS.md §4.1**。
 
 ### Hosted(k8s,P2)
 
@@ -239,7 +191,7 @@ cd pkg && go test ./duckdb/...
 │  cube-app Deployment(per-instance)          │
 │  每 instance 一个 Deployment / StatefulSet   │
 │  CUBE_APP_ID / DSN 走 env / Secret         │
-│  + 独立 PVC(挂载 ./data/<app_id>.duckdb)    │
+│  (无 PVC:实例不持有任何数据副本)             │
 └─────────────────────────────────────────────┘
 ```
 
@@ -256,50 +208,37 @@ cube app 的 `/healthz` 另有三段,排查刷新问题时先看它们:
 ```json
 {
   "status": "ok",
-  "data":    { "interval_seconds": 1800, "data_age_seconds": 52,
-               "consecutive_failures": 0, "models": { "product": { ... } } },
-  "refresh": { "mode": "dapr-job", "job_name": "cube-refresh",
-               "triggered": 3, "skipped_overlap": 0 }
+  "source": "sixun-ysx-00",
+  "dapr_app_id": "cube-sixun-ysx-00",
+  "models": ["product", "member", "..."],
+  "uptime": "12m3s"
 }
 ```
 
-- `status` = `degraded` 时仍返 **200**(数据旧 ≠ 服务不可用),别用 5xx 判活
-- `data_age_seconds` 超过 `2 × interval_seconds` 才判 stale,避免刚启动时误报
-- `refresh.mode` 见下节
+- `status` **恒为 `ok`** —— 本实例**不持有任何数据副本**,查询实时透传源库,
+  所以没有"数据过期"这回事(新鲜度 = 源库的新鲜度)。
+- ⚠️ 2026-10-23 之前还有 `data`(副本物化状态与年龄)与 `refresh`(刷新 job 统计)
+  两段,**现在都删了** —— 留着它们会是**假信号**:一个恒为 "ok" 的健康检查
+  会让人以为"有人在管数据的新鲜度"。`internal/boot` 的
+  `TestHealthHandler_NoCopySegments` 钉住了这一点。
 
-## 刷新驱动:dapr-job 优先,ticker 兜底
+## 刷新驱动(dapr-job / ticker)—— **已删除**
 
-duck 模型的定时重拉由 `internal/refreshschedule` 统一管,两种模式:
-
-| mode | 含义 | 触发源 |
-|---|---|---|
-| `dapr-job` | 已登记到 Dapr Scheduler | sidecar 到点 POST `/job/cube-refresh` |
-| `ticker` | 登记失败,退回进程内定时器 | `time.Ticker` |
-| `disabled` | `interval <= 0` | 无 |
-
-**为什么必须有兜底**:Dapr Jobs 是 alpha 能力,可用性取决于集群里 Scheduler 与 sidecar 的连通性。
-2026-10-10 实测:sidecar 被指向 `localhost:50006` 时 Jobs API 直接挂死(超时,不是 404),
-表现是「登记没成功也没报错」。纯 job 的话结果就是**数据永远不刷新、healthz 全绿**。
-
-**ticker 不是终点 —— 收到 job 触发会自动切回。** Scheduler 恢复后,之前留在 etcd 里的
-job 会继续投递(触发时找不到可用 sidecar 的会进 staging queue,等 sidecar 可用后自动补投)。
-app 一收到自己的 job,就同时证明了 Scheduler 活着、etcd 数据完好、sidecar 在线,
-于是**立刻切回 `dapr-job` 并停掉 ticker**:
-
-```
-收到 dapr job 触发,判定 Scheduler 已恢复,切回 dapr-job 并停止 ticker
-```
-
-不切的话,ticker 与 job 会同时刷同一个 DuckDB(刷新频率翻倍),而且 `refresh.mode`
-会显示 `ticker` 而 job 其实一直在触发 —— **那个字段会开始说谎**。
-
-所以运维上:
-
-- `refresh.mode: ticker` 且 `refresh.schedule_error` 有值 = Scheduler 不可用,查调度器
-- 恢复后不必重启 cube app,等下一次 job 触发会自动切回(最迟一个间隔)
-- `refresh.triggered` / `skipped_overlap` 是**进程内**计数,重启归零;
-  `skipped_overlap` 持续增长说明刷新耗时已超过间隔(在途守卫在丢触发),
-  该调大 `refresh.every` 或优化加载
+> ⚠️ **2026-10-23:整节作废。**
+>
+> 当时 `internal/refreshschedule` 用两种模式驱动副本的定时重拉:
+> `dapr-job`(登记到 Dapr Scheduler,sidecar 到点 POST `/job/cube-refresh`)
+> 与 `ticker`(登记失败时退回进程内定时器),并把 `mode` / `triggered` /
+> `skipped_overlap` 写进 healthz。
+>
+> 这些**全部删除**:没有副本 ⇒ 没有"重拉"⇒ 没有刷新 job、没有调度器登记、
+> 没有 `cube-refresh` / `cube-refresh-full` 这两个 job。
+> `config.yaml` 的 `refresh:` 段(`incremental` / `incremental_fallback` /
+> `full_schedule`)也一并删除。
+>
+> ⇒ 现在**没有任何后台任务**。要"只看变过的行",用 model 上显式声明的
+> "最后变动时间"维度(如 `product.updated_at`),由**下游编排方**加 `gt` 过滤
+> —— 见 AGENTS.md §4「增量过滤维度」行。
 
 ## 改动 schema / mapping 后:生效与验证
 
@@ -329,9 +268,11 @@ schema 缺 mapping、mapping 为空、mapping 拼错 model 名,都会让测试�
 ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep 'loading schemas'"
 ```
 
-### 必须重启才会重拉
+### 必须重新构建 + 重启
 
-新列写进 DuckDB 的唯一路径是启动时的 `Fetch → mapping → LoadFrom`:
+⚠️ 2026-10-23 之前这里是"必须重启才会重拉"(把新列写进本地副本)。
+现在**没有副本、也没有"拉"这一步** —— schema/mapping 是 `go:embed` 编译进二进制的,
+所以生效路径是:**重新构建 → 重新部署 → 重启**。
 
 ```bash
 ssh gyy "systemctl --user restart cube-sixun-ysx.service && sleep 90 && systemctl --user is-active cube-sixun-ysx.service"
@@ -339,45 +280,48 @@ ssh gyy "systemctl --user restart cube-sixun-ysx.service && sleep 90 && systemct
 
 ### ⚠️ 空结果不等于配置错了
 
-重拉过程中查询会返回 `{"data":[]}`。**先判断是不是还没拉完,再怀疑配置**:
+⚠️ 旧流程里"重拉过程中查一次返回 `{"data":[]}`"是**表正在重建**造成的。
+现在没有重建这一步 ⇒ 空结果就是**真的空**:要么过滤条件写错,
+要么源库那段区间本来就没有数据。
 
 ```bash
-ssh gyy "ls -la /opt/YunBright/cube/semantic-layers/sixun-ysx/data/"   # 看 .duckdb/.wal 时间戳
+ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep -E 'live model 缺|schemas loaded'"
+# → 有 "live model 缺 source.table_*" ⇒ 是漏配表名,不是数据问题
 ```
 
-### 用 COUNT(*) 自检有没有被 row_limit 截断
+### 用 COUNT(*) 对一下源库实测行数
 
 ```bash
 curl -s -X POST http://127.0.0.1:8083/query -H 'Content-Type: application/json' \
   -d '{"measures":["product.count"],"dimensions":[]}'
-# → 27299 == 源库实测行数 ✅
-# → 10000 / 50000 这类整数 = 被 row_limit 截断了 ❌
+# → 与源库 COUNT(*) 同量级 ✅
+# → 10000 / 50000 这类整数 = 被某个写死的上限截断了 ❌
 ```
 
-`COUNT(*)` **恰好等于某个上限值**,基本可以断定数据被静默截断。
+⚠️ 2026-10-23:`row_limit` / `DefaultRowLimit` 已删除,现在**没有任何配置上限**。
+所以这项从"检查有没有被上限截断"变成"检查**源库侧**是不是本来就少"。
 
 多 family 一致性验证:同一条 query body 打不同端口,比对返回的 `sql` 字段是否**逐字节相同**。
 
-## row_limit(拉取行数上限)
+## 行数上限(`row_limit`)—— **已删除**
 
-`source.DefaultRowLimit = 50000`(`semantic-layers/sixun/internal/source/source.go`),
-`config.yaml` 可按角色覆盖:
+> ⚠️ **2026-10-23:整套机制删除。**
+>
+> `source.DefaultRowLimit = 50000`、`source.RowLimits` / `source.NewRowLimits`、
+> `source.Role*`、以及 `config.yaml` 的 `row_limit:` / `row_limits:` 键全部删除。
+> 它们只服务于"把 model 拉全量物化进本地副本"时的封顶。
+>
+> 现在的对应物只有一条:**查询里的 `limit`**
+> (`pkg/cubequery.DefaultLimit = 1000` 是没给 limit 时的兜底,
+> 调用方 cube-router 每页 5000)—— 它限制的是**返回给调用方的行数**,
+> 不是"从源库拉多少行",而且**显式**、每次查询的 SQL 里都看得见。
 
-```yaml
-source:
-  row_limit: 50000        # 未覆盖角色的兜底
-  row_limits:
-    product: 50000         # 源库实测 27299 / 44313
-    stock:   40000         # 源库实测 23576 / 10607
-    supplier: 2000
-    category: 2000
-    # sale 流水表不要跟着放大 —— 它才是该单独限流的那个
-```
+历史教训仍然成立(只是现在没有"默认值"可配了):
+**过载会报错,截断不会** —— 任何写死的 `TOP n` 都要拿实测行数对一遍。
 
 2026-10-09 实测:硬编码 `TOP 10000` 曾让 ysx 静默丢 63% 商品、hbposv7 丢 77%,
 **库存表还丢 57%**(会让盘点账面数量直接是错的),而全链路零报错。
-实测 27299 行 × 65 列全量拉取仅 3.6MB / 1.4s。
-**默认值必须高于所有维表的实测行数** —— 正确性不能依赖"记得配这一项"。
+实测 27299 行 × 65 列全量拉取仅 3.6MB / 1.4s —— **"别一次性拉太多"在这个量级上是想象出来的约束**。
 
 ## 日志
 
@@ -407,4 +351,3 @@ P2 候选:
 | cube-gateway 挂 | BI 工具全失败;启动新实例(注册表由 dapr state store 持久化) |
 | cube-compiler 挂 | cube app 正常运行,只是不能 reload 新代码;重启 compiler 即可 |
 | dapr sidecar 挂 | dapr 自动重启(根据 liveness probe) |
-| Scheduler 不可用(广播地址错 / 容器停) | 启动时登记失败 → 自动回退 ticker,`refresh.mode=ticker` + `schedule_error` 有值;数据照常刷新。Scheduler 恢复后由 job 触发自动切回,不必重启 app |

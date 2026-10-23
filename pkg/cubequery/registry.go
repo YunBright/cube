@@ -16,7 +16,7 @@ type ModelEntry struct {
 	Schema *cubeschema.Model
 	// SourceTable 是该 model 的物理表名。
 	//   - live model:实例 config 的 table_*(透传源库,必须真实表名)
-	//   - duck model :schema.SQLTable(DuckDB 侧表名)
+	//   - 非 live 的 model(已不存在):schema.SQLTable —— 那是本地副本侧的表名
 	SourceTable string
 	// Mapper 把该 model 的 canonical 列名解析成物理列名。
 	Mapper ColumnResolver

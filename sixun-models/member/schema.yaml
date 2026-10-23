@@ -18,12 +18,12 @@
 # 让下游排查时无从查证(playbook §3.2)。
 name: member
 sql_table: member
-# 2026-10-23:改成 live(全仓去 DuckDB)。
+# 2026-10-23:改成 live(全仓去掉本地副本)。
 # ⚠️ **member 的 live 源不是表名,是片段**:卡内余额 / 累计消费 / 消费次数
 #    是"主表 JOIN 三张流水表"算出来的(源库里没有这几列)
 #    ⇒ 片段见 internal/source/member_sql.go 的 MemberFromFragment。
 storage: live
-# 增量刷新按主键 upsert(见 internal/dataloader)。
+# ⚠️ 2026-10-23:增量刷新(按主键 upsert 进本地副本)已删除,primary_key 现在**没有读取方**;字段保留只为不再让已有 schema 里的 primary_key: id 变成被静默忽略的僵尸配置。
 # ✅ 实测两库 distinct(card_id) == 行数(无重复),所以 card_id 可以当主键。
 primary_key: id
 
@@ -127,7 +127,7 @@ dimensions:
       源列 vip_tax(numeric(16,4))。
       ⚠️ **type 必须与物理列一致(= number)**（2026-10-21 生产实测踩到）：
       查询构造器按 dimension 的 type 决定要不要包 RTRIM，而
-      **DuckDB 的 RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报
+      **RTRIM 只接受 VARCHAR** ⇒ 对 DECIMAL 直接报
       "No function matches RTRIM(DECIMAL)" ⇒ 整个查询 500。
       ⚠️ mapping 里这一列的 type 也必须是 decimal：
       go-mssqldb 把 numeric 扫成 []byte，若 mapping 写 string，
@@ -277,10 +277,11 @@ dimensions:
     title: 操作时间
     description: |
       源列 oper_date(datetime)= 建卡/最后一次业务操作时间。
-      ⚠️ **它同时是增量刷新的回退列**(见 config.yaml 的
-      refresh.incremental_fallback.member):实测 modify_date 有
-      1154 行(ysx)/2573 行(hbposv7)是 NULL,而 oper_date **0 行为 NULL**,
-      所以 COALESCE(modify_date, oper_date) 能覆盖全部行。
+      ⚠️ 2026-10-23:它曾是增量刷新的回退列(config.yaml 的
+      refresh.incremental_fallback.member,那套配置已删除)。
+      保留这条实测记录是因为它仍然有用:oper_date **0 行为 NULL**
+      (实测 modify_date 有 1154 行(ysx)/2573 行(hbposv7)是 NULL)
+      ⇒ 想知道"会员档案最后一次变化",oper_date 比 modify_date 可靠。
 
   - name: valid_from
     sql: valid_from

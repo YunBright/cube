@@ -1,6 +1,6 @@
 # Dapr App 协议(v2 — plan B 解耦版)
 
-> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> ⚠️ **2026-10-23:本文档里关于本地副本 / 预聚合 / 刷新 job / 水位 的部分已作废。**
 > 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
 > **不保留任何本地副本、不做任何原始数据同步**。
 > 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
@@ -165,7 +165,7 @@ X-Request-Id: <optional>               // 不传则 gateway 自动生成
 | member 不在 schema | **400 `QUERY_INVALID`**,`details.order_member` |
 
 排序按 **SELECT 别名**实现(`"settlement.settled_at"` / `[settlement.settled_at]`),
-DuckDB 与 T-SQL 两条路径共用同一份编译逻辑,语义逐字一致。
+两条存储路径(现已合并为 T-SQL 一条)共用同一份编译逻辑,语义逐字一致。
 
 > ⚠️ 不给 `order` 时 `limit` 是**任意截取**(ysx 4348 张结算单、hbposv7 799 张,
 > TOP/LIMIT 按存储顺序取前 N 行)。列表类场景必须显式给 `order`,
@@ -203,7 +203,7 @@ DuckDB 与 T-SQL 两条路径共用同一份编译逻辑,语义逐字一致。
 `beforeDate` / `afterDate`(排他)。值必须是 `YYYY-MM-DD`,否则 400。
 
 **大小写无关的子串匹配**:`containsCI`(2026-10-20 新增)。
-`contains` 编译成 `RTRIM(col) LIKE '%v%'`,而 DuckDB 的 LIKE **大小写敏感**
+`contains` 编译成 `RTRIM(col) LIKE '%v%'`,而 SQL Server 的 LIKE **大小写敏感**
 (实测 `Face` 命中、`face` 不命中)。思迅商品名里混着拉丁品牌名
 (洁柔Face / C&S / H01-04),用户打出小写就搜不到。
 

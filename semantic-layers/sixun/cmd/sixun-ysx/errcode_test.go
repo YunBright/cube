@@ -39,7 +39,7 @@ type errEnvelope struct {
 // postQuery 打一次 /query 并解出错误信封。
 //
 // 只测错误路径,所以 db / conn 都可以传 nil:错误发生在 SQL 拼装阶段,
-// 走不到 DuckDB 与源库。传 nil 也顺带证明了"错误分类不依赖任何 IO 成功"。
+// 走不到源库(也没有本地副本可走)。传 nil 也顺带证明了"错误分类不依赖任何 IO 成功"。
 func postQuery(t *testing.T, model string, body string) (int, errEnvelope) {
 	t.Helper()
 

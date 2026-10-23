@@ -45,7 +45,7 @@ func loadDeployedConfig(t *testing.T) appConfig {
 
 // TestDeployedConfigCoversEveryLiveModel 锁"每个 live model 都有源"。
 //
-// ⚠️ 2026-10-23 去 DuckDB 之后,**全部 model 都是 live** ⇒ 源表名(config 的
+// ⚠️ 2026-10-23 去掉本地副本之后,**全部 model 都是 live** ⇒ 源表名(config 的
 // table_<model>)就是它们**唯一**的取数入口 —— 少一条,那个 model 就静默不可查。
 //
 // 症状特别难查:main.go 只打一行 "live model 缺 source.table_*,该 model 不可查询",
@@ -77,9 +77,9 @@ func TestDeployedConfigCoversEveryLiveModel(t *testing.T) {
 			t.Errorf("解析 schema %q 失败: %v", name, err)
 			continue
 		}
-		if schema.EffectiveStorage() != cubeschema.StorageLive {
-			t.Errorf("model %q 不是 live model(storage=%s)—— 全仓去 DuckDB 之后应当都是 live",
-				name, schema.EffectiveStorage())
+		if schema.Storage != cubeschema.StorageLive {
+			t.Errorf("model %q 不是 live model(storage=%s)—— 全仓去掉本地副本之后应当都是 live",
+				name, schema.Storage)
 			continue
 		}
 		if strings.TrimSpace(live[name]) == "" {

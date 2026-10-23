@@ -1,6 +1,6 @@
 # 数据源勘察与 mapping 编写手册
 
-> ⚠️ **2026-10-23:本文档里关于 DuckDB / 预聚合 / 刷新 job / 水位 的部分已作废。**
+> ⚠️ **2026-10-23:本文档里关于本地副本 / 预聚合 / 刷新 job / 水位 / 行数上限 的部分已作废。**
 > 全部 model 改成 `storage: live`(查询时把 schema 编译成 T-SQL 直打源库),
 > **不保留任何本地副本、不做任何原始数据同步**。
 > 规矩与理由见 **AGENTS.md §4.1**;现状见 **docs/cache-strategy.md**。
@@ -24,7 +24,7 @@
 | # | 铁律 | 违反后的症状 |
 |---|---|---|
 | 1 | **连接不通时不要猜任何列名** | 猜错 → 整表 `LoadFrom` 失败 / 或更糟:拉到空数据 |
-| 2 | **mapping 是白名单** | schema 加了 dimension,DuckDB 里**根本没有这一列**,查询报 column not found |
+| 2 | **mapping 是白名单** | schema 加了 dimension,mapping 里**根本没有这一条**,查询报 column not found |
 | 3 | **共享 schema 必须所有 family 一起改** | 改一边 → 另一边查该字段直接 SQL 报错 |
 | 4 | **任何静默截断 / 静默忽略都比报错危险** | 过载会报错;截断只会让大半数据凭空消失,且 healthz 全绿 |
 
@@ -67,7 +67,9 @@ SELECT COUNT(*) FROM t_bd_supcust_info;
 SELECT COUNT(*) FROM t_bd_item_cls;
 ```
 
-实测值(2026-10-09),这张表直接决定了 `row_limit` 怎么配:
+实测值(2026-10-09)。⚠️ **2026-10-23:`row_limit` / `row_limits` 整套配置已删除**
+(那是给"拉全量物化副本"封顶用的;副本层没了 ⇒ 没有"拉"这一步 ⇒ 没有上限可配)。
+今天这张表只用来判断"查询会不会太慢",不再用来配上限:
 
 | 表 | ysx / hbposv10 | hbposv7 / hbposepro |
 |---|---|---|
@@ -121,7 +123,7 @@ SELECT '[' + item_no + ']' FROM t_bd_item_info WHERE item_no LIKE '6922303199721
 -- hbposv7: [6922303199721       ]  ← 尾部 7 个空格
 ```
 
-思迅的 char 定长列普遍补空格,而 **DuckDB 会原样保留**。
+思迅的 char 定长列普遍补空格,而源库会**原样保留**。
 查询层统一 `RTRIM`,详见 §4.3。
 
 ---
@@ -156,7 +158,7 @@ WHERE TABLE_NAME='t_bd_item_info' AND COLUMN_NAME LIKE '%unit%';
 ```
 ① sixun-models/product/schema.yaml              加 dimension
      - name: unit
-       sql: unit          ← 这是 DuckDB 侧的列名,由 mapping 产出
+       sql: unit          ← canonical 侧的列名,由 mapping 产出
        type: string
        title: 商品单位
 
@@ -171,12 +173,16 @@ WHERE TABLE_NAME='t_bd_item_info' AND COLUMN_NAME LIKE '%unit%';
 
 ### 3.2 mapping.yaml 的边界(AGENTS.md §4 拍板,不要越界)
 
-**mapping 条数 = DuckDB 物理列数。** `product` 的 DuckDB 表当前 **9 列**
+**mapping 条数 = model 的物理列数。** `product` 的 mapping 当前 **9 条**
 (`id / name / category_id / supplier_id / unit / price_yuan / cost_yuan / status / created_at`),
-正好等于 `mapping-product.yaml` 的 9 条映射(加 `unit` 之前是 8 列)。
+正好等于它能查出来的列数(加 `unit` 之前是 8 条)。
 
 schema.yaml 里 dimension + measure 共 13 条,**不等于**物理列数 ——
 measure 是查询时聚合出来的,不对应物理列。数列时别拿 schema 条数去对。
+
+> ⚠️ 现在的硬约束由 `mapping_parity_test.go` 断言:**mapping 的 target 集合
+> == schema 的 dimension 集合**(两个 family 都查)。少一条 → 源库 column not found;
+> 多一条 → schema 不认识它。
 
 ```yaml
 mappings:
@@ -236,12 +242,18 @@ ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep 'loading sche
 
 ---
 
-## 4. 让改动真正生效:全量重拉
+## 4. 让改动真正生效:重新构建 + 重启
 
-### 4.1 必须重启才会重拉
+> ⚠️ **2026-10-23:这一节重写过。**
+> 以前改完 schema/mapping 要"全量重拉"—— 因为东西要写进本地副本。
+> 现在**没有副本、也没有"拉"这一步**:schema/mapping 是 `go:embed` 编译进二进制的,
+> 所以生效路径只有一条:**重新构建 → 重新部署 → 重启进程**。
 
-新增列要写进 DuckDB,唯一的路径是启动时的 `Fetch → mapping → LoadFrom`。
-所以改完 schema/mapping 后**必须 `systemctl --user restart cube-sixun-*.service`**。
+### 4.1 必须重新构建 + 重启
+
+改 schema/mapping 后必须**重新构建二进制并重启**
+(`systemctl --user restart cube-sixun-*.service`)。
+只重启不重建 ⇒ 跑的还是旧二进制里的旧 schema(模型是 embed 进去的)。
 
 ```bash
 ssh gyy "systemctl --user restart cube-sixun-ysx.service && sleep 90 && systemctl --user is-active cube-sixun-ysx.service"
@@ -249,19 +261,20 @@ ssh gyy "systemctl --user restart cube-sixun-ysx.service && sleep 90 && systemct
 
 ### 4.2 **空结果不代表配置错了**
 
-本次在重拉过程中查了一次,返回 `{"data":[]}` —— 当时几乎要回滚。
-实际上只是**表正在重建**。
+⚠️ 旧流程里"查一次返回 `{"data":[]}`"是**表正在重建**造成的;
+现在没有重建这一步 ⇒ 空结果就是**真的空**,要么过滤条件写错,
+要么源库那段区间本来就没有数据。
 
 正确的判读顺序:
 
 ```bash
-# 1. 看 duckdb 文件时间戳/大小有没有在动
-ssh gyy "ls -la /opt/YunBright/cube/semantic-layers/sixun-ysx/data/"
-# 2. 再等一会儿重查
-# 3. 最后才怀疑配置
+# 1. 看进程是不是刚重启、日志里有没有 "live model 缺 source.table_*"
+ssh gyy "journalctl --user -u cube-sixun-ysx.service -n 200 | grep -E 'live model|schemas loaded'"
+# 2. 去掉过滤条件再查一次(确认不是被过滤掉的)
+# 3. 最后才怀疑 mapping / schema
 ```
 
-**先看"是不是还没拉完",再想"是不是配错了"。**
+**先看"是不是没加载上",再想"是不是配错了"。**
 
 ### 4.3 RTRIM:统一在查询层,不要在数据层
 
@@ -280,7 +293,7 @@ GROUP BY id                  -- 裸列名
 LIMIT 5
 ```
 
-这条规则已固化在共用包 `pkg/cubequery.Build` 里,见 §5。
+这条规则已固化在共用包 `pkg/cubequery.BuildTSQLJoin` 里,见 §5。
 
 ---
 
@@ -305,19 +318,25 @@ LIMIT 5
 
 ```
 pkg/cubequery/                ← Query → SQL 的唯一实现
-   build.go   buildFilter / buildOrder / TrimExpr   (DuckDB 方言)
+   build.go   buildFilter / buildOrder / TrimExpr   (共用逻辑)
    tsql.go    rewriteColumns / numberPlaceholders    (T-SQL 方言,live 透传)
         ↑ buildOrder 与 buildFilter 是**两个方言共用**的,只有别名列名引号不同
-   ├── cmd/sixun-ysx/main.go      按 storage 分流调 Build / BuildTSQL
+   ├── cmd/sixun-ysx/main.go      调 BuildTSQLJoin
    └── cmd/sixun-hbposv7/main.go  同上
 ```
 
 **补丁只能修这一次症状;共用代码才能让分叉不可能再发生。**
 
+> ⚠️ 2026-10-23 之前 `build.go` 里的 `Build` 是**打本地副本**的第二条路
+> (别名引号用 `"`、日期用 `DATE_TRUNC`、分页用 `LIMIT`)。
+> 副本层删除后只剩 `BuildTSQLJoin` 一条 ⇒ **不再有两套方言可分叉**。
+> `build.go` 里那一半 DuckDB 方言暂时留在代码里(它只被自己的单测覆盖),
+> 清理它是独立的一次改动 —— 见 AGENTS.md §4 的"存储分层"行。
+
 > 加 ORDER BY 时这条规则直接生效:`buildOrder` 写在 `build.go`,
 > 两条路径只通过 `quote` 参数区分别名引号(`"` vs `[`),
 > 并由 `TestOrder_DialectsAgree` 锁住"同一条 query 两条路径逐字一致"。
-> 若当初把 ORDER BY 各写一份,就会重演"live 有排序、duck 没有"的分叉。
+> 若当初把 ORDER BY 各写一份,就会重演"live 有排序、副本没有"的分叉。
 
 ### 5.1 抽共用代码时的陷阱:顺手"优化"语义
 
@@ -363,9 +382,9 @@ ssh gyy "grep -n 'target: unit' .../sixun-ysx/mapping/mapping-product.yaml"
 # ② 服务已用新配置重启
 ssh gyy "systemctl --user is-active cube-sixun-ysx.service"
 
-# ③ 行数 = 源库实测行数(证明没被 row_limit 截断)
+# ③ 行数 = 源库实测行数(证明没被截断)
 curl -s -X POST http://127.0.0.1:8083/query -d '{"measures":["product.count"],"dimensions":[]}'
-# → 27299 == §1.2 实测值;若正好等于 10000,就是被截断了
+# → 与 §1.2 实测值同量级;若正好等于 10000 / 50000 这类整数,基本可以断定被截了
 
 # ④ 目标数据真的有值,且 SQL 里出现了新字段
 curl -s -X POST http://127.0.0.1:8083/query -d @/tmp/query.json
@@ -375,42 +394,44 @@ curl -s -X POST http://127.0.0.1:8083/query -d @/tmp/query.json
 ```
 
 第 ③ 项是最容易被跳过、但**最能暴露截断**的一项。
-`COUNT(*)` 恰好等于 `DefaultRowLimit` 或某个整数上限时,基本可以断定被截了。
+⚠️ 2026-10-23:`row_limit` / `DefaultRowLimit` 已删除 —— 现在**没有任何配置上限**,
+所以这一项从"检查有没有被上限截断"变成"检查**源库侧**是不是本来就少"。
 
 ---
 
-## 7. row_limit:默认值必须高于实测行数
+## 7. 行数上限(`row_limit`)—— **已删除**
 
-```go
-// semantic-layers/sixun/internal/source/source.go
-const DefaultRowLimit = 50000
-```
-
-`row_limits` 按角色独立配置(`config.yaml`):
+> ⚠️ **2026-10-23:整套机制删除。**
+>
+> 它存在的前提是"cube 会把 model 拉全量物化进本地副本",
+> 上限的作用是给那次拉取封顶(`SELECT TOP n *`,无 ORDER BY ⇒ 截断丢的是随机行)。
+>
+> 副本层删除后 cube **根本不拉数** ⇒ 没有"拉"这一步 ⇒ 没有上限可配。
+> `row_limit` / `row_limits` 配置键、`source.DefaultRowLimit`、`source.RowLimits`
+> 与 `source.Role*` 全部删除。
+>
+> 今天的对应物只有一条:**查询里的 `limit`**
+> (`pkg/cubequery.DefaultLimit = 1000` 是没给 limit 时的兜底,
+> 调用方 cube-router 每页 5000)—— 它限制的是**返回给调用方的行数**,
+> 不是"从源库拉多少行",而且是**显式**的、每次查询都在 SQL 里看得见的。
 
 ```yaml
+# ❌ 2026-10-23 起这些键不再被读取(留着无害,但会被误以为还在生效)
 source:
-  row_limit: 50000        # 未覆盖角色的兜底
+  row_limit: 50000
   row_limits:
-    product: 50000         # 实测 27299 / 44313
-    stock:   40000         # 实测 23576 / 10607
-    supplier: 2000         # 实测 218 / 300
-    category: 2000         # 实测 186 / 596
-    # sale 流水表**不要**跟着放大 —— 它才是该单独限流的那个
+    product: 50000
 ```
 
-两条规则:
-
-1. **默认值必须高于所有维表的实测行数。** 漏配配置时,"多拉一点"远比"静默丢数据"安全。
-   正确性不能依赖"记得配这项"。
-2. **只有真正常驻增长的表才配上限。** 本项目流水表实测 0 行,
-   真要限流时单独配 `sale`,别用同一个值把维表和流水表一起放开。
+历史教训仍然成立(只是现在没有"默认值"可配了):
+**过载会报错,截断不会** —— 任何写死的 `TOP n` 都要拿实测行数对一遍。
 
 ---
 
 ## 8. 测试要锁住"正确约束",不是"当前实现"
 
-本次发现仓库里一条测试:
+⚠️ 2026-10-23:`DefaultRowLimit` 相关的那两条测试**随机制一起删除**。
+下面留作**反面教材**(它们曾经把一个缺陷钉成了规格):
 
 ```go
 func TestDefaultRowLimitIsBelowRealProductTableSize(t *testing.T) {
@@ -422,7 +443,7 @@ func TestDefaultRowLimitIsBelowRealProductTableSize(t *testing.T) {
 后来有人把 `TOP 10000` 外置成配置(确实是进步)→ "忘记配置"退回默认值 →
 **缺陷复活,而这条测试因为缺陷还在而全绿**。
 
-正确的方向是反过来,锁住真实约束:
+正确的方向是反过来,锁住真实约束(下面是**当时的**写法,机制已删):
 
 ```go
 func TestDefaultRowLimitCoversRealTableSizes(t *testing.T) {
@@ -448,7 +469,7 @@ func TestDefaultRowLimitCoversRealTableSizes(t *testing.T) {
 | 步骤 | 动作 | 验证点 |
 |---|---|---|
 | 1 | 确认源库连通(本机 + cube 所在机器) | 不连通则停,不猜列名 |
-| 2 | `COUNT(*)` 实测 4~5 张表行数 | 决定 `row_limits` |
+| 2 | `COUNT(*)` 实测 4~5 张表行数 | 判断查询代价(旧流程用它定 `row_limits`,那套已删) |
 | 3 | `INFORMATION_SCHEMA` 找候选列 | 拿到准确列名 |
 | 4 | `SELECT 真实行` 看值形态 | 决定要不要 join |
 | 5 | 在**另一个 family 源库**重复 3~4 | 确认共享 schema 可行 |

@@ -50,10 +50,10 @@ cube/
 | 决策 | 选择 | 不要做的 |
 |---|---|---|
 | 多版本共享 schema | 抽 `<family>-models` module,差异在 mapping.yaml | ❌ 复制代码、❌ 写 Go 硬编码映射 |
-| DuckDB 存储 | 每个 dapr cube app instance 独立 .duckdb 文件(命名 `<app_id>.duckdb`) | ❌ 共享一个 DB |
+| 本地存储层 | **没有本地存储层**(2026-10-23 起):全部 model 都是 `storage: live`,查询时把 schema 编译成 T-SQL 直打源库,**不落任何本地副本**。实例的"数据新鲜度"= 源库的新鲜度 | ❌ 给 cube 加任何本地副本(数据库文件 / 内存表 / 本地文件)、❌ 定时把源表拉下来同步 |
 | Instance 配置 | env 驱动(`CUBE_APP_ID` 是 wire id;`DAPR_APP_ID` 由 dapr 自动注入,cube app 报给 gateway 当 dapr app-id 寻址用),同 binary 多 instance | ❌ 硬编码 const、❌ 编译时区分 instance |
 | 模型资产交付 | **schema.yaml / mapping.yaml 一律 `go:embed` 编译进二进制**(`sixun-models/embed.go` + 各 cmd 的 `mappingAssets`);只有 `config.yaml` 留盘(含 DSN 口令) | ❌ 运行时读盘(原 `CUBE_MODELS_DIR` 路径探测:**路径对不上时一个模型都加载不到,但启动不报错**,已删除)、❌ 把 DSN 打进二进制、❌ 归档里塞模型文件 |
-| 资产完整性 | 由 `internal/embedcheck` 兜底:schema 缺 mapping / mapping 为空 / mapping 拼错 model 名 → **测试失败** | ❌ 靠运行期 INFO 日志提示"mapping missing"然后 continue |
+| 资产完整性 | 由 `internal/embedcheck` 兜底:schema 缺 mapping / mapping 为空 / mapping 拼错 model 名 / **schema 解析不过(含 `storage:` 不是 live)** → **测试失败** | ❌ 靠运行期 INFO 日志提示"mapping missing"然后 continue |
 | 配置读取 | `internal/appcfg` 统一:**`config.local.yaml` > `config.yaml`**,存在即生效,不读 env。两份都在 `.gitignore`;`config.example.yaml` 进版本库 | ❌ 用 env 变量指配置路径、❌ 允许 config.local.yaml 留在服务器上(会盖住部署下去的 config.yaml,「部署不生效」且零报错,`deploy-cube.ps1 -Step prune` 负责删) |
 | config.yaml 随包发布 | **归档含 config.yaml,部署会用打包机工作区那份覆盖远端**(用户 2026-10-09 决定不移出) | ❌ 只改远端不改本地(下次部署静默还原)、❌ 在别处维护"生产配置" |
 | 部署模式 | hosted (k8s) + 本地 dev (docker-compose) | ❌ 其他模式 |
@@ -71,14 +71,14 @@ cube/
 | segment(预定义过滤) | schema 里写一段静态 SQL 谓词,调用方只传名字(`"segments":["purchase_return"]`),编译进 WHERE。**SQL 里只能用 canonical 名**(mapping 的 target),由 mapping 在查询时重写成该 family 的源列名 | ❌ 写源库列名(两个 family 源列名一致时恰好能跑,不一致时才炸)、❌ 含 `?`(segment 不带参数,占位符变成无人绑定的位置)、❌ 含子查询(列名重写是标识符盲替换,会误伤)、❌ 跨 model 引用别的 model 的 segment(编译期报 `segment not found`) |
 | 采购退货单 | **不是独立 model**:pm 模块实测只有 `t_pm_sheet_master` / `t_pm_sheet_detail` / `t_pm_process_yh` 三张表,RO 就是 master 里的行。用 `purchase_sheet` 的 segment `purchase_return` / `purchase_receipt`。⚠️ **两侧金额符号相反**:采购侧 RO 是**正数**(ysx +175.2 万 / hbposv7 +130.5 万),结算侧 RO 是**负数**(ysx -171.7 万 / hbposv7 -174.4 万) | ❌ 为它单开一个 model(同一张表的维度定义要维护两份,必然分叉),❌ 用 `total_amount_yuan` 不带 segment 直接聚合(退货被再加一遍,实测多算 350 万/261 万),❌ 拿采购侧 RO 与结算侧 RO 直接比(差一个符号、约 346 万) —— 必须用 `total_net_amount_yuan`(RO 取负) |
 | 查询语义共用 | **`Query → SQL` 只有一份实现:`pkg/cubequery.BuildTSQLJoin`**,各 family 的 main.go 都调它 | ❌ 各 main.go 各写一份 queryHandler(2026-10-09 教训:hbposv7 那份**完全忽略 filters** → 带 filter 查询退化成"取前 1000 行",调用方取 data[0] 拿到**错误实体**,200 OK 零报错) |
-| 拉取行数上限 | 实时查询的行数由**调用方的 limit** 决定(cube-router 每页 5000);`pkg/cubequery.DefaultLimit = 1000` 是没给 limit 时的兜底 | ❌ 在 SQL 里写死 `TOP 10000` 之类的上限(历史上丢过 63% 商品,零报错) |
-| 增量刷新 / 水位 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准"、没有 `refresh:` 配置段。**下游**(supertrade 侧)的增量水位是**另一套东西**(它自己的编排服务管),与 cube 无关 | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加 DuckDB 水位表、❌ 再在 config 里加 `refresh:` 段 |
+| 拉取行数上限 | **没有"拉取上限"这个概念了**(2026-10-23:`row_limit` / `row_limits` 配置键与 `source.DefaultRowLimit` / `source.RowLimits` 一并删除 —— 那是给"拉全量物化副本"封顶用的)。现在行数由**调用方的 limit** 决定(cube-router 每页 5000);`pkg/cubequery.DefaultLimit = 1000` 是没给 limit 时的兜底 | ❌ 在 SQL 里写死 `TOP 10000` 之类的上限(历史上丢过 63% 商品,零报错) |
+| 增量刷新 / 水位 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准"、没有 `refresh:` 配置段。**下游**(supertrade 侧)的增量水位是**另一套东西**(它自己的编排服务管),与 cube 无关 | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加本地副本水位表、❌ 再在 config 里加 `refresh:` 段 |
 | 增量过滤维度 | 要做"只导变过的行",用 model 上**显式声明**的"最后变动时间"维度(如 `product.updated_at` = `COALESCE(modify_date, created_at)`,`type: time`)⇒ 下游的编排方加 `gt` 过滤 | ❌ 用 `type: string` 声明时间列(live 路径会退化成文本比较 ⇒ 字典序 ≠ 时间序 ⇒ 过滤静默出错)、❌ 直接用 `modify_date`(新建商品 80% 是 NULL ⇒ 新商品永远同步不到) |
 | char 补空格 | 在**查询层**统一 `RTRIM`(SELECT 与 filter 两侧都包,GROUP BY 用裸列),已固化在 `pkg/cubequery` | ❌ 加载层 trim、❌ 调用方 LIKE/trim 兜底 |
 | 存储分层 | **全部 model 一律 `storage: live`**(2026-10-23 起):查询时把 schema 编译成 T-SQL 直打源库,**不落任何本地副本**。live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 新增 `storage: duck` 的 model、❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
-| 增量刷新 / 校准 job | **已删除**(2026-10-23)。全部 model 都是 live ⇒ 没有本地副本 ⇒ 没有"刷新"、没有"水位"、没有"夜间全量校准" | ❌ 再加 `cube-refresh` / `cube-refresh-full` job、❌ 再加 DuckDB 水位表 |
+| `storage:` 契约 | **只接受 `live`**,而且**必须在 `cubeschema.Load()` 里就拒掉别的**:写了 `storage: duck`、或干脆**漏写** `storage:`,一律**加载期报错**并说明原因(见 §4.1) | ❌ 把 duck 当默认值(2026-10-23 之前的 `EffectiveStorage()` 就是这么干的:漏写 = 默认 duck = **静默加载成功**,直到查询那一刻才炸 "model X is not a live model" —— 报错点离真正的原因隔了整条链路) |
 | live 表名来源 | live 源表名**只来自实例 `config.yaml` 的 `table_<model>`**,不进共享 `sixun-models/` | ❌ 在共享 schema 写死源库表名(会让两个 family 的 schema 分叉) |
-| join 解析 | **只走 schema 显式声明的 joins**,BFS 找最短路径;链深度不限;列名必须 model 别名限定(`settlement_line.id`);`live → duck` 不可 join,编译期拒绝 | ❌ JIT 自动关联、❌ 把 model 名当物理表名(2026-10-09 真库验证抓到:JOIN 用了 model 名当表名,而单测的假 registry 恰好同名,所以 40+ 单测全绿) |
+| join 解析 | **只走 schema 显式声明的 joins**,BFS 找最短路径;链深度不限;列名必须 model 别名限定(`settlement_line.id`);**只支持 storage: live**(2026-10-23 之后只有 live 这一种存储 ⇒ 该限制恒成立,保留它是为了挡住手工塞进 registry 的畸形 schema) | ❌ JIT 自动关联、❌ 把 model 名当物理表名(2026-10-09 真库验证抓到:JOIN 用了 model 名当表名,而单测的假 registry 恰好同名,所以 40+ 单测全绿) |
 | 扇出防护 | join 链上存在 `one_to_many` 时,**被放大一侧的 measure → 400**,错误信息指出该用多的那一侧;**不做链式传播**(曾误加,把唯一正确的用法一起拦了) | ❌ 静默返回翻倍的数字 |
 | 旧版 SQL Server 兼容 | **能力探测而非配置**:`source.DetectLegacyTSQL` 读 `SERVERPROPERTY('ProductMajorVersion')`,< 12 走 2008 方言(`DATEADD(month, DATEDIFF(month,0,d),0)` + `ROW_NUMBER()`),探测失败保守返 true | ❌ 硬编码 `DATEFROMPARTS` / `OFFSET-FETCH`(两个生产库都是 **2008 R2**,直接语法错)、❌ 用配置开关描述能力(配置会骗人) |
 | 只读约束 | `QueryLive` 前置 `source.AssertReadOnly`(只发 SELECT;连接池=1;时间窗有界) | ❌ 给源库发任何写语句、❌ 一次导出把百万行拉进内存 |
@@ -92,7 +92,7 @@ cube/
 
 | ❌ 不许做 | 为什么 |
 |---|---|
-| 新增 `storage: duck` 的 model | cube 只做**语义层**:查询时把 schema 编译成 T-SQL 直打源库 |
+| 新增 `storage: duck` 的 model | cube 只做**语义层**:查询时把 schema 编译成 T-SQL 直打源库。而且现在**根本写不进去**:`cubeschema.Load()` 在**加载期**就拒绝任何非 live 的 `storage:`(包括"漏写") |
 | 给 cube 加任何**本地数据副本**(DuckDB / SQLite / 内存表 / 本地文件) | 副本 = 第二份真相 = 必然滞后 |
 | 给 cube 加**原始数据同步**(定时拉源表 → 落盘) | cube 不是数仓;源库是**生产库、只读**,不该被无谓地压 |
 | 加"增量刷新 job / 水位表 / 夜间全量校准 / 启动全量重拉" | 全部 model 都 live ⇒ 没有副本 ⇒ 这些机制**一个都不需要** |
@@ -101,7 +101,7 @@ cube/
 
 ### 4.1.2 为什么(2026-10-22/23 真源库实测,别再重复测一遍)
 
-| 查询 | 直查源库 | 曾经走 DuckDB | 结论 |
+| 查询 | 直查源库 | 曾经走本地副本(已删除) | 结论 |
 |---|---|---|---|
 | product 按主键 | **6ms** | ~6ms | 无差别 |
 | product 关键词全表扫 | **66ms** | 8~13ms | 差 5~8 倍,但**绝对值仍然是个位数到几十毫秒** |
@@ -143,8 +143,37 @@ cube/
 3. 副本失效时,**谁**会发现、多久发现?(现在的答案是"没人会发现")
 4. 这个副本要新增哪些常驻组件(文件/水位/校准 job/健康检查/告警)?
 
-⚠️ **历史教训(2026-10-22)**:DuckDB 层的失效模式是"**报告照样成功、结果悄悄是旧的**"。
+⚠️ **历史教训(2026-10-22)**:本地副本层的失效模式是"**报告照样成功、结果悄悄是旧的**"。
 这种故障比崩溃贵得多。**除非你能说清副本失效时谁会发现,否则不要加副本。**
+
+### 4.1.6 收益清单:删掉本地副本之后,实际拿到了什么(2026-10-23 收口)
+
+> 4.1.2/4.1.3 讲的是"为什么不该有"；这一节讲的是"**已经拿到了什么**"，
+> 用来回答"值不值"—— **下面的数字都是实测/实盘核过的,不是估算**。
+
+| # | 收益 | 证据 |
+|---|---|---|
+| 1 | **磁盘上的第二份副本没了** | 删前 gyy 上有 6 个 `.duckdb`(ysx 17.3MB + hbposv7 18.4MB + 两个 3.2/2.9MB 旧副本 + 12KB 空壳)外加 **24MB 的 `.wal` 残留**与历史备份 ⇒ 删后 `find -name "*.duckdb"` = **0 字节** |
+| 2 | **不再反复搬源库** | 曾经物化的行数:product 27569 + category 186 + supplier 219 + member 4133 + member_type 3 + cust_type 4 ≈ **3.2 万行/家族**,启动全量 + 夜间 3 点全量校准各来一遍 ⇒ 现在**一次都不搬** |
+| 3 | **原生库依赖没了** | 两个 cube unit 里的 `DUCKDB_LIBRARY_PATH=/usr/local/lib/libduckdb/libduckdb.so` 已删;`github.com/fpt/go-pduckdb` 已从 `pkg/go.mod` 移除 ⇒ 部署面少一个 `.so` |
+| 4 | **两个 dapr 定时 job 没了** | `cube-refresh`(@every 30m,增量)与 `cube-refresh-full`(`0 0 3 * * *`,全量校准)已不再登记 ⇒ cube app 的 `/healthz` 里**不再有 `jobs` 段**(实盘确认) |
+| 5 | **只剩一条查询路** | 以前是 DuckDB 方言 + T-SQL 方言**两套**(`build.go` / `tsql.go`),同一个语义要写两遍、还要让两边"逐字一致"(`TestOrder_DialectsAgree` 才能验)⇒ 现在生产只走 `tsql.go` 一条 ⇒ "两套语义漂移"整类问题消失 |
+| 6 | **静默截断这类事故**结构上不可能了 | 副本时代必须给"拉取行数"封顶(`DefaultRowLimit = 50000` + `row_limits` 按角色覆盖),而硬编码 `SELECT TOP 10000` 曾让 **ysx 静默丢 63% 商品、hbposv7 丢 77%**,**healthz 全绿** ⇒ 没有副本就没有"拉多少行"这个概念 |
+| 7 | **副本滞后**这类事故结构上不可能了 | 思迅改了价、副本还是旧的 ⇒ POS 按旧价收银 ⇒ **一行报错都没有**;而 `purchase_sheet` 当初就是因为"刚收货的单要立刻可查,落盘快照会漏"才被迫 live ⇒ 全 live 之后这类"某个 model 特例"逐个消失 |
+| 8 | **增量水位纪律整类消失** | 只要有副本,"源数据滞后"就是必须跟踪的量(漏算 ⇒ 永久漏数据且零报错;`internal/source/incremental.go` 的 `FetchSince`/水位/校准已删) |
+| 9 | **join 限制统一了** | 以前 `checkStorage` 规定"live → duck 不可 join" ⇒ `product`(live)join `supplier`(duck)**用不了** ⇒ `product.supplier.*` 查不出来 ⇒ 现在只有 live 一种存储,join 不再有跨存储的例外分支 |
+| 10 | **启动不再阻塞** | 以前"启动必须走全量"(无水位时增量会 bootstrap 全量)⇒ 冷启动要先物化几万行才能服务 ⇒ 现在启动即服务 |
+| 11 | **仓库少了一大块会腐烂的东西** | 本仓 32 个 commit 里,**4 个动 `pkg/duckdb`、3 个动 dataloader/freshness/refreshschedule、8 个 commit 标题里带 DuckDB** ⇒ 约 **1/4 的历史**是在维护这条链路 |
+| 12 | **出错的时机前移** | 以前"漏写 `storage:`"是**零症状**的(默认 duck ⇒ 静默加载成功,直到查询那一刻才炸"model is not a live model")⇒ 现在 `cubeschema.Load()` **加载期就拒**,并且 `internal/embedcheck` 这道**永远会跑**的资产闸也查 `storage == live` |
+
+**代价(必须一起记着,别只记好处)**:源库直查比副本慢。
+4.1.2 的实测:product 关键词全表扫 66ms(副本 8~13ms)、member 四表 JOIN 73ms(副本 ~1ms)。
+⇒ **绝对值仍然是个位数到几十毫秒**;但如果将来某个查询真的到了"扫不动"的量级,
+**该加的是源库侧的索引/物化视图,不是给 cube 加一份副本**。
+
+**当前实盘状态(2026-10-23)**:24 个 model 全部 `storage: live`;
+`cmd/sqlcheck` 对**两个真实源库**各 **45/45 通过**;
+5 个 module `go build` + `go test` 全绿;公网 9 个业务端点(5 个新功能域 + 会员档案)全部 200。
 
 ## 5. 编码约束
 
@@ -172,7 +201,7 @@ cube/
 | `add-new-model` | 加新 model(如 customer) | `docs/semantic-layer-design.md` |
 | `write-field-mapping` | 写 mapping.yaml | **`docs/data-source-mapping-playbook.md`** |
 | `design-schema` | 写 schema.yaml | `docs/semantic-layer-design.md` |
-| `write-preaggregation` | ~~写 DuckDB 预聚合~~ | **已作废**(2026-10-23 去 DuckDB)。新的 model 一律 `storage: live`,见 §4.1 |
+| `write-preaggregation` | ~~写预聚合物化(本地副本)~~ | **已作废**(2026-10-23 去掉本地副本)。新的 model 一律 `storage: live`,见 §4.1 |
 | `debug-query` | 排查 cube query 慢/错 | `docs/dapr-app-contract.md` |
 
 ## 7. 完成前自检
@@ -184,10 +213,13 @@ cube/
 - [ ] 新增代码有对应 pkg 接口的最小测试(脚手架阶段允许 TODO)
 - [ ] 测试断言的方向服务于**真实约束**,不是当前的实现细节
       (反例:曾有一条测试断言 `DefaultRowLimit < 27299`,把"默认值截断数据"
-      这个**缺陷**钉成了规格,导致缺陷复活时它仍然全绿)
+      这个**缺陷**钉成了规格,导致缺陷复活时它仍然全绿。
+      ⚠️ `DefaultRowLimit` / `RowLimits` 已于 2026-10-23 **删除** ——
+      "拉取行数上限"这套机制整体没了,现在仓库里没有任何行数上限常量)
 - [ ] 改了 schema/mapping → **已重新构建二进制**(模型是 go:embed 进去的,只重推旧二进制不会有任何变化)
-      → 已重启 cube app 全量重拉 → 已用 `COUNT(*)`
-      确认行数等于源库实测值(没有被 row_limit 截断)
+      → 已重启 cube app → 已用 `COUNT(*)` 确认行数等于源库实测值
+      (⚠️ 现在**没有"全量重拉"这一步**了 —— 行数由查询里的 limit 决定;
+       要确认"没少数据",查一次不带 limit 的 `COUNT(*)` 即可)
 - [ ] 新增 / 改名 model → **两个 family 的 `mapping/mapping-<model>.yaml` 都加了**
       (漏一个 `go test ./cmd/sixun-*/...` 会红,别用"先提交再说"绕过)
 - [ ] 改了 `.goreleaser.yaml` 或 deploy 脚本 → 归档里**不含** schema/mapping,
@@ -198,13 +230,23 @@ cube/
 - [ ] 共享 schema(`sixun-models/`)的改动 → **所有 family 的 mapping 都同步改了**
 - [ ] 新增 `storage: live` 的 model → **每个部署实例的 `config.yaml` 都补了 `table_<model>`**,
       并已重启验证(缺表名会在启动期报错,不是运行期静默空结果)
-- [ ] 碰过增量刷新(`refresh.incremental` / 水位 / 校准 job)→ **已删除**(2026-10-23 去 DuckDB)。
-      仓库里不该再有 `pkg/duckdb`、`internal/dataloader`、`internal/refreshschedule`、
-      `sixun-models/*/preagg.go`、`cmd/incrementalcheck`,也不该再有 `config.yaml` 的 `refresh:` 段
+- [ ] 碰过增量刷新(`refresh.incremental` / 水位 / 校准 job)→ **已删除**(2026-10-23 去掉本地副本)。
+      仓库里不该再有 `pkg/duckdb`、`internal/dataloader`、`internal/freshness`、
+      `internal/refreshschedule`、`internal/source/incremental.go`、
+      `sixun-models/*/preagg.go`、`cmd/incrementalcheck`,也不该再有 `config.yaml` 的
+      `refresh:` 段 / `row_limit:` / `row_limits:`
+- [ ] 写了 `storage: duck`,或者**漏写** `storage:` → `cubeschema.Load()` 会**当场拒绝**
+      (加载期报错,不是运行期才炸)。看到 `unknown storage` / `storage 未声明` 就是这里错了
+- [ ] 看到 `pkg/cubequery/build.go` 里还有一半 **DuckDB 方言** → **知道它为什么还在**:
+      那是**已删除的本地副本那条路**,已无生产调用方,只被自己的单测覆盖;
+      它是"两条路语义必须逐字一致"这条契约的对照物。
+      清理它是**独立的一次改动**(删 `Build` / `quoteDouble` / `duckTime`
+      + 只测 DuckDB 侧的用例,再把方言参数从共用 helper 里拆掉)——
+      不要在改查询语义时顺手删,那会把对照物先毁掉
 - [ ] 碰过**增量过滤维度**(model 上的"最后变动时间")→ 它必须 `type: time`
       (live 路径按 DATETIME 比较;声明成 string 会退化成文本比较 ⇒ 过滤静默出错),
       且**必须用 COALESCE 兜住 NULL**(新建商品 80% 的 modify_date 是 NULL)
-- [ ] ~~碰过 `refresh.full_schedule`~~ → **已作废**(2026-10-23 去 DuckDB,不再有校准 job)
+- [ ] ~~碰过 `refresh.full_schedule`~~ → **已作废**(2026-10-23 去掉本地副本,不再有校准 job)
 - [ ] 碰过**增量过滤维度**的 `COALESCE` 兜底 → 写进注释的实测数字能在源库上复现
       (`modify_date IS NULL` 的行数、`both-NULL` 的行数、`modify_date < build_date` 的行数)
 - [ ] 改了 segment / measure 的 SQL → **`go run ./cmd/sqlcheck -family ysx|hbposv7 -only segment`

@@ -72,34 +72,17 @@ source:
   #   同一张表在 ysx(hbposv10)有 31355 行 / 731 行当前生效,数据是齐的。
   table_promotion: t_pub_plan_flow
 
-  # 拉取行数上限,**只对 storage: duck 的 model 生效**(supplier/product/category/sale_detail)。
-  # ⚠️ fetch 用的是 `SELECT TOP N * FROM t`(无 ORDER BY),截断丢的是随机行,
-  #    而且 healthz 全绿 —— 这就是历史上 TOP 10000 让 hbposv7 丢 77% 商品的原因。
-  #    **每一项都必须高于实测行数。**
+  # ⚠️ 2026-10-23:**没有 row_limit / row_limits 了** —— 也不需要。
   #
-  # 括号内为 2026-10-09 实测 COUNT(*):ysx / hbposv7
+  # 以前这两个键的作用是给"拉全量物化进本地副本"封顶(`SELECT TOP n *`,
+  # 没有 ORDER BY ⇒ 截断丢的是随机行,而且 healthz 全绿 —— 历史上硬编码
+  # TOP 10000 让 hbposv7 丢 77% 商品)。
+  # 本地副本层删除后,cube **不再拉全量**:查询时把 schema 编译成 T-SQL
+  # 直打源库,返回行数由**查询里的 limit** 决定(上限见 pkg/cubequery 的
+  # DefaultLimit)。⇒ 封顶这件事根本不存在了。
   #
-  # ⚠️ 兜底值必须 >= source.DefaultRowLimit(50000),**不要为了"看起来省事"调小**。
-  # 它是"没在 row_limits 里列出的 model"用的,平时用不上,但一旦将来新增一个
-  # duck model 忘了加进 row_limits,写小的兜底值就会立刻静默丢数据;
-  # 写 50000 最多是"多拉了点",不会错。
-  row_limit: 50000
-  row_limits:
-    product:  200000   # 27299 / 44313
-    supplier: 20000    # 218 / 300
-    category: 20000    # 186 / 596
-    sale:     500000
-    # 会员卡档案(t_rm_vip_info):实测 ysx 4128 / hbposv7 2642 行。
-    # 它会持续增长 ⇒ 上限给到 20000(截断是静默的,丢的是随机行)。
-    member: 20000
-    # 会员类别字典(t_rm_vip_type):实测两个库各 3 行,字典表不该被截断。
-    member_type: 2000
-
-  # ⚠️ 上面这些 row_limits **不再**需要为 settlement / settlement_line /
-  #    purchase_sheet / purchase_sheet_line / sale_day / stock 配置:
-  #    它们是 storage: live,**不落 DuckDB**,查询时实时透传源库,
-  #    返回行数由查询里的 limit 控制(上限见 pkg/cubequery 的 DefaultLimit)。
-  #    上面的 table_* 是它们**必需的**源表名,漏配则该 model 不可查询。
+  # 上面的 table_* 仍然是**必需的**:它们是每个 live model 的源表名,
+  # 漏配则该 model 在启动期就被跳过(日志:live model 缺 source.table_*)。
 
 # ⚠️ 2026-10-23 起**没有 storage.duckdb_path 了** —— 不再有本地副本。
   secret_store: cube-secrets

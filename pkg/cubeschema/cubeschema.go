@@ -113,15 +113,20 @@ var hasSubqueryRE = regexp.MustCompile(`(?i)\bselect\b`)
 
 // Storage 决定一个 model 的数据落在哪里。
 //
-// 架构约束(2026-10-09 确认):**cube 不做任何原始数据同步**。
-// DuckDB 只承载聚合结果与常用枚举/档案类数据;明细与实时数据查询时透传源库。
+// # 2026-10-23:只剩一种存储
+//
+// 历史上还有第二种:"duck" —— 把 model 物化进**本地 .duckdb 副本**。
+// 它已经**整个删掉**了(理由见 AGENTS.md §4.1:副本 = 第二份真相 = 必然滞后,
+// 且失效模式是"报告照样成功、结果悄悄是旧的")。
+//
+// ⇒ 现在的契约:**只接受 "live"**,而且**必须在 Load() 里就拒掉别的**。
 type Storage string
 
 const (
-	// StorageDuck 物化进 DuckDB。用于枚举/档案类(变化少、体量小、被高频引用)。
-	StorageDuck Storage = "duck"
 	// StorageLive 不落盘,查询时实时透传源库。
-	// 用于明细表与实时变化的数据(结算单、采购单、销售流水、当前库存)。
+	//
+	// 这是**唯一**合法的 storage 值 —— 不是"推荐值",是"唯一值"。
+	// schema.yaml 里写 `storage: live` 是**必填**,漏写会被 Load() 拒掉。
 	StorageLive Storage = "live"
 )
 
@@ -133,13 +138,22 @@ type Model struct {
 
 	// PrimaryKey 是主键**维度名**(指向 Dimensions 里某一项的 name)。
 	//
-	// 只有走增量的 duck model 需要它(见 dataloader 的增量刷新)。
-	// 留空表示"不支持增量",调用方必须回落到全量 —— 不允许"没声明主键
-	// 但仍然尝试 upsert",那会退化成不可控的行重复。
+	// ⚠️ 2026-10-23:这个字段**已经没有任何读取方**了。
 	//
-	// ⚠️ 名字与 SQL 各指一侧,别混用:
-	//     dim.Name → **DuckDB `_raw` 表的列名**(canonical,即 mapping 的 target)
-	//     dim.SQL → **源库侧的表达式**(可能是列名,也可能是 RTRIM(x) 这类函数)
+	// 它原本只服务于"增量刷新按主键 upsert"(拉一遍行 → 按主键覆盖)。
+	// 增量刷新连同 DuckDB 物化层一起在 2026-10-23 删掉了 ⇒ 现在没人 upsert,
+	// 也就没人需要主键。
+	//
+	// 那为什么**不删字段**?
+	// 因为已经有 7 个 schema.yaml 声明了 `primary_key: id`
+	// (item / item_cls / item_cls_parent / member / member_type / product / supplier),
+	// 其中 product 那份是**别的仓库在依赖的契约**,不能顺手改。
+	// yaml.v3 默认**静默忽略**未知字段 ⇒ 删掉 Go 侧字段 = 那些 `primary_key: id`
+	// 变成"看着还在、其实没人读"的僵尸配置 —— 和"storage: duck 静默加载"
+	// 是同一类陷阱,只是更隐蔽。
+	//
+	// ⇒ 保留字段 + **保留 Load() 里的校验**(写错维度名照样当场报错),
+	// 让"它还在但不参与任何逻辑"这件事是**显式**的。
 	PrimaryKey string `yaml:"primary_key,omitempty"`
 
 	// SourceTable 是 live model 的**源库表名**。
@@ -151,14 +165,6 @@ type Model struct {
 	Measures   []Measure   `yaml:"measures"`
 	Segments   []Segment   `yaml:"segments,omitempty"`
 	Joins      []Join      `yaml:"joins,omitempty"`
-}
-
-// EffectiveStorage 返回实际存储策略,未声明时按 duck 处理(保持既有 model 行为不变)。
-func (m *Model) EffectiveStorage() Storage {
-	if m.Storage == "" {
-		return StorageDuck
-	}
-	return m.Storage
 }
 
 // Load 解析 schema.yaml。
@@ -176,10 +182,38 @@ func Load(yamlBytes []byte) (*Model, error) {
 	if m.SQLTable == "" {
 		return nil, fmt.Errorf("cubeschema: model %q: sql_table is empty", m.Name)
 	}
-	switch m.EffectiveStorage() {
-	case StorageDuck, StorageLive:
+	// ---- storage:只接受 live,且**必须在加载期**就拒掉别的 ----
+	//
+	// ⚠️ 2026-10-23:这一段是"全仓去 DuckDB"留下的最重要的护栏。
+	//
+	// 老行为(危险):storage 没写 ⇒ 按 duck 处理 ⇒ schema **静默加载成功**;
+	// 一直到**查询那一刻**才炸("model X is not a live model")——
+	// 报错点离真正的原因(有人写了 `storage: duck` / 忘了写 storage)
+	// 隔了整个"加载 → 注册 → 编译 → 打源库"的链路,排查成本极高。
+	// 而且症状是"某个 model 查不了",很容易先怀疑数据、怀疑权限、
+	// 怀疑源库,没人会想到去看 schema 里的 storage 那一行。
+	//
+	// 新行为:非 live 一律**加载期**报错,并说清楚"为什么只有 live"。
+	//
+	// ⚠️ 顺带堵住一个更隐蔽的入口:**漏写 storage**。
+	// 以前漏写 = 默认 duck = 静默通过;现在漏写 = 明确报错。
+	// "漏写"比"写错"更常见,而它以前是**零症状**的。
+	switch m.Storage {
+	case StorageLive:
+	case "":
+		return nil, fmt.Errorf(
+			"cubeschema: model %q: storage 未声明 —— 现在**只有** storage: live 可用"+
+				"(本地副本层已于 2026-10-23 删除;schema.yaml 必须显式写 `storage: live`,"+
+				"见 AGENTS.md §4.1)", m.Name)
+	case "duck":
+		return nil, fmt.Errorf(
+			"cubeschema: model %q: storage \"duck\" 已作废 —— "+
+				"本地副本(DuckDB 物化)已于 2026-10-23 删除,"+
+				"所有 model 都是 storage: live(查询时透传源库),见 AGENTS.md §4.1",
+			m.Name)
 	default:
-		return nil, fmt.Errorf("cubeschema: model %q: unknown storage %q (want duck|live)", m.Name, m.Storage)
+		return nil, fmt.Errorf(
+			"cubeschema: model %q: unknown storage %q (want live)", m.Name, m.Storage)
 	}
 	// 校验 dimension / measure name 唯一
 	seenDim := map[string]bool{}
@@ -205,8 +239,9 @@ func Load(yamlBytes []byte) (*Model, error) {
 		seenMeas[ms.Name] = true
 	}
 	// primary_key 必须指向一个真实存在的 dimension。
-	// 拼错名在这里就炸,而不是等到增量刷新时才发现 —— 后者的症状是
-	// "UpsertInto 报主键列不在列清单里",离真正的原因(primary_key 写错)很远。
+	// 拼错名在这里就炸 —— 它现在**不参与任何运行时逻辑**(增量 upsert 已删),
+	// 但保留这条校验是为了让"写了却写错"当场暴露,而不是留一行永远没人读的
+	// 僵尸配置。
 	if m.PrimaryKey != "" {
 		if _, ok := m.FindDimension(m.PrimaryKey); !ok {
 			return nil, fmt.Errorf(
@@ -281,18 +316,6 @@ func (m *Model) FindDimension(name string) (*Dimension, bool) {
 		}
 	}
 	return nil, false
-}
-
-// PrimaryKeyDimension 返回主键维度。
-//
-// 没声明 primary_key 的 model 返回 (nil, false),调用方据此回落到全量刷新。
-// 这不是"可选优化",而是正确性前提:没有主键就无法安全 upsert,
-// 而静默地按全量做会让人以为自己在跑增量。
-func (m *Model) PrimaryKeyDimension() (*Dimension, bool) {
-	if m.PrimaryKey == "" {
-		return nil, false
-	}
-	return m.FindDimension(m.PrimaryKey)
 }
 
 // FindMeasure 按名查度量。

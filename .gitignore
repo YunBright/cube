@@ -18,10 +18,6 @@
 # Dapr
 .dapr/
 
-# DuckDB 数据(每个 app 独立)
-/data/*.duckdb
-/data/*.duckdb.wal
-
 # 配置 & 密钥
 config.yaml
 !config.example.yaml

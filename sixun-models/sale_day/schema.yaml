@@ -15,7 +15,7 @@
 #   时间窗口过滤用字符串比较(YYYY-MM-DD 字典序 == 时间序),不要套 date 函数。
 name: sale_day
 sql_table: sale_day
-storage: live  # 不落 DuckDB:ysx 实测 120 万行,且销售每天都在增长(见 settlement/schema.yaml 顶部说明)
+storage: live  # 不落本地副本:ysx 实测 120 万行,且销售每天都在增长(见 settlement/schema.yaml 顶部说明)
 
 dimensions:
   - name: id

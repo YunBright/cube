@@ -9,17 +9,17 @@
 //
 // 启动流程:
 //  1. boot.Load() → cfg(env 加载 + 校验)
-//  2. ./config.yaml(DSN + 源表名:4 张 duck 表 + 6 张 live 表)
+//  2. ./config.yaml(DSN + 源表名:table_<model> 一一对应)
 //  3. 内嵌 mapping-*.yaml(go:embed,不再读 ./mapping/ 目录)
 //  4. 内嵌 sixun-models schema(go:embed,不再读磁盘目录)
 //  5. hbposv7.Connector 打开 SQL Server
-//  6. cfg.ResolveDuckDBPath() 打开 DuckDB
-//  7. storage: duck 的 4 个 model:supplier / product / category / sale_detail
-//     → Fetch → mapping → LoadFrom → preagg.Build
-//     storage: live 的 6 个 model(settlement / settlement_line / purchase_sheet /
-//     purchase_sheet_line / sale_day / stock)**不拉任何数据**,查询时透传源库。
-//  8. goroutine: cfg.RegisterBody → POST /register
-//  9. gin engine:/query /healthz
+//  6. 全部 24 个 model 都是 storage: live —— **不拉任何数据、不落本地副本**,
+//     查询时把 schema 编译成 T-SQL 直打源库。
+//     (2026-10-23 以前这里还有第 6~7 步:打开 .duckdb 文件 → 拉全量 →
+//      mapping → 物化 → 登记刷新 job → 夜间全量校准。整套机制已删除,
+//      理由见 AGENTS.md §4.1。)
+//  7. goroutine: cfg.RegisterBody → POST /register
+//  8. gin engine:/query /healthz
 package main
 
 import (
@@ -63,7 +63,7 @@ import (
 var mappingAssets embed.FS
 
 // appConfig 是本实例关心的 config.yaml 子集(只保留 DSN / 表名;server.http_addr /
-// storage.duckdb_path 改由 CUBE_PORT / CUBE_DUCKDB_PATH 环境变量控制)。
+// 本地副本路径已删除 —— 2026-10-23 起实例不持有任何数据副本)。
 type appConfig struct {
 	Source struct {
 		DSN           string `yaml:"dsn"`
@@ -81,7 +81,7 @@ type appConfig struct {
 		// TableSaleDetail 是**逐笔销售流水**表(t_rm_saleflow,两个 family 同名同表)。
 		//
 		// ⚠️ 2026-10-22:旧的 `table_sale` 键**退役**了 ——
-		//   它配的是旧的(duck)sale_detail 路径:ysx t_mp_saleflow 实测 **0 行**,
+		//   它配的是旧的(副本)sale_detail 路径:ysx t_mp_saleflow 实测 **0 行**,
 		//   hbposv7 t_rm_order_saleflow 实测**表根本不存在** ⇒ 两个库都取不到数据,
 		//   而症状是"查询 200 OK 返回空数组",零报错。
 		//   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐
@@ -116,7 +116,7 @@ type appConfig struct {
 		//
 		// ⚠️ 这三列的真值**不在** t_rm_vip_info 里:
 		//   余额(residual_amt)是脏字符串、累计消费 / 消费次数主表里几乎全空。
-		//   ⇒ 取数 SQL 走 source.MemberSQL(带 JOIN),口径见 internal/source/member_sql.go。
+		//   ⇒ 取数 SQL 走 source.MemberFromFragment(带 JOIN 的 live 片段),口径见 internal/source/member_sql.go。
 		TableMemberConsume    string `yaml:"table_member_consume"`
 		TableMemberPaylist    string `yaml:"table_member_paylist"`
 		TableMemberSavingPlus string `yaml:"table_member_savingplus"`
@@ -146,21 +146,17 @@ type appConfig struct {
 		TableItemCls       string `yaml:"table_item_cls"`
 		TableItemClsParent string `yaml:"table_item_cls_parent"`
 		// 促销(2026-10-15)。POP 价签打印要"当前生效特价",时效性极强,
-		// 所以 promotion 是 live model(不落 DuckDB),漏配表名该 model 直接不可查。
+		// 所以 promotion 是 live model(不落本地副本),漏配表名该 model 直接不可查。
 		TablePromotion string `yaml:"table_promotion"`
 		// 商品条码补充表(2026-10-21)。一品多码:一个货号可有 1~7 个条码。
 		// 实测两库都有该表(ysx 153 行 / hbposv7 同表同列)。
 		TableItemBarcode string `yaml:"table_item_barcode"`
-		// RowLimit 所有角色共用的拉取行数上限;<=0 回落到 source.DefaultRowLimit。
-		RowLimit int `yaml:"row_limit"`
-		// RowLimits 按角色覆盖 RowLimit,键取 source.Role*(supplier/product/category/sale/stock)。
-		RowLimits map[string]int `yaml:"row_limits"`
 	} `yaml:"source"`
 }
 
 // schemaMeta 是本实例的 model 元信息。
 //
-// ⚠️ 2026-10-23:去 DuckDB 之后**没有"物化出来的表"了** ⇒ 不再有列清单
+// ⚠️ 2026-10-23:去掉本地副本之后**没有"物化出来的表"了** ⇒ 不再有列清单
 // (Columns)与预聚合物化器 —— 只剩 schema / 列名映射 / live 源。
 type schemaMeta struct {
 	Schema *cubeschema.Model
@@ -262,7 +258,7 @@ func main() {
 			continue
 		}
 		sm := &schemaMeta{Schema: schema, Mapper: mapper}
-		if schema.EffectiveStorage() == cubeschema.StorageLive {
+		if schema.Storage == cubeschema.StorageLive {
 			src := live[name]
 			if src == "" {
 				// 漏配表名必须显式失败:否则该 model 会以 MODEL_NOT_FOUND 静默消失。
@@ -277,23 +273,13 @@ func main() {
 	lg.Info("schemas loaded", "count", len(schemas), "models", keysOf(schemas))
 
 	// 5. SQL Server
+	// ⚠️ 2026-10-23:connector 只剩 **DSN** 一项。
+	//
+	// 以前这里传了一长串 Table*(源表名)与 RowLimits(行数上限)——
+	// 它们**只**服务于"把 model 拉下来物化进本地副本"。
+	// 副本层删除后:源表名由 liveTables() 交给编译器,行数由查询里的 limit 决定。
 	conn, err := hbposv7.New(hbposv7.Options{
-		DSN:             appCfg.Source.DSN,
-		TableSupplier:   appCfg.Source.TableSupplier,
-		TableProduct:    appCfg.Source.TableProduct,
-		TableCategory:   appCfg.Source.TableCategory,
-		TableCustType:   appCfg.Source.TableCustType,
-		TableSaleWay:    appCfg.Source.TableSaleWay,
-		TableMember:     appCfg.Source.TableMember,
-		TableMemberType: appCfg.Source.TableMemberType,
-		// 会员模型的派生列来源表(余额 / 累计消费 / 消费次数)。
-		TableMemberConsume:         appCfg.Source.TableMemberConsume,
-		TableMemberPaylist:         appCfg.Source.TableMemberPaylist,
-		TableMemberSavingPlus:      appCfg.Source.TableMemberSavingPlus,
-		MemberStoredPayType:        appCfg.Source.MemberStoredPayType,
-		MemberPointsAccumulatedCol: appCfg.Source.MemberPointsAccumulatedCol,
-		MemberPointsUsedCol:        appCfg.Source.MemberPointsUsedCol,
-		RowLimits:                  source.NewRowLimits(appCfg.Source.RowLimit, appCfg.Source.RowLimits),
+		DSN: appCfg.Source.DSN,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "open SQL Server:", err)
@@ -302,10 +288,10 @@ func main() {
 	defer conn.Close()
 	lg.Info("SQL Server connected")
 
-	// 6. ⚠️ 2026-10-23:**全仓去 DuckDB** —— 全部 model 都是 live(查询时透传源库),
+	// 6. ⚠️ 2026-10-23:**全仓去掉本地副本** —— 全部 model 都是 live(查询时透传源库),
 	// **不保留任何本地副本**,也不做任何原始数据同步(见 AGENTS.md §4.1)。
 	//
-	// 以前这里是:开 .duckdb 文件 → 按 model 拉数物化 → 登记刷新 job → 夜间全量校准。
+	// 以前(2026-10-23 之前)这里是:开 .duckdb 文件 → 按 model 拉数物化 → 登记刷新 job → 夜间全量校准。
 	// 那些机制一个都不需要了,而且每一个都会"悄悄坏掉"
 	// (副本过期了而报告照样正常 —— 这是缓存最贵的一种失败)。
 	registeredModels := make([]string, 0, len(schemas))
@@ -379,9 +365,9 @@ func metaHandler(schemas map[string]*schemaMeta, appID string, lg *log.Logger) g
 
 // registryOf 把本实例的全部 model 打包成编译器的 registry。
 //
-// 只暴露 **live** model:duck model 的表里存的是 canonical 列名(编译时不做列名重写),
-// 与 live 的别名限定是两套列名空间,混进来会生成半对的 SQL。duck 侧需要 join 时,
-// 编译器会明确报 storage 不匹配,而不是猜。
+// 只暴露 **live** model —— 现在**所有** model 都是 live(本地副本层已于
+// 2026-10-23 删除)⇒ 这个过滤实际上恒真;保留它是为了防止有人手工塞一个
+// 非 live 的 Model 进 schemas,那样编译器会生成半对的 SQL。
 func registryOf(schemas map[string]*schemaMeta, conn interface{ LegacyTSQL() bool }) cubequery.ModelRegistry {
 	entries := map[string]cubequery.ModelEntry{}
 	// ⚠️ conn 允许为 nil:错误路径的单测只验证"错误分类不依赖任何 IO 成功",
@@ -410,14 +396,6 @@ type liveQuerier interface {
 	QueryLive(ctx context.Context, query string, args ...any) ([]map[string]any, error)
 	// LegacyTSQL 报告源库是否为 SQL Server 2008 及更早(决定日期截断与分页写法)
 	LegacyTSQL() bool
-}
-
-// storageOf 给日志用的小标签。
-func storageOf(m *schemaMeta) string {
-	if m.Live {
-		return "live"
-	}
-	return "duck"
 }
 
 func queryHandler(conn liveQuerier, schemas map[string]*schemaMeta, supportedModels []string, source string, lg *log.Logger) gin.HandlerFunc {
@@ -451,8 +429,8 @@ func queryHandler(conn liveQuerier, schemas map[string]*schemaMeta, supportedMod
 
 		// SQL 拼装走共用包:live model 编译成 T-SQL 直接打源库。
 		//
-		// ⚠️ 2026-10-23 去 DuckDB 之后**只有这一条路**了 ——
-		// 以前是两条(duck → cubequery.Build 查 DuckDB,live → BuildTSQL 打源库),
+		// ⚠️ 2026-10-23 去掉本地副本之后**只有这一条路**了 ——
+		// 以前是两条(副本 → cubequery.Build 查本地库,live → BuildTSQL 打源库),
 		// 现在统一走 BuildTSQLJoin。
 		//
 		// 传 registry 是为了支持跨 model 的 joins:查询里出现
@@ -515,7 +493,7 @@ func queryHandler(conn liveQuerier, schemas map[string]*schemaMeta, supportedMod
 			return
 		}
 
-		lg.Info("query ok", "model", modelName, "storage", storageOf(meta), "sql", built.SQL, "rows", len(rows))
+		lg.Info("query ok", "model", modelName, "storage", "live", "sql", built.SQL, "rows", len(rows))
 		total, rows := cubequery.ExtractTotal(rows, q.Total)
 		c.JSON(http.StatusOK, gin.H{
 			"source":     source,
@@ -531,7 +509,7 @@ func queryHandler(conn liveQuerier, schemas map[string]*schemaMeta, supportedMod
 
 // liveTables 把 config.yaml 的源表名按 model 名挂起来。
 //
-// storage: live 的 model 不落 DuckDB,查询时把 schema 编译成 T-SQL 直接打源库。
+// storage: live 的 model 不落本地副本,查询时把 schema 编译成 T-SQL 直接打源库。
 // 表名只可能来自 config —— 这是 family 私有事实,共享 schema 里不能有。
 //
 // # ⚠️ 两种"源"形态
@@ -588,7 +566,7 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		"item_cls":        cfg.Source.TableItemCls,
 		"item_cls_parent": cfg.Source.TableItemClsParent,
 		"promotion":       cfg.Source.TablePromotion,
-		// 商品条码补充表(2026-10-21)。live model 不落 DuckDB,查询时透传源库。
+		// 商品条码补充表(2026-10-21)。live model 不落本地副本,查询时透传源库。
 		"item_barcode": cfg.Source.TableItemBarcode,
 		// 商品档案(2026-10-22 改成 live)。
 		//
@@ -610,9 +588,9 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,
 		"branch_price":   cfg.Source.TableBranchPrice,
-		// ---- 2026-10-23:最后 6 个 model 也改成 live ⇒ **一个都不落 DuckDB** ----
+		// ---- 2026-10-23:最后 6 个 model 也改成 live ⇒ **一个都不落本地副本** ----
 		// 档案/字典类(供应商/分类/客户类别/会员类别)体量小(219~4128 行),
-		// 之前留 duck 只是因为"档案变化少"—— 而"变化少"恰恰是**最该实时**的
+		// 之前留副本只是因为"档案变化少"—— 而"变化少"恰恰是**最该实时**的
 		// (新建的商品/供应商要立刻能查到,不该等一次同步)。
 		"supplier":    cfg.Source.TableSupplier,
 		"category":    cfg.Source.TableCategory,

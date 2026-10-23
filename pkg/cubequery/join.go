@@ -12,14 +12,18 @@
 // 里解析(这正是 cube 的语义),解析完再打上该表的别名限定。同名列与
 // 不同表的同名列因此天然分得开。
 //
-// # 一个刻意的限制:join 目前只支持 live model
+// # join 只支持 live model(现在也就是"只支持唯一的存储")
 //
-// duck model 的表里存的是 canonical 列名(见 Build 里"不做列名重写"),
-// 而 live 走 T-SQL 要经 mapper 换成物理列名。两套列名空间的限定方式不同,
-// 一次做对两套的风险大于收益。审批链路要用到的表
-// (settlement / settlement_line / purchase_sheet / sale_day / stock)
-// **全部是 live**,所以这个限制不挡任何实际用例。
-// 遇到跨 storage 或 duck 的 join 时,这里给明确报错而不是生成半对的 SQL。
+// 2026-10-23 之前这里有两套列名空间:本地副本侧存的是 canonical 列名
+// (见 Build 里"不做列名重写"),live 走 T-SQL 要经 mapper 换成物理列名,
+// 两套限定方式不同,一次做对两套的风险大于收益。
+//
+// 现在**只剩 live 一套**(本地副本层已于 2026-10-23 删除,见 AGENTS.md §4.1),
+// 所以 checkStorage 里的判断实际上恒真 —— 保留它是为了:
+//   - 有人手工构造 Model{} 直接塞进 registry(绕过 Load())时仍然拦得住;
+//   - 把"为什么 join 只在 live 上做"这件事留在代码里,而不是留在记忆里。
+//
+// 遇到 storage 不是 live 的 model 时,这里给明确报错而不是生成半对的 SQL。
 //
 // # 扇出(fan-out)是这里唯一真正危险的东西
 //
@@ -233,26 +237,26 @@ func checkFanOut(plan *joinPlan, measureModels []string) error {
 	return nil
 }
 
-// checkStorage 拒绝跨 storage / duck 的 join(见文件头说明)。
+// checkStorage 拒绝 storage 不是 live 的 join(见文件头说明)。
 func checkStorage(base *cubeschema.Model, plan *joinPlan, reg ModelRegistry) error {
 	if len(plan.Edges) == 0 {
 		return nil
 	}
-	if base.EffectiveStorage() != cubeschema.StorageLive {
+	if base.Storage != cubeschema.StorageLive {
 		return &BuildError{Kind: "model",
 			Msg: fmt.Sprintf("joins are only supported on storage: live models"+
-				" (got %q with storage=%s)", base.Name, base.EffectiveStorage())}
+				" (got %q with storage=%s)", base.Name, base.Storage)}
 	}
 	for _, e := range plan.Edges {
 		entry, ok := reg.Get(e.To)
 		if !ok || entry.Schema == nil {
 			continue
 		}
-		if entry.Schema.EffectiveStorage() != cubeschema.StorageLive {
+		if entry.Schema.Storage != cubeschema.StorageLive {
 			return &BuildError{Kind: "model", Ref: e.To,
 				Msg: fmt.Sprintf("cannot join %q into %q: it is storage: %s, joins are live-only"+
 					"(mixing storage would query two different engines in one statement)",
-					e.To, base.Name, entry.Schema.EffectiveStorage())}
+					e.To, base.Name, entry.Schema.Storage)}
 		}
 	}
 	return nil

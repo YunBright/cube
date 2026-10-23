@@ -100,11 +100,11 @@ mappings:
   #    (实测 INFORMATION_SCHEMA:积分列只有 now_acc_num,且 2642 行**全部为 NULL**)。
   #
   #    这里**照常列出** source: acc_num,而不是删掉:
-  #      - mapping 的 target 决定 DuckDB 的**物理列**(dataloader.loadFull 用
-  #        meta.Columns 建表),两个 family 的 target 集合必须一致
+  #      - mapping 的 target 决定这个 model 的**物理列集合**,两个 family 的
+  #        target 集合必须一致
   #        (internal/source/mapping_parity_test.go 会因此红);
   #      - 共享 schema 的 dimension 查的就是这个列名,删了它
-  #        ⇒ DuckDB 里根本没有这一列 ⇒ 查询报 column not found。
+  #        ⇒ 源库里根本没有这一列 ⇒ 查询报 column not found。
   #      - 源列不存在时,mapRows 拿不到该键 ⇒ toRows 写入 nil ⇒ **该列恒为 NULL**。
   #
   #    ⚠️ 也**不能**改成 now_acc_num:那是"当前积分",与"累计获得"语义不同,
@@ -141,7 +141,7 @@ mappings:
   # 源列 residual_amt(**varchar(20)**):源库的**原值**,仅供审计。
   # ⚠️ 这一列是带脏值的字符串,不是数字 ⇒ type 必须是 string:
   #    若按 decimal 处理,fieldmapping.convert 会在 ParseFloat 上报错,
-  #    而 dataloader.mapRows 对转换失败的行是**静默丢弃**的
+  #    而旧物化器(mapRows,已删除)对转换失败的行是**静默丢弃**的
   #    ⇒ 整张表的行数会悄悄少掉一大截(症状:COUNT(*) 对不上 2642,零报错)。
   - source: residual_amt
     target: residual_amt_raw
@@ -183,7 +183,8 @@ mappings:
     type: string
 
   # 源列 oper_date(datetime):建卡 / 最后一次业务操作时间。
-  # 它同时是增量刷新的**回退列**(config.yaml 的 refresh.incremental_fallback.member):
+  # ⚠️ 2026-10-23:它曾是增量刷新的**回退列**(config.yaml 的
+  # refresh.incremental_fallback.member,那套配置已随本地副本一起删除)。
   # 实测 modify_date 有 2573/2642 行是 NULL,而 oper_date **0 行为 NULL**
   # ⇒ COALESCE(modify_date, oper_date) 能覆盖全部行。
   - source: oper_date
