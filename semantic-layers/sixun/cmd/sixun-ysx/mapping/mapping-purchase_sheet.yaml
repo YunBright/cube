@@ -68,7 +68,13 @@ mappings:
     target: remark
     type: string
 
-  # ---- 金额(measure 用)----
+  # ---- 金额(measure 用;2026-10-23 起 amount **同时**是维度)----
+  #
+  # ⚠️ `amount` 不只是度量底下的物理列,它**还必须能当维度被过滤**:
+  #   度量**不能被过滤**(cube 的 filter 只作用于维度)
+  #   ⇒ "金额 ≥ X"在协议层表达不出来。
+  #   采购单是**单据头表,一行一单** ⇒ 金额就是行上的列
+  #   ⇒ 暴露成维度后,过滤等价于 SQL 的 HAVING。
   - source: sheet_amt
     target: amount
     type: decimal

@@ -365,6 +365,88 @@ func buildCases() []checkCase {
 			},
 		},
 		{
+			// ⚠️ 这条用例是**消费方的完整维度清单**(2026-10-23 补)。
+			//
+			// 为什么必须有它:每条用例各挑几个维度 ⇒ **少了哪一列都发现不了**。
+			// 实例:sale_detail 的分支号维度写成了旧名 branch_id(mapping 的 target
+			// 是 branch_no)⇒ 后端"商品销售流水"的整条查询 400
+			// (dimension not found: branch_no),而单测与既有 sqlcheck 用例**全绿**。
+			//
+			// ⇒ 判据从"这条用例能跑"升级成"**消费方要的那一组列**能跑"。
+			name: "采购单-后端完整维度清单", base: "purchase_sheet",
+			desc: "后端 /procurement/purchase-sheets 真正 SELECT 的那一组维度(必须一次全过)。" +
+				"⚠️ 少一列的后果是**整条查询 400**(dimension not found),而不是少一个字段。",
+			query: &cubequery.Query{
+				Measures: []string{
+					"purchase_sheet.total_amount_yuan",
+					"purchase_sheet.total_net_amount_yuan",
+				},
+				Dimensions: []string{
+					"purchase_sheet.id", "purchase_sheet.supplier_id",
+					"purchase_sheet.document_type", "purchase_sheet.approve_status",
+					"purchase_sheet.order_status", "purchase_sheet.branch_id",
+					"purchase_sheet.pay_way", "purchase_sheet.currency",
+					"purchase_sheet.created_at", "purchase_sheet.finished_at",
+					"purchase_sheet.operator_id", "purchase_sheet.confirmer",
+					"purchase_sheet.remark",
+				},
+				Limit: lim(3),
+			},
+		},
+		{
+			// ⚠️ 这条用例锁的是**数值比较**(2026-10-23 修的 bug 的回归锁)。
+			//
+			// 之前过滤侧对**所有**维度一律包 RTRIM ⇒ 数值列的区间过滤变成
+			// **文本比较**:`WHERE RTRIM(sheet_amt) >= @p1`
+			// ⇒ 实测(ysx 源库,同一条件):
+			//	源库**数值**比较 = 82950 行
+			//	源库**文本**比较 = 84613 行
+			//	cube 的过滤(之前恒包)= 73026 行
+			// ⇒ **漏 12%,而且零报错** —— 任何"按数值区间筛"的查询都给错答案。
+			//
+			// 现在 number 维度在**过滤侧**不包 RTRIM ⇒ 数值比较 ✅。
+			// (SELECT 侧照旧包 RTRIM:返回值保持明文文本,下游零改动。)
+			//
+			// 这条用例在**真源库**上跑 ⇒ 它验的就是生产跑的那段 SQL。
+			name: "采购单-金额≥过滤(数值比较)", base: "purchase_sheet",
+			desc: "purchase_sheet.amount 是**维度**(源列 sheet_amt)⇒ 可被过滤。" +
+				"⚠️ 过滤侧对 number 不包 RTRIM ⇒ 是数值比较;" +
+				"若包了 RTRIM 就退化成文本比较,同样条件下会漏行。",
+			query: &cubequery.Query{
+				Measures: []string{"purchase_sheet.total_amount_yuan"},
+				Dimensions: []string{
+					"purchase_sheet.id", "purchase_sheet.amount",
+					"purchase_sheet.document_type",
+				},
+				Filters: []cubequery.Filter{
+					// ⚠️ 值是**字符串**:MSSQL 按类型优先级把 nvarchar 转成 numeric
+					// (numeric 优先级高于 nvarchar)⇒ 精确十进制比较。
+					// 下发 JSON 数字会走 float(float 优先级高于 numeric)⇒ 丢末位精度。
+					{Member: "purchase_sheet.amount", Operator: "gte", Values: []any{"1000"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
+			// ⚠️ 金额过滤与**其它维度过滤并存**时的回归。
+			//
+			// 为什么单独一条:每条 WHERE 子句的列都是**独立**被 rewrite 的
+			// (canonical 名 → 源列名),而分支号那一列的 canonical 名
+			// 曾经被写成旧名 ⇒ 少一个 RTRIM/rewrite 都不会报错,
+			// 只会在源库上报"无效列名"。
+			name: "采购单-金额≥与分支过滤并存", base: "purchase_sheet",
+			desc: "金额(数值列)与分支号(char 列)同时过滤:两列的 rewrite 与 RTRIM 策略各走各的。",
+			query: &cubequery.Query{
+				Measures:   []string{"purchase_sheet.total_amount_yuan"},
+				Dimensions: []string{"purchase_sheet.id", "purchase_sheet.amount"},
+				Filters: []cubequery.Filter{
+					{Member: "purchase_sheet.amount", Operator: "gte", Values: []any{"1"}},
+					{Member: "purchase_sheet.branch_id", Operator: "equals", Values: []any{"0001"}},
+				},
+				Limit: lim(5),
+			},
+		},
+		{
 			name: "segment-结算采购行", base: "settlement_line",
 			desc: "既有 segment 回归:purchase_only 只留 PI/RO 行",
 			query: &cubequery.Query{
