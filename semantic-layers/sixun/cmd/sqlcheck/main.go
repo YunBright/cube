@@ -413,10 +413,13 @@ func buildCases() []checkCase {
 				"⚠️ 过滤侧对 number 不包 RTRIM ⇒ 是数值比较;" +
 				"若包了 RTRIM 就退化成文本比较,同样条件下会漏行。",
 			query: &cubequery.Query{
-				Measures: []string{"purchase_sheet.total_amount_yuan"},
+				Measures: []string{
+					"purchase_sheet.total_amount_yuan",
+					"purchase_sheet.total_order_amount_yuan",
+				},
 				Dimensions: []string{
 					"purchase_sheet.id", "purchase_sheet.amount",
-					"purchase_sheet.document_type",
+					"purchase_sheet.order_amount", "purchase_sheet.document_type",
 				},
 				Filters: []cubequery.Filter{
 					// ⚠️ 值是**字符串**:MSSQL 按类型优先级把 nvarchar 转成 numeric
