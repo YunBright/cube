@@ -6,7 +6,11 @@
 //
 // 两条编译路径(Build → DuckDB / BuildTSQL → T-SQL)必须给出**同一套**排序语义,
 // 所以本文件的核心不是"各自能排序",而是 TestOrder_DialectsAgree 那一条:
-// 同一条 query 过两条路径,ORDER BY 片段逐字相同(只差别名引号)。
+// 同一条 query 过两条路径,ORDER BY 的**成员、方向、顺序**必须一致。
+//
+// ⚠️ 一致的是**语义**,不是逐字文本(2026-10-23 改):
+// 两条路的投影形态不同 ⇒ ORDER BY 的渲染形态也必须不同
+// (duck 按别名排、live 按底层表达式排,详见 TestOrder_DialectsAgree 的注释)。
 package cubequery
 
 import (
@@ -87,12 +91,19 @@ func TestBuildTSQL_EmitsOrderByAtEnd(t *testing.T) {
 		t.Errorf("T-SQL 不支持 LIMIT,实际: %s", sql)
 	}
 	frag := orderByOf(t, sql)
-	// 排序的是**别名**,所以是 [settlement.settled_at] 而不是源列 [settle_date]。
-	if !strings.Contains(frag, "[settlement.settled_at] DESC") {
-		t.Errorf("应按 SELECT 别名 DESC 排序,实际: %s", frag)
+	// ⚠️ live 路按**底层表达式**排,不是按 SELECT 别名:
+	// 它的投影一律 RTRIM ⇒ 别名是**文本** ⇒ 按别名排 = 按字典序排
+	// (datetime 排成 "Jan  1 2025  4:11PM"、number 排成 "100" < "9")。
+	// ⇒ 排序必须落在底层 datetime 列上。
+	if !strings.Contains(frag, "settle_date DESC") {
+		t.Errorf("应按底层 datetime 表达式 DESC 排序,实际: %s", frag)
 	}
-	if strings.Contains(frag, "settle_date") {
-		t.Errorf("ORDER BY 不该用源列名(别名才是响应体的 key),实际: %s", frag)
+	if strings.Contains(frag, "[settlement.settled_at]") {
+		t.Errorf("ORDER BY 不该用 RTRIM 后的别名(那是文本,排序退化成字典序),实际: %s", frag)
+	}
+	// ⚠️ 但**响应体的 key 不变**:SELECT 侧仍投影别名(返回明文文本,下游零改动)。
+	if !strings.Contains(sql, "AS [settlement.settled_at]") {
+		t.Errorf("SELECT 侧必须仍投影别名(响应体的 key),实际: %s", sql)
 	}
 }
 
@@ -101,7 +112,19 @@ func TestBuildTSQL_EmitsOrderByAtEnd(t *testing.T) {
 //
 // 这里刻意用**同一个 schema**(liveSchema)过两条路径:Build 不校验 storage,
 // 所以它能编译,输出的 FROM 会是 schema.SQLTable 而不是 config 里的源表名。
-// 差异只在 FROM/TOP/LIMIT,ORDER BY 必须逐字相同(只差 "[] → "" 的别名引号)。
+//
+// # 比较的是**语义**,不是渲染形态
+//
+// 两条路径的 ORDER BY **成员、方向、顺序**必须一致;
+// 但**渲染形态可以不同**,而且必须不同:
+//
+//	duck(本地副本那条路):按 SELECT **别名** —— 它的投影是类型感知的
+//	  (datetime 不包 RTRIM)⇒ 别名里就是真 datetime ⇒ 按别名排 = 按时间排。
+//	live(生产在跑的那条):按**底层表达式** —— 它的投影一律 RTRIM
+//	  ⇒ 别名是**文本** ⇒ 按别名排 = 按字典序排(见 tsql.go 的 orderTermsTSQL)。
+//
+// ⇒ 逐字比对会把"渲染形态不同"误判成"语义分叉"(2026-10-23 之前就是逐字比对的,
+// live 路改成按表达式排之后它红了 —— 那次红是**正确的**:live 路原先的渲染是错的)。
 func TestOrder_DialectsAgree(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -131,34 +154,161 @@ func TestOrder_DialectsAgree(t *testing.T) {
 				t.Fatalf("BuildTSQL 失败: %v", err)
 			}
 
-			// ORDER BY 后面的东西(有没有、是哪些、什么方向)必须一致。
-			duckFrag, tsqlFrag := "", ""
-			if i := strings.Index(duckSQL, " ORDER BY "); i >= 0 {
-				duckFrag = strings.TrimSuffix(duckSQL[i:], "")
-				if j := strings.Index(duckFrag, " LIMIT "); j >= 0 {
-					duckFrag = duckFrag[:j]
+			// 排序成员的**权威清单**:两条路径的校验与归一都出自它。
+			members, err := resolveOrder(q, liveSchema(), "settlement", nil)
+			if err != nil {
+				t.Fatalf("resolveOrder 失败: %v", err)
+			}
+			duckTerms := orderTermsOf(t, duckSQL)
+			liveTerms := orderTermsOf(t, tsqlSQL.SQL)
+
+			if len(duckTerms) != len(members) || len(liveTerms) != len(members) {
+				t.Fatalf("两条路径的 ORDER BY 项数与成员数不一致\n 成员: %d\n duck: %d %v\n live: %d %v",
+					len(members), len(duckTerms), duckTerms, len(liveTerms), liveTerms)
+			}
+			for i, m := range members {
+				// 方向必须逐项一致(这是"翻页顺序"真正依赖的东西)。
+				if !strings.HasSuffix(duckTerms[i], " "+m.Dir) {
+					t.Errorf("第 %d 项方向应是 %s,duck 实际: %q", i, m.Dir, duckTerms[i])
 				}
-			}
-			if i := strings.Index(tsqlSQL.SQL, " ORDER BY "); i >= 0 {
-				tsqlFrag = tsqlSQL.SQL[i:]
-			}
-			// 别名引号两边不同(DuckDB "x" / T-SQL [x]),剥掉引号字符后逐字比对:
-			// 留下的是真正要保证一致的东西 —— 有哪些成员、什么方向、什么顺序。
-			norm := func(s string) string {
-				return strings.NewReplacer(`"`, "", "[", "", "]", "").Replace(s)
-			}
-			if norm(duckFrag) != norm(tsqlFrag) {
-				t.Fatalf("两条路径的 ORDER BY 语义分叉了\n duck: %q\n live: %q", duckFrag, tsqlFrag)
+				if !strings.HasSuffix(liveTerms[i], " "+m.Dir) {
+					t.Errorf("第 %d 项方向应是 %s,live 实际: %q", i, m.Dir, liveTerms[i])
+				}
+				// duck 那条路只有别名可用(它的投影是类型感知的)⇒ 逐字必须是别名。
+				if want := `"` + m.Alias + `" ` + m.Dir; duckTerms[i] != want {
+					t.Errorf("第 %d 项 duck 应逐字是 %q,实际: %q", i, want, duckTerms[i])
+				}
 			}
 			// 防"两边都忽略 order 也算一致"的空跑:
 			// 排序成员一个都没给时片段必须为空,给了就必须非空。
-			if len(c.order) == 0 && norm(duckFrag) != "" {
-				t.Fatalf("没给 order 却生成了 ORDER BY: %q", duckFrag)
+			if len(c.order) == 0 && len(duckTerms) != 0 {
+				t.Fatalf("没给 order 却生成了 ORDER BY: %v", duckTerms)
 			}
-			if len(c.order) > 0 && norm(duckFrag) == "" {
+			if len(c.order) > 0 && len(duckTerms) == 0 {
 				t.Fatal("给了 order 却没生成 ORDER BY")
 			}
 		})
+	}
+}
+
+// groupByOf 抠出 SQL 里的 GROUP BY 片段。
+func groupByOf(t *testing.T, sql string) string {
+	t.Helper()
+	i := strings.Index(sql, " GROUP BY ")
+	if i < 0 {
+		t.Fatalf("SQL 里没有 GROUP BY: %s", sql)
+	}
+	frag := sql[i+len(" GROUP BY "):]
+	if j := strings.Index(frag, " ORDER BY "); j >= 0 {
+		frag = frag[:j]
+	}
+	return frag
+}
+
+// orderTermsOf 拆出 SQL 里 ORDER BY 的每一项(按**顶层逗号**拆 ——
+// 表达式里可能带逗号,如 SUM(a, b))。
+func orderTermsOf(t *testing.T, sql string) []string {
+	t.Helper()
+	i := strings.Index(sql, " ORDER BY ")
+	if i < 0 {
+		return nil
+	}
+	frag := sql[i+len(" ORDER BY "):]
+	if j := strings.Index(frag, " LIMIT "); j >= 0 {
+		frag = frag[:j]
+	}
+	var out []string
+	depth, start := 0, 0
+	for i, r := range frag {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, strings.TrimSpace(frag[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	if s := strings.TrimSpace(frag[start:]); s != "" {
+		out = append(out, s)
+	}
+	return out
+}
+
+// TestBuildTSQL_OrdersByUnderlyingExpression 锁 2026-10-23 修的那条真缺陷:
+//
+// live 路的 SELECT 一律 RTRIM ⇒ 别名是**文本** ⇒ 按别名排 = 按**字典序**排:
+//
+//	datetime:RTRIM(datetime) 的文本形如 "Jan  1 2025  4:11PM"
+//	  ⇒ 1 月排在 2 月前面;同一天里 " 4:11PM" 排在 " 9:02AM" 前面
+//	    (单数日的小时前面多一个空格)
+//	number:RTRIM(number) 的文本形如 "100" ⇒ "100" < "9"
+//
+// 实测症状(生产):促销方案列表"按制单日期排"⇒ 顺序是乱的,而且**零报错**。
+//
+// ⇒ ORDER BY 必须落在**底层表达式**上(与 GROUP BY 里排的是同一份)。
+func TestBuildTSQL_OrdersByUnderlyingExpression(t *testing.T) {
+	lim := 30
+	q := &Query{
+		Measures:   []string{"settlement.count"},
+		Dimensions: []string{"settlement.id", "settlement.settled_at"},
+		Limit:      &lim,
+		Order:      []Order{{ID: "settlement.settled_at", Order: "desc"}},
+	}
+	res, err := BuildTSQL(q, liveSchema(), "t_fm_recpay_gx_master", mustMapper(t, hbSettlementMapping))
+	if err != nil {
+		t.Fatalf("BuildTSQL 失败: %v", err)
+	}
+	terms := orderTermsOf(t, res.SQL)
+	if len(terms) != 1 {
+		t.Fatalf("应只有一项排序,实际: %v", terms)
+	}
+	// 底层 datetime 列(源列名 settle_date)—— 不是 RTRIM 后的别名。
+	if !strings.Contains(terms[0], "settle_date") {
+		t.Errorf("应按底层 datetime 列排序,实际: %q", terms[0])
+	}
+	if strings.Contains(terms[0], "[settlement.settled_at]") {
+		t.Errorf("不能按 RTRIM 后的别名排(那是文本 ⇒ 字典序),实际: %q", terms[0])
+	}
+	// ⚠️ GROUP BY 与 ORDER BY 必须是**同一份表达式** ——
+	// 否则 T-SQL 会报 "not a grouped column"。
+	groupBy := groupByOf(t, res.SQL)
+	if !strings.Contains(groupBy, "settle_date") {
+		t.Errorf("GROUP BY 应排裸列(与 ORDER BY 同源),实际: %q", groupBy)
+	}
+	if strings.Contains(groupBy, "RTRIM") {
+		t.Errorf("GROUP BY 不该包 RTRIM(与 ORDER BY 不同源),实际: %q", groupBy)
+	}
+}
+
+// TestBuildTSQL_OrdersNumberDimensionNumerically 锁数值维度的排序也是数值序。
+//
+// number 维度的 SELECT 侧**照旧**包 RTRIM(返回值保持明文文本,下游零改动),
+// 但 ORDER BY 必须用底层数值列 ⇒ 否则 "100" 会排在 "9" 前面。
+func TestBuildTSQL_OrdersNumberDimensionNumerically(t *testing.T) {
+	lim := 30
+	q := &Query{
+		Measures:   []string{"settlement.count"},
+		Dimensions: []string{"settlement.id", "settlement.amount_yuan"},
+		Limit:      &lim,
+		Order:      []Order{{ID: "settlement.amount_yuan", Order: "desc"}},
+	}
+	res, err := BuildTSQL(q, numFilterSchema(), "t_fm_recpay_gx_master", numFilterMapper(t))
+	if err != nil {
+		t.Fatalf("BuildTSQL 失败: %v", err)
+	}
+	terms := orderTermsOf(t, res.SQL)
+	if len(terms) != 1 {
+		t.Fatalf("应只有一项排序,实际: %v", terms)
+	}
+	if !strings.Contains(terms[0], "sheet_amt") {
+		t.Errorf("应按底层数值列排序,实际: %q", terms[0])
+	}
+	if strings.Contains(terms[0], "RTRIM") {
+		t.Errorf("数值列的排序不能经 RTRIM(会把数字转文本 ⇒ 字典序),实际: %q", terms[0])
 	}
 }
 

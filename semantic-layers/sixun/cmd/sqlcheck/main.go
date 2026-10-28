@@ -217,6 +217,13 @@ type checkCase struct {
 	errMatch string
 	query    *cubequery.Query
 	base     string
+	// verify 是**结果校验**(拿到全部行之后跑)。
+	//
+	// ⚠️ 为什么需要它:"SQL 跑得通"不等于"结果对"。
+	// 2026-10-23 的排序 bug 就是后者:ORDER BY 落在 RTRIM 后的文本上
+	// ⇒ 字典序 ≠ 时间序 ⇒ 查询**照跑不误**,只是顺序是乱的。
+	// ⇒ 只验执行成功的那类用例,永远抓不到它。
+	verify func(rows []map[string]any) error
 }
 
 func runCase(ctx context.Context, db *sql.DB, reg cubequery.ModelRegistry, c checkCase,
@@ -272,19 +279,25 @@ func runCase(ctx context.Context, db *sql.DB, reg cubequery.ModelRegistry, c che
 	}
 	n := 0
 	first := ""
+	all := make([]map[string]any, 0, 16)
 	for rows.Next() {
-		if n == 0 && len(cols) > 0 {
+		if len(cols) > 0 {
 			vals := make([]any, len(cols))
 			ptrs := make([]any, len(cols))
 			for i := range vals {
 				ptrs[i] = &vals[i]
 			}
 			if rows.Scan(ptrs...) == nil {
+				row := make(map[string]any, len(cols))
 				parts := make([]string, len(cols))
 				for i, v := range vals {
+					row[cols[i]] = v
 					parts[i] = fmt.Sprintf("%s=%v", cols[i], stringify(v))
 				}
-				first = strings.Join(parts, " ")
+				if n == 0 {
+					first = strings.Join(parts, " ")
+				}
+				all = append(all, row)
 			}
 		}
 		n++
@@ -296,6 +309,16 @@ func runCase(ctx context.Context, db *sql.DB, reg cubequery.ModelRegistry, c che
 		return
 	}
 	_ = rows.Close()
+	// ⚠️ **结果本身**也要能判对错 —— 只验"SQL 跑得通"会漏掉
+	// "跑得通但顺序是错的"这类缺陷(2026-10-23 的排序 bug 就是这种:
+	// ORDER BY 排在 RTRIM 后的**文本**上 ⇒ 字典序 ≠ 时间序,查询照跑不误)。
+	if c.verify != nil {
+		if err := c.verify(all); err != nil {
+			fmt.Printf("FAIL  %-34s 结果校验失败: %v\n", c.name, err)
+			*failN++
+			return
+		}
+	}
 	fmt.Printf("ok    %-34s %s\n      rows=%d  %s\n", c.name, c.desc, n, truncate(first, 160))
 	*pass++
 }
@@ -472,13 +495,33 @@ func buildCases() []checkCase {
 		},
 		{
 			name: "order-desc", base: "settlement",
-			desc: "按 SELECT 别名排序",
+			desc: "按底层表达式排序(live 路:datetime 必须按真时间序,不是字典序)",
 			query: &cubequery.Query{
 				Measures:   []string{"settlement.total_goods_yuan"},
 				Dimensions: []string{"settlement.id", "settlement.settled_at"},
 				Order:      []cubequery.Order{{ID: "settlement.settled_at", Order: "desc"}},
 				Limit:      lim(5),
 			},
+			verify: verifyTimeDesc("settlement.settled_at"),
+		},
+		{
+			// ⚠️ 这条用例是**生产真缺陷**的回归锁(2026-10-23 加)。
+			//
+			// 之前 live 路径的 ORDER BY 落在 SELECT 别名上,而别名是 RTRIM 后的**文本**
+			// ⇒ datetime 按**字典序**排("Jan  1 2025  4:11PM" 排在 "Jan  1 2025  9:02AM" 前面)
+			// ⇒ 查询**照跑不误**,只是顺序是乱的(后台"按制单日期排"看着像没生效)。
+			//
+			// ⇒ 这条用例在**真源库**上跑,并**校验结果本身**的时间序
+			// (只验"SQL 跑得通"抓不到这类缺陷 —— 它跑得通,只是结果是错的)。
+			name: "促销方案-按制单时间倒序", base: "promotion_plan",
+			desc: "ORDER BY 必须落在底层 datetime 列(oper_date)上 ⇒ 结果按真实时间倒序。",
+			query: &cubequery.Query{
+				Measures:   []string{"promotion_plan.count"},
+				Dimensions: []string{"promotion_plan.plan_no", "promotion_plan.created_at"},
+				Order:      []cubequery.Order{{ID: "promotion_plan.created_at", Order: "desc"}},
+				Limit:      lim(15),
+			},
+			verify: verifyTimeDesc("promotion_plan.created_at"),
 		},
 		{
 			name: "offset-分页", base: "settlement",
@@ -1021,6 +1064,79 @@ func buildCases() []checkCase {
 			},
 		},
 	}
+}
+
+// ---- 结果校验(verify) ----
+
+// verifyTimeDesc 校验某一列**按时间倒序**(后一行不得晚于前一行)。
+//
+// ⚠️ 为什么需要它:"SQL 跑得通"不等于"结果对"。
+// 2026-10-23 的排序 bug 就是后者:ORDER BY 落在 RTRIM 后的**文本**上
+// ⇒ 字典序 ≠ 时间序 ⇒ 查询照跑不误,只是顺序是乱的。
+//
+// ⇒ 只验执行成功的那类用例,永远抓不到它。
+func verifyTimeDesc(col string) func(rows []map[string]any) error {
+	return func(rows []map[string]any) error {
+		// ⚠️ NULL 行的位置由 DB 决定(DESC 时 NULL 在**末尾**),
+		// 且 NULL 与非 NULL 之间没有可比性 ⇒ 直接跳过,不参与序列校验。
+		var prev time.Time
+		havePrev := false
+		for i, row := range rows {
+			v := row[col]
+			if v == nil {
+				continue
+			}
+			s := strings.TrimSpace(fmt.Sprintf("%v", v))
+			if s == "" || s == "<nil>" {
+				continue
+			}
+			cur, ok := parseMSSQLTime(s)
+			if !ok {
+				return fmt.Errorf("第 %d 行 %s=%v 不是可解析的时间", i+1, col, v)
+			}
+			if havePrev && cur.After(prev) {
+				return fmt.Errorf("第 %d 行(%s)晚于前一行(%s)⇒ 不是时间倒序(排序落在文本上?)",
+					i+1, cur.Format(time.RFC3339), prev.Format(time.RFC3339))
+			}
+			prev = cur
+			havePrev = true
+		}
+		return nil
+	}
+}
+
+// parseMSSQLTime 解析 MSSQL 默认(datetime → varchar)布局。
+//
+// ⚠️ live 路径的 SELECT 一律 RTRIM ⇒ datetime 列返回的是**文本**,
+// 形如 "Jan  1 2025  4:11PM"(月名在前、单数日补空格、12 小时制)。
+// ⇒ 校验排序时必须先把它解析回时刻,否则比的是字典序(那就白测了)。
+func parseMSSQLTime(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	// MSSQL 用多个空格对齐字段 ⇒ 先压成单空格再按 Go 布局解析。
+	s = strings.Join(strings.Fields(s), " ")
+	// ⚠️ **实测两种布局都要认**(2026-10-23 在 ysx 真库上看到的):
+	//	数字月日年:"09 16 2021 12:00AM"(月/日/年,单数日补空格)
+	//	英文月名年:"Jan  1 2025  4:11PM"
+	// 布局里的 "1" 同时接受 "1" 与 "01" ⇒ 一套布局覆盖两种补零。
+	for _, layout := range []string{
+		"1 2 2006 3:04PM",
+		"1 2 2006 3:04:05PM",
+		"1 2 2006",
+		"Jan 2 2006 3:04PM",
+		"Jan 2 2006 3:04:05PM",
+		"Jan 2 2006",
+		"2006-01-02 15:04:05",
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // ---- schema / mapping 加载 ----

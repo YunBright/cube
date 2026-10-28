@@ -261,12 +261,26 @@ func BuildTSQLJoin(q *Query, schema *cubeschema.Model, sourceTable string, resol
 		limit = *q.Limit
 	}
 	offset := q.Offset.First()
-	orderBy, err := buildOrder(q, schema, modelName, quoteBracket, timePlan.dimRefs)
+	// 合成 ref(时间粒度)的底层表达式也进 exprs ——
+	// 它们在 SELECT / GROUP BY 里各有一份,顺序必须落在同一份表达式上。
+	for i, ref := range timePlan.dimRefs {
+		if i < len(timePlan.groupBy) {
+			orderExprs[modelName+"."+ref] = timePlan.groupBy[i]
+		}
+	}
+	members, err := resolveOrder(q, schema, modelName, timePlan.dimRefs)
 	if err != nil {
 		return nil, err
 	}
-	// orderKeys 是 order 的表达式形态(给 ROW_NUMBER 用)。
-	orderKeys := orderExprKeys(q, modelName, orderExprs)
+	// orderTerms 是 live 路径的 ORDER BY 项(按**底层表达式**,见 [orderTermsTSQL])。
+	orderTerms := orderTermsTSQL(members, orderExprs, modelName, quoteBracket, true)
+	orderBy := ""
+	if len(orderTerms) > 0 {
+		orderBy = " ORDER BY " + strings.Join(orderTerms, ", ")
+	}
+	// orderKeys 是同一批项(给 ROW_NUMBER 用)—— 窗口函数里看不到 SELECT 别名
+	// ⇒ 这一条不允许退回别名。
+	orderKeys := orderTermsTSQL(members, orderExprs, modelName, quoteBracket, false)
 	// T-SQL 的两条分页路径**互斥**,不能混用:
 	//   - offset == 0 → SELECT TOP n ... ORDER BY ...(TOP 取的是排序后的前 n 行)
 	//   - offset  > 0 → 去掉 TOP,改用 ORDER BY ... OFFSET m ROWS FETCH NEXT n ROWS ONLY
@@ -388,29 +402,58 @@ func outerColumns(selectList []string) []string {
 	return out
 }
 
-// orderExprKeys 把 q.Order 翻译成"成员底层表达式 + 方向"。
+// orderTermsTSQL 产出 live(T-SQL)路径的 ORDER BY 项(不含 "ORDER BY" 前缀)。
 //
-// 与 buildOrder 的差别:buildOrder 产出的是给最终 SQL 的 ORDER BY(用别名),
-// 这里产出的是给 ROW_NUMBER() OVER(ORDER BY ...) 的 —— **窗口函数里看不到
-// SELECT 别名**,必须用底层表达式。
-func orderExprKeys(q *Query, modelName string, exprs map[string]string) []string {
-	var out []string
-	for _, o := range q.Order {
-		ref := strings.TrimPrefix(o.ID, modelName+".")
-		expr, ok := exprs[o.ID]
+// # 为什么按**底层表达式**排,而不是 SELECT 别名
+//
+// live 路径的 SELECT 一律 RTRIM(思迅 char 定长列普遍补空格)⇒ 别名是**文本**。
+// 而 ORDER BY 只能引用输出列 ⇒ 按别名排 = 按文本排:
+//
+//	datetime 列:RTRIM(datetime) 的文本形如 "Jan  1 2025  4:11PM"
+//	  ⇒ 字典序 ≠ 时间序(月份名在前;单数日的小时前面还有一个空格
+//	    ⇒ " 4:11PM" 排在 " 9:02AM" 前面)
+//
+//	number 列:RTRIM(number) 的文本形如 "100" ⇒ "100" < "9"
+//
+// ⇒ 排序结果与源库的真实顺序不一致,而且**零报错**
+// (症状:列表"按制单日期排",看上去却是乱的;翻页还会重复/漏行)。
+//
+// 改按底层表达式排(GROUP BY 里排的也是它)⇒ 与源库同序。
+//
+// # 为什么这不会破坏 T-SQL 的语法
+//
+// ORDER BY 项要么是**分组表达式**(维度的裸列)、要么是**聚合**(度量),
+// 两者都允许出现在 ORDER BY 里 ⇒ 合法。
+// SQL Server 2008 那条路(ROW_NUMBER 窗口)本来就只能用表达式
+// ⇒ 两条分页路径现在**用同一批表达式**,不会出现"第 1 页一种序、第 2 页另一种序"。
+//
+// # 返回值不变
+//
+// SELECT 侧仍投影 RTRIM 文本 ⇒ 下游零改动。
+// (改投影会让 datetime 变成原生类型 ⇒ 驱动按 UTC 返回 ⇒ 墙钟平移 8 小时。)
+//
+// # 例外:合成 ref
+//
+// 时间粒度合成 ref(如 oper_date.month)没有独立表达式时退回按别名排 ——
+// 它的值是数字/日期,不是文本,按别名排是对的。
+//
+// ⚠️ allowAlias=false 时(ROW_NUMBER 窗口那条路)不允许退回别名:
+// **窗口函数里看不到 SELECT 别名** ⇒ 只能用表达式。
+// 那种情况下没有表达式的成员被跳过(与旧实现同款)。
+func orderTermsTSQL(members []orderMember, exprs map[string]string, modelName string, quote func(string) string, allowAlias bool) []string {
+	out := make([]string, 0, len(members))
+	for _, m := range members {
+		term, ok := exprs[modelName+"."+m.Ref]
 		if !ok {
-			expr, ok = exprs[modelName+"."+ref]
+			term, ok = exprs[m.Alias]
 		}
 		if !ok {
-			// 排序成员没被 select(时间粒度合成的成员等)—— 交给 buildOrder 报错,
-			// 这里跳过即可。
-			continue
+			if !allowAlias {
+				continue
+			}
+			term = quote(m.Alias)
 		}
-		dir, ok := normalizeOrderDir(o.Order)
-		if !ok {
-			continue
-		}
-		out = append(out, expr+" "+dir)
+		out = append(out, term+" "+m.Dir)
 	}
 	return out
 }

@@ -194,34 +194,73 @@ func quoteDouble(s string) string { return fmt.Sprintf("%q", s) }
 // quoteBracket 是 T-SQL 的标识符引用,与 BuildTSQL 的 [..] 保持逐字一致。
 func quoteBracket(s string) string { return "[" + s + "]" }
 
-// buildOrder 编译 q.Order → " ORDER BY ..." 片段。两个方言**共用这一份实现**,
-// 只靠 quote 参数区分别名引号(DuckDB "x" / T-SQL [x])。
+// buildOrder 编译 q.Order → " ORDER BY ..." 片段(DuckDB 路径)。
 //
 // timeDimRefs 是 timeDimensions 按 granularity 生成的**合成 ref**
 // (如 oper_date.month)。它们不在 schema 里,但确实在 SELECT 里 ——
 // "按月汇总、按月倒序"是最自然的用法,不能因为它没写进 schema.yaml 就排不了。
 //
-// 为什么共用:build.go 顶部记着 hbposv7 那套残缺实现的教训 —— 同一份契约
+// 为什么校验与归一在 [resolveOrder] 里(两个方言共用):
+// build.go 顶部记着 hbposv7 那套残缺实现的教训 —— 同一份契约
 // 各写一份必然分叉,而分叉只在真实数据上才暴露。这里多写一遍的代价是
 // "duck 有 order、live 没有",结算单列表在两个 family 上排序结果不一致。
 //
-// 排序按 **SELECT 别名**而不是原始表达式,两个理由:
-//  1. 别名已经过 schema 校验,用户输入不可能混进 SQL 文本;
-//  2. 维度是 RTRIM(col)、度量是聚合,重推一遍极易与 SELECT 处不一致
-//     (而 GROUP BY 里排的是原列,SELECT 里排的是 RTRIM 列,正是 build.go
-//     顶部描述的 char 补空格坑)。
+// ⚠️ **渲染形态按方言不同**(但语义必须一致):
+//   - DuckDB(本地副本那条路):按 **SELECT 别名**。它的投影是**类型感知**的
+//     (见 trimForType):datetime 列不包 RTRIM ⇒ 别名里就是真 datetime
+//     ⇒ 按别名排 = 按时间排 ✅。
+//   - T-SQL(live 路,生产唯一在跑的那条):按**底层表达式**。
+//     它的投影一律 RTRIM ⇒ 别名是**文本** ⇒ 按别名排 = 按字典序排 ❌
+//     (datetime 排成 "Jan 1 2025 4:11PM"、number 排成 "100" < "9")。
+//     详见 tsql.go 的 [orderTermsTSQL]。
+//
+// ⇒ 两条路径的 ORDER BY **成员、方向、顺序必须一致**,但渲染形态可以不同。
 func buildOrder(q *Query, schema *cubeschema.Model, modelName string, quote func(string) string, timeDimRefs []string) (string, error) {
+	members, err := resolveOrder(q, schema, modelName, timeDimRefs)
+	if err != nil {
+		return "", err
+	}
+	if len(members) == 0 {
+		return "", nil
+	}
+	parts := make([]string, 0, len(members))
+	for _, m := range members {
+		parts = append(parts, quote(m.Alias)+" "+m.Dir)
+	}
+	return " ORDER BY " + strings.Join(parts, ", "), nil
+}
+
+// orderMember 是一个**已校验**的排序成员。
+type orderMember struct {
+	// Ref 是成员名(相对 model):"settled_at"。
+	Ref string
+	// Alias 是 SELECT 别名("model.ref")—— 也是响应体里的 key。
+	Alias string
+	// Dir 是归一后的方向(ASC / DESC)。
+	Dir string
+}
+
+// resolveOrder 校验 q.Order,归一成**有序**的成员列表。
+//
+// 这是排序契约的**唯一实现**:两条编译路径共用它,渲染形态各自决定。
+//
+// 校验项(任何一条不满足都是 4xx,不是静默回落):
+//   - 成员必须存在(schema 里的维度/度量,或时间粒度合成 ref)
+//   - 成员必须**同时出现在本次 SELECT 里**(ORDER BY 只能引用输出列)
+//   - 方向必须归一(空 = ASC,其它值一律拒)
+//   - 别名必须是简单列名(它会原样进 SQL 文本,不校验就是注入面)
+func resolveOrder(q *Query, schema *cubeschema.Model, modelName string, timeDimRefs []string) ([]orderMember, error) {
 	if len(q.Order) == 0 {
 		// 分页必须在**稳定排序**上。DuckDB 允许无 ORDER BY 的 OFFSET,
 		// T-SQL 则直接语法报错(SQL Server 要求 OFFSET/FETCH 配 ORDER BY) ——
 		// 与其让两个方言一个能跑一个报错、或都跑但翻页结果不稳定,
 		// 不如在编译期把这条约束显式化:这是"能不能翻页"的前置条件,不是可选优化。
 		if off := q.Offset.First(); off > 0 {
-			return "", &BuildError{Kind: "query",
+			return nil, &BuildError{Kind: "query",
 				Msg: fmt.Sprintf("offset=%d 需要显式 order:分页必须建立在稳定排序上,"+
 					"否则每页可能重复或漏行", off)}
 		}
-		return "", nil
+		return nil, nil
 	}
 	selected := make(map[string]bool, len(q.Dimensions)+len(q.Measures)+len(timeDimRefs))
 	for _, raw := range q.Dimensions {
@@ -237,37 +276,37 @@ func buildOrder(q *Query, schema *cubeschema.Model, modelName string, quote func
 		synthetic[ref] = true
 	}
 
-	parts := make([]string, 0, len(q.Order))
+	members := make([]orderMember, 0, len(q.Order))
 	for _, o := range q.Order {
 		ref := strings.TrimPrefix(o.ID, modelName+".")
 		_, isDim := schema.FindDimension(ref)
 		_, isMeasure := schema.FindMeasure(ref)
 		if !isDim && !isMeasure && !synthetic[ref] {
-			return "", &BuildError{Kind: "order", Ref: ref,
+			return nil, &BuildError{Kind: "order", Ref: ref,
 				Msg: "order member not found: " + ref}
 		}
 		// 必须同时出现在本次 SELECT 里:ORDER BY 只能引用输出列,否则
 		// GROUP BY 查询会在 DB 层报 "not a grouped column" —— 那是个
 		// 调用方看不懂的 500,而这里能给出"把它加进 dimensions/measures"。
 		if !selected[ref] {
-			return "", &BuildError{Kind: "order", Ref: ref,
+			return nil, &BuildError{Kind: "order", Ref: ref,
 				Msg: "order member must also be selected: " + ref +
 					" (add it to dimensions or measures)"}
 		}
 		// 别名会原样进 SQL 文本(quote 不做转义),不校验就是注入面。
 		alias := modelName + "." + ref
 		if !isSimpleColumn(alias) {
-			return "", &BuildError{Kind: "order", Ref: ref,
+			return nil, &BuildError{Kind: "order", Ref: ref,
 				Msg: "illegal order member name: " + alias}
 		}
 		dir, ok := normalizeOrderDir(o.Order)
 		if !ok {
-			return "", &BuildError{Kind: "order", Ref: ref,
+			return nil, &BuildError{Kind: "order", Ref: ref,
 				Msg: fmt.Sprintf("unsupported order direction %q for %s (want asc or desc)", o.Order, ref)}
 		}
-		parts = append(parts, quote(alias)+" "+dir)
+		members = append(members, orderMember{Ref: ref, Alias: alias, Dir: dir})
 	}
-	return " ORDER BY " + strings.Join(parts, ", "), nil
+	return members, nil
 }
 
 // normalizeOrderDir 归一排序方向。cube 契约是 asc / desc;空串按 asc

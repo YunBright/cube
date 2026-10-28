@@ -239,8 +239,15 @@ cube/
       (加载期报错,不是运行期才炸)。看到 `unknown storage` / `storage 未声明` 就是这里错了
 - [ ] 看到 `pkg/cubequery/build.go` 里还有一半 **DuckDB 方言** → **知道它为什么还在**:
       那是**已删除的本地副本那条路**,已无生产调用方,只被自己的单测覆盖;
-      它是"两条路语义必须逐字一致"这条契约的对照物。
-      清理它是**独立的一次改动**(删 `Build` / `quoteDouble` / `duckTime`
+      它是"两条路语义必须一致"这条契约的对照物。
+      ⚠️ **一致性是"语义"不是"逐字"(2026-10-23 改)**:
+      两条路的 ORDER BY **成员、方向、顺序**必须相同(`TestOrder_DialectsAgree`),
+      但**渲染形态必须不同** ——
+      duck 侧按 SELECT **别名**排(它的投影类型感知,别名里就是真 datetime);
+      live 侧按**底层表达式**排(它的投影一律 RTRIM ⇒ 别名是文本 ⇒ 按别名排 = 字典序,
+      见 `tsql.go` 的 `orderTermsTSQL`)。
+      ⇒ 逐字比对会把"渲染形态不同"误判成"语义分叉"。
+      清理 DuckDB 那条路是**独立的一次改动**(删 `Build` / `quoteDouble` / `duckTime`
       + 只测 DuckDB 侧的用例,再把方言参数从共用 helper 里拆掉)——
       不要在改查询语义时顺手删,那会把对照物先毁掉
 - [ ] 碰过**增量过滤维度**(model 上的"最后变动时间")→ 它必须 `type: time`
@@ -256,6 +263,11 @@ cube/
       (`go run ./cmd/sqlcheck -config <config.yaml> -family ysx|hbposv7`)。
       单测只比对 SQL 字符串,**不执行**,所以 2008 R2 语法错、JOIN 用错物理表名这类 bug
       只有真库能抓(2026-10-09:40+ 单测全绿,真库 6 个 bug)
+- [ ] 改过 `pkg/cubequery` 的 **ORDER BY 构造** → **必须校验"结果的顺序",不只是"跑得通"**
+      (2026-10-23:live 路改成按底层表达式排之前,datetime 按别名排 = **字典序**,
+      查询**照跑不误**只是顺序是乱的 ⇒ sqlcheck 增加了 `verify` 回调,
+      逐行校验返回值的真实次序)。
+      ⇒ 真库上跑 `sqlcheck` 时,带 `verify` 的用例(排序类)必须全绿才算过
 - [ ] 没碰 P1 拍板里 ❌ 的事项
 - [ ] 新增 family 必须同时加 `skills/add-new-data-source` 的代码示例(若案例缺失)
 
