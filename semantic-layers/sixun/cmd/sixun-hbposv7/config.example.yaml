@@ -63,6 +63,10 @@ source:
   table_purchase_sheet:      t_pm_sheet_master
   table_purchase_sheet_line: t_pm_sheet_detail
   table_sale_day:            t_rm_daysum
+  # 盘损(2026-10-31):库存类单据(JO 报损 / OO 库存调整)的头与明细。
+  # ⚠️ 这两张表**不是**采购单(t_pm_sheet_*)—— 那里是 PI/RO 采购进货/退货。
+  table_stock_loss:          t_im_sheet_master
+  table_stock_loss_line:     t_im_sheet_detail
 
   # promotion(POP 价签"当前生效特价",2026-10-15)
   # ⚠️ 本库 t_pub_plan_flow 实测 **0 行**(2026-10-15 逐表 COUNT)。

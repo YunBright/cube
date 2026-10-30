@@ -1,0 +1,45 @@
+# stock_loss_line mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_im_sheet_detail —— 库存类单据的明细行(两库列名逐列一致,已实测核对)。
+#
+# ⚠️ 本表**没有 trans_no**(单据类型在头表 t_im_sheet_master 的 trans_no)。
+#    要按"报损 / 库存调整(减少)"筛,必须 join stock_loss + filter。
+# ⚠️ real_qty 恒为正(实测两库负数计数均为 0),方向在头表 db_no。
+# ⚠️ sub_amt 恒为 0 ⇒ 金额用 数量 × valid_price 算。
+version: 1
+model: stock_loss_line
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: sheet_no
+    target: sheet_id
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: valid_date
+    target: valid_at
+    type: datetime
+
+  # ---- 数量 / 金额(measure 用)----
+  # 无损数量(源列 real_qty;正数,方向在头表 db_no)
+  - source: real_qty
+    target: quantity
+    type: decimal
+
+  # 单价(源列 valid_price,已含税折算)
+  - source: valid_price
+    target: cost_price
+    type: decimal
+    unit: yuan
+
+  # 明细金额(源列 sub_amt;⚠️ 实测恒为 0,只作对照,不要用它算损耗金额)
+  - source: sub_amt
+    target: amount
+    type: decimal
+    unit: yuan

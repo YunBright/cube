@@ -1,0 +1,109 @@
+# stock_loss model - 思迅家族共享 schema(库存单据头:报损 / 库存调整 / 扣补 / 领用)
+#
+# 源表:t_im_sheet_master(两个 family 同名同表,列结构已实测核对)
+#
+# 它是"进货数量严重偏离销量"判据的**解释源**:
+# 门店进货 A、窗口只卖出 S,若之后再有一张报损单损失了 L,
+# 那 A 的消耗就应该按 S + L 来理解(而不是只看 S)。
+#
+# 单据类型由 trans_no 区分(前缀释义来自思迅字典表 t_sys_sheet_no):
+#   JO 报损单      ← 实测 ysx 427 张 / hbposv7 315 张,**全部 db_no='-'**
+#   OO 库存调整单  ← 实测 ysx 698 张 '-' + 471 张 '+';hbposv7 178 '-' + 271 '+'
+#   KB 扣补单 / KO 领用单(偶见)
+#
+# ⚠️ **方向在头表 db_no,不在明细数量上**:
+#   实测 t_im_sheet_detail.real_qty **全部为正**(JO 5907 行 / OO 10826 行,负数 0 行);
+#   '+' 表示增加库存(盘盈/补录),'-' 表示减少库存(损耗/领用)。
+#   ⇒ 盘损口径必须是「JO 全部 + OO 且 direction='-'」,**不能**把 OO 的 '+' 也算成损耗
+#   (那会把盘盈当成损耗,反而把进货偏离"解释"掉)。
+#
+# 一个单据头对应多行(t_im_sheet_detail),按 sheet_no 关联。
+name: stock_loss
+sql_table: stock_loss
+storage: live  # 不落本地副本:报损单当天就可能发生,快照会漏(见 settlement/schema.yaml 顶部说明)
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 单据号
+    description: 源列 sheet_no。两个 family 都是 char,查询层统一 RTRIM
+
+  - name: document_type
+    sql: document_type
+    type: string
+    title: 单据类型
+    description: 源列 trans_no
+    enum_values:
+      - { value: "JO", label: 报损单 }
+      - { value: "OO", label: 库存调整单 }
+      - { value: "KB", label: 扣补单 }
+      - { value: "KO", label: 领用单 }
+
+  - name: direction
+    sql: direction
+    type: string
+    title: 库存方向
+    description: |
+      源列 db_no。'+' = 增加库存(盘盈/补录),'-' = 减少库存(损耗/领用)。
+
+      ⚠️ 明细表的 real_qty **恒为正**,增减方向只在这一列上。
+
+  - name: approve_status
+    sql: approve_status
+    type: string
+    title: 审核状态
+    description: 源列 approve_flag
+    enum_values:
+      - { value: "0", label: 未审核 }
+      - { value: "1", label: 已审核 }
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date(真 datetime,源库有单列索引)
+
+  - name: finished_at
+    sql: finished_at
+    type: time
+    title: 审核完成时间
+    description: 源列 work_date
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 other1(实测装的是损耗原因文本,如"破损、被偷")
+
+  # amount 同时是维度:单据头一行一单 ⇒ 过滤等价于 HAVING(理由见 purchase_sheet.schema.yaml)
+  - name: amount
+    sql: amount
+    type: number
+    title: 单据金额(元)
+    description: 源列 sheet_amt
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 单据数
+
+  - name: total_amount_yuan
+    sql: "SUM(amount)"
+    type: number
+    title: 单据金额合计(元)
+    format: "0.00"
+    description: 源列 sheet_amt
+
+joins:
+  - name: stock_loss_line
+    sql: stock_loss_line
+    on: "{CUBE}.id = stock_loss_line.sheet_id"
+    relationship: one_to_many

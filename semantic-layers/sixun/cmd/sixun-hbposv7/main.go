@@ -134,6 +134,11 @@ type appConfig struct {
 		TablePurchaseSheet   string `yaml:"table_purchase_sheet"`
 		TablePurchaseSheetLn string `yaml:"table_purchase_sheet_line"`
 		TableSaleDay         string `yaml:"table_sale_day"`
+		// 盘损(2026-10-31)。库存类单据头(JO 报损 / OO 库存调整)与明细行。
+		// 这两张 table_* 是"进货偏离销量"判据的**解释源**:有报损时按 销量+盘损 判定。
+		// ⚠️ 采购单不在 t_im_sheet_master,别把它和 t_pm_sheet_master 搞混。
+		TableStockLoss     string `yaml:"table_stock_loss"`
+		TableStockLossLine string `yaml:"table_stock_loss_line"`
 		// 销售报表(2026-10-15)。日汇总流水 + 商品档案 + 类别字典。
 		//
 		// ⚠️ TableItemClsParent 与 TableItemCls 指向**同一张物理表**(t_bd_item_cls),
@@ -558,6 +563,9 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		"purchase_sheet":      cfg.Source.TablePurchaseSheet,
 		"purchase_sheet_line": cfg.Source.TablePurchaseSheetLn,
 		"sale_day":            cfg.Source.TableSaleDay,
+		// 盘损(2026-10-31)。漏配 ⇒ 该 model 在启动期被跳过,盘损读取会 400 MODEL_NOT_FOUND。
+		"stock_loss":      cfg.Source.TableStockLoss,
+		"stock_loss_line": cfg.Source.TableStockLossLine,
 		"stock":               cfg.Source.TableStock,
 		// 销售报表四件套。item / item_cls / item_cls_parent 同理各要一张表名:
 		// 少配一个,对应 model 会在 main() 里被跳过并只留一行日志。

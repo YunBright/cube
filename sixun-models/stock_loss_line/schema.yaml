@@ -1,0 +1,77 @@
+# stock_loss_line model - 思迅家族共享 schema(库存单据明细行)
+#
+# 源表:t_im_sheet_detail(两个 family 同名同表,列结构已实测核对)
+#
+# 本表是**所有库存类单据共用**的明细表(JO 报损 / OO 调整 / KB 扣补 / KO 领用)。
+# 它**没有 trans_no 列** ⇒ 要按单据类型/方向筛选必须 join stock_loss(头表):
+#   维度写 `stock_loss.document_type` / `stock_loss.direction`,
+#   或 filter 打这两个成员(见 cube docs/semantic-layer-design.md 的
+#   「明细侧按单据类型筛要用 join + filter」)。
+#
+# ⚠️ 数量列 real_qty **恒为正**(实测 JO 5907 行 / OO 10826 行,负数 0 行);
+#   减/增方向在头表的 db_no(见 stock_loss.schema.yaml)。
+#   这里的度量取 ABS:万一源库出现负数行,也不会把"损耗"算成一个负的
+#   "销量"(那会让进货偏离看起来更严重,方向反而是错的)。
+#
+# ⚠️ 金额列 sub_amt 实测**恒为 0**(与 purchase_sheet_detail 不同)
+#   ⇒ 金额只能由 数量 × 单价 算出来,不能 SUM(sub_amt)。
+name: stock_loss_line
+sql_table: stock_loss_line
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 明细行 ID
+    description: 源列 flow_id。hbposv7 另有 row_id,ysx 没有 ⇒ 不映射
+
+  - name: sheet_id
+    sql: sheet_id
+    type: string
+    title: 单据号
+    description: 源列 sheet_no,join stock_loss.id
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品 ID
+    description: 源列 item_no。char(20),hbposv7 尾部补空格、ysx 不补
+
+  - name: valid_at
+    sql: valid_at
+    type: time
+    title: 生效日期
+    description: 源列 valid_date
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 明细行数
+
+  - name: total_loss_quantity
+    sql: "SUM(ABS(quantity))"
+    type: number
+    title: 损耗数量合计
+    format: "0.00"
+    description: 源列 real_qty。单位随商品(称重商品是重量),与 sale_day 的销量同一口径
+
+  - name: total_loss_amount_yuan
+    sql: "SUM(ABS(quantity) * cost_price)"
+    type: number
+    title: 损耗金额合计(元)
+    format: "0.00"
+    description: 数量 × 单价(源列 real_qty × valid_price)。⚠️ 源列 sub_amt 实测恒为 0,
+      金额只能这样算
+
+joins:
+  - name: stock_loss
+    sql: stock_loss
+    on: "{CUBE}.sheet_id = stock_loss.id"
+    relationship: many_to_one
+
+  - name: product
+    sql: product
+    on: "{CUBE}.product_id = product.id"
+    relationship: many_to_one

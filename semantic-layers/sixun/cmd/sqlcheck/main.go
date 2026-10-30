@@ -69,6 +69,9 @@ type config struct {
 		TablePurchaseSheet string `yaml:"table_purchase_sheet"`
 		TablePurchaseLn    string `yaml:"table_purchase_sheet_line"`
 		TableSaleDay       string `yaml:"table_sale_day"`
+		// 盘损(2026-10-31)。库存类单据头/明细(JO 报损 / OO 库存调整)。
+		TableStockLoss     string `yaml:"table_stock_loss"`
+		TableStockLossLine string `yaml:"table_stock_loss_line"`
 		// 销售报表四件套。与 cmd/sixun-<family>/main.go 的 liveTables 是
 		// **同一个集合的三份拷贝之一** —— 见 loadSchemas 里 srcTables 的注释。
 		TableSalesReport   string `yaml:"table_sales_report"`
@@ -1163,6 +1166,9 @@ func loadSchemas(mappingDir string, cfg *config) (
 		"purchase_sheet":      cfg.Source.TablePurchaseSheet,
 		"purchase_sheet_line": cfg.Source.TablePurchaseLn,
 		"sale_day":            cfg.Source.TableSaleDay,
+		// 盘损(2026-10-31)。与 liveTables() 同一个集合。
+		"stock_loss":      cfg.Source.TableStockLoss,
+		"stock_loss_line": cfg.Source.TableStockLossLine,
 		"stock":               cfg.Source.TableStock,
 		"sales_report":        cfg.Source.TableSalesReport,
 		"item":                cfg.Source.TableItem,

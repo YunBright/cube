@@ -1,0 +1,50 @@
+# stock_loss mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_im_sheet_master —— 库存类单据(JO 报损 / OO 库存调整 / KB 扣补 / KO 领用)。
+# ⚠️ 采购单**不在**这张表(t_pm_sheet_master 才是)。
+#
+# 实测(ysx):   JO 427 张(db_no 全 '-')/ OO 698 '-' + 471 '+'
+# 实测(hbposv7): JO 315 张(db_no 全 '-')/ OO 178 '-' + 271 '+'
+# ⇒ 盘损口径 =「JO 全部 + OO 且 direction='-'」,不要用 OO 的 '+' 行。
+version: 1
+model: stock_loss
+
+mappings:
+  - source: sheet_no
+    target: id
+    type: string
+
+  - source: trans_no
+    target: document_type
+    type: string
+
+  # 增减方向(源列 db_no):'+' 增加库存 / '-' 减少库存。
+  # ⚠️ 明细数量 real_qty 恒为正,方向只在这一列上。
+  - source: db_no
+    target: direction
+    type: string
+
+  - source: approve_flag
+    target: approve_status
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  - source: work_date
+    target: finished_at
+    type: datetime
+
+  - source: other1
+    target: remark
+    type: string
+
+  - source: sheet_amt
+    target: amount
+    type: decimal
+    unit: yuan
