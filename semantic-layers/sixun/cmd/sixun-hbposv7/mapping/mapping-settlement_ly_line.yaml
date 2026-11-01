@@ -1,0 +1,56 @@
+# settlement_ly_line mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_fm_recpay_ly_detail —— 联营帐款明细(按商品的销售额与扣点)。
+#
+# ⚠️ 两个 family 共有列:flow_id / oper_date / item_no / branch_no /
+#   sale_qty / sale_amount / ac_amount / sup_ly_rate / sup_ly_amount / sheet_no
+#   (hbposv7 另有 num3,ysx 没有 ⇒ 不映射)
+#
+# 扣点率算法:SUM(sup_ly_amount) / SUM(sale_amount)(汇总金额相除,不要 AVG 逐行 rate)。
+version: 1
+model: settlement_ly_line
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: sheet_no
+    target: settlement_id
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  # ---- 数量 / 金额(measure 用)----
+  - source: sale_qty
+    target: sale_qty
+    type: decimal
+
+  - source: sale_amount      # 销售额(扣点率分母)
+    target: sales_amount
+    type: decimal
+    unit: yuan
+
+  - source: sup_ly_amount    # 联营扣点金额(扣点率分子)
+    target: deduct_amount
+    type: decimal
+    unit: yuan
+
+  - source: sup_ly_rate      # 源系统记录的扣点率(汇总口径仍以金额相除为准)
+    target: deduct_rate
+    type: decimal
+
+  - source: ac_amount        # 结算金额
+    target: settle_amount
+    type: decimal
+    unit: yuan

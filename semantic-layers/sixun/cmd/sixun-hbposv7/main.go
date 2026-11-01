@@ -97,7 +97,7 @@ type appConfig struct {
 		// ⚠️ 这是 **family 私有事实**,所以走 config 而不是 mapping
 		// (mapping 的 target 集合两个 family 必须逐字一致)。
 		SaleDetailReturnQtyCol string `yaml:"sale_detail_return_qty_col"`
-		TableStock            string `yaml:"table_stock"`
+		TableStock             string `yaml:"table_stock"`
 		// ---- 2026-10-22 新增的 live model 源表 ----
 		// 收银流水 / 促销方案头 / 商品供货信息 / 商品档案价格。
 		// 表名是 family 私有事实,所以只在这里配,不进共享的 sixun-models/
@@ -129,11 +129,19 @@ type appConfig struct {
 		MemberPointsUsedCol        string `yaml:"member_points_used_col"`
 		// 结算审批场景(2026-10-09)。表名在两个 family 同名同表,
 		// 单据类型不同:hbposv7 的结款单是 DP(供应商对帐单)、ysx 是 CP。
-		TableSettlement      string `yaml:"table_settlement"`
-		TableSettlementLine  string `yaml:"table_settlement_line"`
-		TablePurchaseSheet   string `yaml:"table_purchase_sheet"`
-		TablePurchaseSheetLn string `yaml:"table_purchase_sheet_line"`
-		TableSaleDay         string `yaml:"table_sale_day"`
+		TableSettlement     string `yaml:"table_settlement"`
+		TableSettlementLine string `yaml:"table_settlement_line"`
+		// 联营帐款(2026-10-31)。联营单在**独立表** t_fm_recpay_ly_master /
+		// t_fm_recpay_ly_detail(实测 gx_master 里只有 DP/CP,LY = 0 张)。
+		TableSettlementLY     string `yaml:"table_settlement_ly"`
+		TableSettlementLYLine string `yaml:"table_settlement_ly_line"`
+		// 代销帐款(2026-11-01)。同样在**独立表** t_fm_recpay_dx_master /
+		// t_fm_recpay_dx_detail_v4(gx_master 里没有 DX)。
+		TableSettlementDX     string `yaml:"table_settlement_dx"`
+		TableSettlementDXLine string `yaml:"table_settlement_dx_line"`
+		TablePurchaseSheet    string `yaml:"table_purchase_sheet"`
+		TablePurchaseSheetLn  string `yaml:"table_purchase_sheet_line"`
+		TableSaleDay          string `yaml:"table_sale_day"`
 		// 盘损(2026-10-31)。库存类单据头(JO 报损 / OO 库存调整)与明细行。
 		// 这两张 table_* 是"进货偏离销量"判据的**解释源**:有报损时按 销量+盘损 判定。
 		// ⚠️ 采购单不在 t_im_sheet_master,别把它和 t_pm_sheet_master 搞混。
@@ -156,6 +164,16 @@ type appConfig struct {
 		// 商品条码补充表(2026-10-21)。一品多码:一个货号可有 1~7 个条码。
 		// 实测两库都有该表(ysx 153 行 / hbposv7 同表同列)。
 		TableItemBarcode string `yaml:"table_item_barcode"`
+		// TableItemCombo 是组合/拆分关系表(t_bd_item_combsplit,2026-11-01)。
+		//
+		// 为什么要它:整箱进货、拆散零售的商品(大米/饮料/啤酒),销售日结只记
+		// **子商品**的销量,而进货记在**父商品**上 ⇒ 不归并就会得出
+		// "进货 1 包、卖出 0"的假事实,把正常进货判成超量。
+		//
+		// ⚠️ 实测(ysx/hbposv10)556 行:other1='1' 520 行是**拆分**
+		//   (comb_item_no → item_no × item_qty,item_qty > 0);
+		//   other1='6' 36 行是**组合**(打包销售,item_qty 恒 0 ⇒ 不可换算)。
+		TableItemCombo string `yaml:"table_item_combo"`
 	} `yaml:"source"`
 }
 
@@ -560,13 +578,17 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 	return map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLine,
+		"settlement_ly":       cfg.Source.TableSettlementLY,
+		"settlement_ly_line":  cfg.Source.TableSettlementLYLine,
+		"settlement_dx":       cfg.Source.TableSettlementDX,
+		"settlement_dx_line":  cfg.Source.TableSettlementDXLine,
 		"purchase_sheet":      cfg.Source.TablePurchaseSheet,
 		"purchase_sheet_line": cfg.Source.TablePurchaseSheetLn,
 		"sale_day":            cfg.Source.TableSaleDay,
 		// 盘损(2026-10-31)。漏配 ⇒ 该 model 在启动期被跳过,盘损读取会 400 MODEL_NOT_FOUND。
 		"stock_loss":      cfg.Source.TableStockLoss,
 		"stock_loss_line": cfg.Source.TableStockLossLine,
-		"stock":               cfg.Source.TableStock,
+		"stock":           cfg.Source.TableStock,
 		// 销售报表四件套。item / item_cls / item_cls_parent 同理各要一张表名:
 		// 少配一个,对应 model 会在 main() 里被跳过并只留一行日志。
 		"sales_report":    cfg.Source.TableSalesReport,
@@ -576,6 +598,9 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		"promotion":       cfg.Source.TablePromotion,
 		// 商品条码补充表(2026-10-21)。live model 不落本地副本,查询时透传源库。
 		"item_barcode": cfg.Source.TableItemBarcode,
+		// 组合/拆分关系(2026-11-01)。漏配 ⇒ 该 model 启动期被跳过,
+		// 上层归并查询会 400 MODEL_NOT_FOUND。
+		"item_combo": cfg.Source.TableItemCombo,
 		// 商品档案(2026-10-22 改成 live)。
 		//
 		// ⚠️ 为什么必须 live:pkg/cubequery/join.go 的 checkStorage 拒绝任何

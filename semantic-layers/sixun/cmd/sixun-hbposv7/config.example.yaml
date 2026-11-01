@@ -60,6 +60,12 @@ source:
 
   table_settlement:          t_fm_recpay_gx_master
   table_settlement_line:     t_fm_recpay_detail
+  # 联营帐款(2026-10-31):独立表 t_fm_recpay_ly_master / t_fm_recpay_ly_detail。
+  table_settlement_ly:       t_fm_recpay_ly_master
+  table_settlement_ly_line:  t_fm_recpay_ly_detail
+  # 代销帐款(2026-11-01):独立表 t_fm_recpay_dx_master / t_fm_recpay_dx_detail_v4。
+  table_settlement_dx:       t_fm_recpay_dx_master
+  table_settlement_dx_line:  t_fm_recpay_dx_detail_v4
   table_purchase_sheet:      t_pm_sheet_master
   table_purchase_sheet_line: t_pm_sheet_detail
   table_sale_day:            t_rm_daysum

@@ -1,0 +1,28 @@
+# item_combo mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_bd_item_combsplit —— 商品组合/拆分关系(2026-11-01 实测 ysx 556 行)。
+#
+# ⚠️ 两个 family 共有列:comb_item_no / item_no / item_qty / memo / other1 / modify_date。
+#
+# ⚠️ other1 的取值决定这条关系能不能换算:
+#   '1' = 拆分(父 → 子 × item_qty,520 行,item_qty > 0)
+#   '6' = 组合(打包销售,36 行,item_qty 恒 0 ⇒ 没有数量,不可换算)
+version: 1
+model: item_combo
+
+mappings:
+  - source: comb_item_no
+    target: parent_id
+    type: string
+
+  - source: item_no
+    target: child_id
+    type: string
+
+  - source: item_qty
+    target: quantity
+    type: decimal
+
+  - source: other1
+    target: combo_type
+    type: string

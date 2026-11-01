@@ -1,0 +1,142 @@
+# settlement_ly model - 思迅家族共享 schema(联营帐款单头)
+#
+# 源表:t_fm_recpay_ly_master(两个 family **同名同表**)
+#
+# # 为什么单独建 model(2026-10-31 生产库实测)
+#
+#   联营帐款(LY)在思迅里**不在**多态的「结款单头」t_fm_recpay_gx_master 里,
+#   而是独立一套:
+#     t_fm_recpay_ly_master  (头)
+#     t_fm_recpay_ly_detail  (明细 = 按商品的销售额与扣点)
+#   实测两个库的 t_fm_recpay_gx_master 里只有 DP / CP 两种 trans_no,LY = 0 张;
+#   联营单(如 LY002610130070)全部落在 ly_master ⇒ 与购销结算单**不同表**,
+#   不能在同一张语义模型里合并查询 ⇒ 独立 model + 前端购销/联营切换。
+#
+# # 金额口径(2026-10-31 实测,两 family 一致)
+#
+#   sum_amount  = 毛销售额(与明细 Σ sale_amount 相等,逐单核对过)
+#   get_amt     = 已付金额(当前基本为 0,预付款未启用)
+#   dct_amount  = **恒 0**,不可当扣点用
+#   num1 / num2 = 净应付 / 扣点,但**两个 family 语义相反** ⇒ 不可用
+#   ⇒ 扣点只能从明细 Σ sup_ly_amount 汇总(sale_amount 作分母)
+#
+# storage: live —— 不落本地副本,查询时实时编译成 T-SQL 打源库。
+#   联营帐款单是实时新建的,落盘副本会查不到当天单。
+name: settlement_ly
+sql_table: settlement_ly
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 联营帐款单号
+    description: 源列 sheet_no。char 定长(两 family 长度不同),查询层统一 RTRIM
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 供应商 ID
+    description: 源列 sup_no,join supplier.id
+
+  - name: document_type
+    sql: document_type
+    type: string
+    title: 单据类型
+    description: 源列 trans_no。本 model 恒为 LY(联营帐款)
+    enum_values:
+      - { value: "LY", label: 联营帐款 }
+
+  - name: approve_status
+    sql: approve_status
+    type: string
+    title: 审核状态
+    description: 源列 approve_flag
+    enum_values:
+      - { value: "0", label: 未审核 }
+      - { value: "1", label: 已审核 }
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: period_start
+    sql: period_start
+    type: time
+    title: 结算期起
+    description: 源列 start_date
+
+  - name: period_end
+    sql: period_end
+    type: time
+    title: 结算期止
+    description: 源列 end_date
+
+  - name: settled_at
+    sql: settled_at
+    type: time
+    title: 结算日期
+    description: 源列 settle_date
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date
+
+  - name: finished_at
+    sql: finished_at
+    type: time
+    title: 审核完成时间
+    description: 源列 work_date
+
+  - name: operator_id
+    sql: operator_id
+    type: string
+    title: 制单人
+    description: 源列 oper_id
+
+  - name: confirmer
+    sql: confirmer
+    type: string
+    title: 审核人
+    description: 源列 confirm_man
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 other1
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 联营帐款单数
+
+  - name: total_sales_yuan
+    sql: "SUM(sales_amount)"
+    type: number
+    title: 毛销售额合计(元)
+    format: "0.00"
+    description: 源列 sum_amount。实测与明细 Σ sale_amount 相等
+
+  - name: total_paid_yuan
+    sql: "SUM(paid_amount)"
+    type: number
+    title: 已付合计(元)
+    format: "0.00"
+    description: 源列 get_amt
+
+joins:
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one
+
+  - name: settlement_ly_line
+    sql: settlement_ly_line
+    on: "{CUBE}.id = settlement_ly_line.settlement_id"
+    relationship: one_to_many

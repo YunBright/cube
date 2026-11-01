@@ -1,0 +1,62 @@
+# item_combo model - 思迅家族共享 schema(商品组合/拆分关系)
+#
+# 源表:t_bd_item_combsplit(两个 family 同名同表)
+#
+# # 为什么必须有这个 model
+#
+#   思迅的「组合 / 拆分」关系只存在于**商品档案**,销售与库存流水里**没有**拆分数据:
+#     - t_rm_saleflow.com_flag 实测 211577 行全为 0(没有任何组合标记);
+#     - 同一 com_no 下没有父子配对行(com_no 只是组合流水号);
+#     - t_im_comb_split_master / t_im_comb_split_detail 两张表实测 0 行。
+#   ⇒ 想按「组」汇总销量/库存/进货,只能从这里取父子关系与换算数量。
+#
+# # 实测数据形态(2026-11-01,两个门店库语义不同!)
+#
+#   hbposepro(172.12.1.6,生产主店):1150 行,1148 行 item_qty > 0,
+#     other1 只是 item_qty 的数值回显('50.00'/'12.00'…),**不是类型**。
+#     关系本身很干净:包 500g → 50 个 500g、件 → 12 瓶、条 → 10 包、组 → 6 盒。
+#
+#   hbposv10(192.168.1.200):556 行,other1='1' 520 行(拆分行,item_qty>0)、
+#     other1='6' 36 行(组合打包,item_qty 恒 0、不可换算)。
+#
+#   ⇒ **不要按 combo_type 的字面值过滤**:跨库唯一可靠的判据是
+#     「item_qty > 0 才可换算」。上层(settlement-auditor)只采信这些行。
+#
+# storage: live —— 商品档案随时可能改组合关系,查询时直打源库。
+name: item_combo
+sql_table: item_combo
+storage: live
+
+dimensions:
+  - name: parent_id
+    sql: parent_id
+    type: string
+    title: 父商品货号
+    description: 源列 comb_item_no。按件/提/组卖的哪个商品
+
+  - name: child_id
+    sql: child_id
+    type: string
+    title: 子商品货号
+    description: 源列 item_no。拆开卖的哪个商品
+
+  - name: quantity
+    sql: quantity
+    type: number
+    title: 换算数量
+    description: 源列 item_qty。「1 个父 = quantity 个子」。为 0 的关系不可换算(丢弃)
+
+  - name: combo_type
+    sql: combo_type
+    type: string
+    title: 关系类型(按库而异)
+    description: >-
+      源列 other1。**语义随库不同**:hbposepro 里是 item_qty 的数值回显('50.00');
+      hbposv10 里是 '1'=拆分 / '6'=组合。上层不要按字面值过滤,
+      只按 quantity(item_qty) > 0 判断能否换算。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 关系数

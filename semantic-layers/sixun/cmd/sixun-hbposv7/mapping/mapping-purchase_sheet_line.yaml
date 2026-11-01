@@ -1,7 +1,13 @@
-# purchase_sheet_line mapping(hbposv7 / ysx 共用同一份)
+# purchase_sheet_line mapping(hbposv7 / ysx 共用同一份 target 集合)
 #
-# 源表 t_pm_sheet_detail —— 采购单明细行(两库列名逐列一致)。
+# 源表 t_pm_sheet_detail —— 采购单明细行。
 # "采购量 vs 实际销售量"判据里**采购侧的唯一数据来源**。
+#
+# ⚠️ 两库**并非逐列一致**(2026-11-01 实测,别再按"逐列一致"推断):
+#   ysx(hbposv10)     有 unit_no / Unit_factor(采购单位名与换算率,实测换算率恒 1)
+#   hbposv7(hbposepro) **没有**这两列(该表只有 25 列,可用 INFORMATION_SCHEMA 复核)
+#   ⇒ hbposv7 的 config.yaml 把 table_purchase_sheet_line 配成派生表片段,
+#     用常量补出 unit_no='' / Unit_factor=1;上层见空单位按 1:1 处理。
 #
 # ⚠️ row_id 只有 hbposv7 有(ysx 14 列 vs hbposv7 13 列,差的是 row_id),
 #    共享 schema 只映射两边都有的列,故 id 用 flow_id。
@@ -25,6 +31,22 @@ mappings:
   - source: valid_date
     target: valid_at
     type: datetime
+
+  # ---- 单位口径(2026-11-01 新增)----
+  #
+  # ⚠️ 数量列(real_qty/large_qty)是**采购单位**口径,而 sale_day 的销量是
+  #    **销售单位**口径。判断两者能否相除,先要知道这一行按什么单位录。
+  #
+  # 实测(hbposv10):本店进货基本按销售单位录(盒/罐/kg/条/提),
+  # Unit_factor 恒 1、real_qty = large_qty;但同一商品存在不同单位录入
+  # (4891599338393 既有「罐」也有「瓶」) ⇒ 单位不一致时上层只发事实信号。
+  - source: unit_no
+    target: unit_no
+    type: string
+
+  - source: Unit_factor
+    target: unit_factor
+    type: decimal
 
   # ---- 数量 / 金额(measure 用)----
   - source: order_qty

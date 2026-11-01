@@ -1,0 +1,142 @@
+# settlement_dx model - 思迅家族共享 schema(代销帐款单头)
+#
+# 源表:t_fm_recpay_dx_master(两个 family **同名同表**,2026-11-01 逐列核对)
+#
+# # 为什么单独建 model
+#
+#   代销帐款(DX)和联营帐款(LY)一样,**不在**多态的「结款单头」
+#   t_fm_recpay_gx_master 里,而是独立一套:
+#     t_fm_recpay_dx_master      (头)
+#     t_fm_recpay_dx_detail_v4   (明细 = 按商品的零售额与结算额)
+#   实测两个库的 gx_master 里 trans_no 只有 DP / CP,没有 DX
+#   ⇒ 与购销结算单**不同表**,不能在同一张语义模型里合并查询
+#   ⇒ 独立 model + 前端「购销 / 联营 / 代销」切换。
+#
+# # 金额口径(2026-11-01 生产实测,单号 DX002610190001)
+#
+#   sum_amount  = 结算额(应付给供应商的钱),与明细 Σ ac_amount 相等
+#   get_amt     = 已付金额(当前基本为 0,预付款未启用)
+#   dct_amount  = 恒 0,不可当扣点用
+#   num1 / num2 = 头表上不代表零售额(实测 num1=0,num2=1)
+#   ⇒ **毛利只能从明细算**:零售额取 num1,结算额取 ac_amount
+#
+# storage: live —— 不落本地副本,查询时实时编译成 T-SQL 打源库。
+#   代销帐款单是实时新建的,落盘副本会查不到当天单。
+name: settlement_dx
+sql_table: settlement_dx
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 代销帐款单号
+    description: 源列 sheet_no。char 定长(两 family 长度不同,ysx 14 / hbposv7 20),查询层统一 RTRIM
+
+  - name: supplier_id
+    sql: supplier_id
+    type: string
+    title: 供应商 ID
+    description: 源列 sup_no,join supplier.id
+
+  - name: document_type
+    sql: document_type
+    type: string
+    title: 单据类型
+    description: 源列 trans_no。本 model 的语义恒为 DX(代销帐款),调用方不要依赖源列取值
+    enum_values:
+      - { value: "DX", label: 代销帐款 }
+
+  - name: approve_status
+    sql: approve_status
+    type: string
+    title: 审核状态
+    description: 源列 approve_flag
+    enum_values:
+      - { value: "0", label: 未审核 }
+      - { value: "1", label: 已审核 }
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: period_start
+    sql: period_start
+    type: time
+    title: 结算期起
+    description: 源列 start_date
+
+  - name: period_end
+    sql: period_end
+    type: time
+    title: 结算期止
+    description: 源列 end_date
+
+  - name: settled_at
+    sql: settled_at
+    type: time
+    title: 结算日期
+    description: 源列 settle_date
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 制单时间
+    description: 源列 oper_date
+
+  - name: finished_at
+    sql: finished_at
+    type: time
+    title: 审核完成时间
+    description: 源列 work_date
+
+  - name: operator_id
+    sql: operator_id
+    type: string
+    title: 制单人
+    description: 源列 oper_id
+
+  - name: confirmer
+    sql: confirmer
+    type: string
+    title: 审核人
+    description: 源列 confirm_man
+
+  - name: remark
+    sql: remark
+    type: string
+    title: 备注
+    description: 源列 other1
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 代销帐款单数
+
+  - name: total_settle_yuan
+    sql: "SUM(settle_amount)"
+    type: number
+    title: 结算额合计(元)
+    format: "0.00"
+    description: 源列 sum_amount。这是**应付给供应商的钱**(代销单的"货款")
+
+  - name: total_paid_yuan
+    sql: "SUM(paid_amount)"
+    type: number
+    title: 已付合计(元)
+    format: "0.00"
+    description: 源列 get_amt
+
+joins:
+  - name: supplier
+    sql: supplier
+    on: "{CUBE}.supplier_id = supplier.id"
+    relationship: many_to_one
+
+  - name: settlement_dx_line
+    sql: settlement_dx_line
+    on: "{CUBE}.id = settlement_dx_line.settlement_id"
+    relationship: one_to_many

@@ -1,0 +1,51 @@
+# settlement_dx_line mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_fm_recpay_dx_detail_v4 —— 代销帐款明细(按商品的零售额与结算额)。
+#
+# ⚠️ 两个 family 列名完全一致(2026-11-01 逐表核对):
+#   flow_id / sheet_no / oper_date / item_no / branch_no /
+#   sale_qty / ac_qty / ac_price / ac_amount / tax / num1 / num2 / other1 / other2
+#
+# 毛利率算法:rate = (SUM(num1) − SUM(ac_amount)) / SUM(num1)
+#   num1(→ retail_amount) = 零售额;ac_amount(→ settle_amount) = 结算额。
+#   ⚠️ 汇总金额相除,不要 AVG 逐行毛利率(见 cube 模型注释)。
+#
+# ⚠️ num2 实测恒 0,不映射(other1/other2 是文本、ac_qty/ac_price/tax 当前口径用不到)。
+version: 1
+model: settlement_dx_line
+
+mappings:
+  - source: flow_id
+    target: id
+    type: int
+
+  - source: sheet_no
+    target: settlement_id
+    type: string
+
+  - source: item_no
+    target: product_id
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  # ---- 数量 / 金额(measure 用)----
+  - source: sale_qty
+    target: sale_qty
+    type: decimal
+
+  - source: num1            # 零售金额(毛利率分母)
+    target: retail_amount
+    type: decimal
+    unit: yuan
+
+  - source: ac_amount       # 结算金额(毛利额减项)
+    target: settle_amount
+    type: decimal
+    unit: yuan

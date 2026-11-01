@@ -46,6 +46,31 @@ dimensions:
     title: 生效日期
     description: 源列 valid_date
 
+  # ---- 单位口径(2026-11-01 新增)----
+  #
+  # ⚠️ 数量列是"采购单位"口径,而 sale_day 的销量是**销售单位**口径。
+  #   要判断两者能否相除,必须先知道这一行是按什么单位录的。
+  #
+  # 实测(hbposv10,2026-11-01):本店进货基本按**销售单位**录入
+  # (盒/罐/kg/条/提),Unit_factor 恒 1、real_qty = large_qty;
+  # 但也存在同一商品在不同日期录成不同单位(如 4891599338393 既有「罐」也有「瓶」)
+  # ⇒ 单位不一致时上层只发事实信号,不做数量阻断(无法比较 ≠ 超量)。
+  #
+  # ⚠️ hbposv7(hbposepro) 的 t_pm_sheet_detail **没有这两列**(实测只有 25 列)。
+  #    该 family 的 table_purchase_sheet_line 由派生表片段补常量
+  #    (unit_no='' / Unit_factor=1),见 cmd/sixun-hbposv7/config.yaml。
+  - name: unit_no
+    sql: unit_no
+    type: string
+    title: 采购单位
+    description: 源列 unit_no(单位名本身,如 件/提/盒/罐/kg)
+
+  - name: unit_factor
+    sql: unit_factor
+    type: number
+    title: 采购单位换算率
+    description: 源列 Unit_factor。采购单位 → 商品基本单位的换算数;实测本店恒为 1
+
 measures:
   - name: count
     sql: "COUNT(*)"

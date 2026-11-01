@@ -1,0 +1,93 @@
+# settlement_ly_line model - 思迅家族共享 schema(联营帐款明细)
+#
+# 源表:t_fm_recpay_ly_detail(两个 family **同名同表**)
+#
+# 一行 = 某个商品在账期内的销售额与联营扣点:
+#   item_no        商品编码(join product/item)
+#   sale_qty       销售数量
+#   sale_amount    销售额(扣点率的分母)
+#   sup_ly_amount  联营扣点金额(扣点率的分子)
+#   sup_ly_rate    源系统记录的扣点率(sale_amount 为 0 时可能为空)
+#   ac_amount      结算金额
+#
+# # 扣点率的唯一正确算法(2026-10-31 实测)
+#
+#   rate = SUM(sup_ly_amount) / SUM(sale_amount)
+#   ⇒ 用**汇总后**的两个金额相除,不要 AVG(sup_ly_rate):
+#     逐行 rate 在促销/零销售行上会失真,汇总金额口径才与账实一致。
+#
+# ⚠️ 金额**不做 dimension**:pkg/cubequery 对所有维度无条件套 RTRIM,
+#   数值维度会变成字符串。按单据取金额请带 dimensions: [settlement_ly_line.settlement_id]。
+name: settlement_ly_line
+sql_table: settlement_ly_line
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 明细行 ID
+    description: 源列 flow_id
+
+  - name: settlement_id
+    sql: settlement_id
+    type: string
+    title: 联营帐款单号
+    description: 源列 sheet_no,join settlement_ly.id
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品编码
+    description: 源列 item_no
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 明细日期
+    description: 源列 oper_date
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 明细行数
+
+  - name: total_sales_yuan
+    sql: "SUM(sales_amount)"
+    type: number
+    title: 销售额合计(元)
+    format: "0.00"
+    description: 源列 sale_amount,扣点率的分母
+
+  - name: total_deduct_yuan
+    sql: "SUM(deduct_amount)"
+    type: number
+    title: 联营扣点合计(元)
+    format: "0.00"
+    description: 源列 sup_ly_amount,扣点率的分子
+
+  - name: total_qty
+    sql: "SUM(sale_qty)"
+    type: number
+    title: 销售数量合计
+    format: "0.00"
+
+  - name: total_settle_yuan
+    sql: "SUM(settle_amount)"
+    type: number
+    title: 结算金额合计(元)
+    format: "0.00"
+    description: 源列 ac_amount
+
+joins:
+  - name: settlement_ly
+    sql: settlement_ly
+    on: "{CUBE}.settlement_id = settlement_ly.id"
+    relationship: many_to_one

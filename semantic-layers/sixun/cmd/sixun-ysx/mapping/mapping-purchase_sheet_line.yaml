@@ -26,6 +26,22 @@ mappings:
     target: valid_at
     type: datetime
 
+  # ---- 单位口径(2026-11-01 新增)----
+  #
+  # ⚠️ 数量列(real_qty/large_qty)是**采购单位**口径,而 sale_day 的销量是
+  #    **销售单位**口径。判断两者能否相除,先要知道这一行按什么单位录。
+  #
+  # 实测(hbposv10):本店进货基本按销售单位录(盒/罐/kg/条/提),
+  # Unit_factor 恒 1、real_qty = large_qty;但同一商品存在不同单位录入
+  # (4891599338393 既有「罐」也有「瓶」) ⇒ 单位不一致时上层只发事实信号。
+  - source: unit_no
+    target: unit_no
+    type: string
+
+  - source: Unit_factor
+    target: unit_factor
+    type: decimal
+
   # ---- 数量 / 金额(measure 用)----
   - source: order_qty
     target: order_quantity

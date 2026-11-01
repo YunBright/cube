@@ -1,0 +1,89 @@
+# settlement_dx_line model - 思迅家族共享 schema(代销帐款明细)
+#
+# 源表:t_fm_recpay_dx_detail_v4(两个 family **同名同表**,2026-11-01 逐列核对)
+#
+# 一行 = 某个商品在账期内的零售额与结算额:
+#   item_no     商品编码(join product/item)
+#   sale_qty    销售数量
+#   ac_price    结算单价(供应商结算价)
+#   ac_amount   结算金额(应付供应商)  ⇒ 结算额的分母
+#   num1        零售金额              ⇒ 毛利的分母
+#   num2        实测恒 0,不映射
+#
+# # 代销毛利率的唯一正确算法(2026-11-01 实测)
+#
+#   毛利额 = SUM(num1) − SUM(ac_amount)
+#   毛利率 = 毛利额 / SUM(num1)
+#   ⇒ 用**汇总后**的两个金额相除,不要 AVG 逐行毛利率:
+#     逐行金额很小(几元),逐行比值的舍入误差会把整体毛利率抬偏。
+#   实测 DX002610190001:SUM(num1)=1503.00,SUM(ac_amount)=1202.40
+#   ⇒ 毛利 300.60,毛利率 20.00%(> 10% 门槛)。
+#
+# ⚠️ 金额**不做 dimension**:pkg/cubequery 对所有维度无条件套 RTRIM,
+#   数值维度会变成字符串。按单据取金额请带 dimensions: [settlement_dx_line.settlement_id]。
+name: settlement_dx_line
+sql_table: settlement_dx_line
+storage: live
+
+dimensions:
+  - name: id
+    sql: id
+    type: string
+    title: 明细行 ID
+    description: 源列 flow_id
+
+  - name: settlement_id
+    sql: settlement_id
+    type: string
+    title: 代销帐款单号
+    description: 源列 sheet_no,join settlement_dx.id
+
+  - name: product_id
+    sql: product_id
+    type: string
+    title: 商品编码
+    description: 源列 item_no
+
+  - name: branch_id
+    sql: branch_id
+    type: string
+    title: 分店 ID
+    description: 源列 branch_no
+
+  - name: created_at
+    sql: created_at
+    type: time
+    title: 明细日期
+    description: 源列 oper_date
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 明细行数
+
+  - name: total_retail_yuan
+    sql: "SUM(retail_amount)"
+    type: number
+    title: 零售额合计(元)
+    format: "0.00"
+    description: 源列 num1,毛利率的分母
+
+  - name: total_settle_yuan
+    sql: "SUM(settle_amount)"
+    type: number
+    title: 结算额合计(元)
+    format: "0.00"
+    description: 源列 ac_amount,毛利额的减项
+
+  - name: total_qty
+    sql: "SUM(sale_qty)"
+    type: number
+    title: 销售数量合计
+    format: "0.00"
+
+joins:
+  - name: settlement_dx
+    sql: settlement_dx
+    on: "{CUBE}.settlement_id = settlement_dx.id"
+    relationship: many_to_one

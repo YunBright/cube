@@ -58,17 +58,22 @@ import (
 // config 是实例 config.yaml 的最小子集(与 cmd/sqlq 保持同构)。
 type config struct {
 	Source struct {
-		DSN                string `yaml:"dsn"`
-		Version            string `yaml:"version"`
-		TableSupplier      string `yaml:"table_supplier"`
-		TableProduct       string `yaml:"table_product"`
-		TableCategory      string `yaml:"table_category"`
-		TableStock         string `yaml:"table_stock"`
-		TableSettlement    string `yaml:"table_settlement"`
-		TableSettlementLn  string `yaml:"table_settlement_line"`
-		TablePurchaseSheet string `yaml:"table_purchase_sheet"`
-		TablePurchaseLn    string `yaml:"table_purchase_sheet_line"`
-		TableSaleDay       string `yaml:"table_sale_day"`
+		DSN               string `yaml:"dsn"`
+		Version           string `yaml:"version"`
+		TableSupplier     string `yaml:"table_supplier"`
+		TableProduct      string `yaml:"table_product"`
+		TableCategory     string `yaml:"table_category"`
+		TableStock        string `yaml:"table_stock"`
+		TableSettlement   string `yaml:"table_settlement"`
+		TableSettlementLn string `yaml:"table_settlement_line"`
+		// 联营 / 代销帐款(2026-10-31 / 2026-11-01)。都是**独立表**,不在 gx_master 里。
+		TableSettlementLY     string `yaml:"table_settlement_ly"`
+		TableSettlementLYLine string `yaml:"table_settlement_ly_line"`
+		TableSettlementDX     string `yaml:"table_settlement_dx"`
+		TableSettlementDXLine string `yaml:"table_settlement_dx_line"`
+		TablePurchaseSheet    string `yaml:"table_purchase_sheet"`
+		TablePurchaseLn       string `yaml:"table_purchase_sheet_line"`
+		TableSaleDay          string `yaml:"table_sale_day"`
 		// 盘损(2026-10-31)。库存类单据头/明细(JO 报损 / OO 库存调整)。
 		TableStockLoss     string `yaml:"table_stock_loss"`
 		TableStockLossLine string `yaml:"table_stock_loss_line"`
@@ -82,21 +87,24 @@ type config struct {
 		// 商品条码补充表(2026-10-21)。与 cmd/sixun-<family>/main.go 的 liveTables
 		// 是**同一个集合的第三份拷贝**(见 loadSchemas 里 srcTables 的注释)。
 		TableItemBarcode string `yaml:"table_item_barcode"`
+		// 组合/拆分关系(2026-11-01)。与 cmd/sixun-<family>/main.go 的 liveTables
+		// 是同一个集合的第三份拷贝(见 loadSchemas 里 srcTables 的注释)。
+		TableItemCombo string `yaml:"table_item_combo"`
 		// ---- 2026-10-22:逐笔销售流水 / 收银流水 / 促销方案头 / 供货信息 / 档案价格 ----
 		//
 		// ⚠️ 旧的 `table_sale`(ysx t_mp_saleflow / hbposv7 t_rm_order_saleflow)
 		//    已退役:前者实测 0 行、后者表根本不存在 ⇒ 两个库都取不到数据。
 		//    live model 的源表名一律按 `table_<model>` 命名(见 loadSchemas 的 srcTables)。
-		TableSaleDetail    string `yaml:"table_sale_detail"`
+		TableSaleDetail string `yaml:"table_sale_detail"`
 		// SaleDetailReturnQtyCol 是"本行被退掉的数量"列名(ysx = ret_qnty;hbposv7 无此列)。
 		//
 		// ⚠️ family 私有事实 ⇒ 走 config 不走 mapping(mapping 的 target 集合
 		//    两个 family 必须逐字一致)。
 		SaleDetailReturnQtyCol string `yaml:"sale_detail_return_qty_col"`
-		TablePayflow       string `yaml:"table_payflow"`
-		TablePromotionPlan string `yaml:"table_promotion_plan"`
-		TableSupplierItem  string `yaml:"table_supplier_item"`
-		TableBranchPrice   string `yaml:"table_branch_price"`
+		TablePayflow           string `yaml:"table_payflow"`
+		TablePromotionPlan     string `yaml:"table_promotion_plan"`
+		TableSupplierItem      string `yaml:"table_supplier_item"`
+		TableBranchPrice       string `yaml:"table_branch_price"`
 		// ---- 2026-10-23:最后六个 live model(全部 model 都是 live 了)----
 		// 供应商 / 分类 / 客户类别 / 会员类别 / 销售方式 / 会员档案。
 		TableCustType   string `yaml:"table_cust_type"`
@@ -818,7 +826,7 @@ func buildCases() []checkCase {
 		{
 			// 负向:wrong member prefix 必须被拒,而不是静默返回 unnamed 的一坨。
 			name: "促销-错前缀应被拒", base: "promotion", wantErr: true,
-			desc:     "product.id 不是 promotion 的成员",
+			desc: "product.id 不是 promotion 的成员",
 			query: &cubequery.Query{
 				Measures:   []string{"promotion.count"},
 				Dimensions: []string{"product.id"},
@@ -861,6 +869,21 @@ func buildCases() []checkCase {
 				Measures:   []string{"item_barcode.count"},
 				Dimensions: []string{"product.id"},
 				Limit:      lim(5),
+			},
+		},
+		// ====== 组合/拆分关系(2026-11-01)======
+		// 验证的是**整条链**:canonical 名 → mapping 翻译 → 真实列名。
+		// 上层按「组」汇总销量/库存/进货时,这条链路查错一位就会归并到错商品。
+		{
+			name: "组合拆分-全量抽样", base: "item_combo",
+			desc: "父/子货号 / 换算数量 / 关系类型四列都要能查出来。" +
+				"⚠️ 实测 ysx 556 行(other1='1' 520 行可换算,'6' 36 行 item_qty=0)," +
+				"所以这是**小表**,上层一次全取再本地归并。",
+			query: &cubequery.Query{
+				Measures: []string{"item_combo.count"},
+				Dimensions: []string{"item_combo.parent_id", "item_combo.child_id",
+					"item_combo.quantity", "item_combo.combo_type"},
+				Limit: lim(5),
 			},
 		},
 		// ====== 2026-10-22:逐笔销售流水 / 收银流水 / 促销方案头 / 供货信息 / 档案价格 =====
@@ -1163,19 +1186,24 @@ func loadSchemas(mappingDir string, cfg *config) (
 	srcTables := map[string]string{
 		"settlement":          cfg.Source.TableSettlement,
 		"settlement_line":     cfg.Source.TableSettlementLn,
+		"settlement_ly":       cfg.Source.TableSettlementLY,
+		"settlement_ly_line":  cfg.Source.TableSettlementLYLine,
+		"settlement_dx":       cfg.Source.TableSettlementDX,
+		"settlement_dx_line":  cfg.Source.TableSettlementDXLine,
 		"purchase_sheet":      cfg.Source.TablePurchaseSheet,
 		"purchase_sheet_line": cfg.Source.TablePurchaseLn,
 		"sale_day":            cfg.Source.TableSaleDay,
 		// 盘损(2026-10-31)。与 liveTables() 同一个集合。
 		"stock_loss":      cfg.Source.TableStockLoss,
 		"stock_loss_line": cfg.Source.TableStockLossLine,
-		"stock":               cfg.Source.TableStock,
-		"sales_report":        cfg.Source.TableSalesReport,
-		"item":                cfg.Source.TableItem,
-		"item_cls":            cfg.Source.TableItemCls,
-		"item_cls_parent":     cfg.Source.TableItemClsParent,
-		"promotion":           cfg.Source.TablePromotion,
-		"item_barcode":        cfg.Source.TableItemBarcode,
+		"stock":           cfg.Source.TableStock,
+		"sales_report":    cfg.Source.TableSalesReport,
+		"item":            cfg.Source.TableItem,
+		"item_cls":        cfg.Source.TableItemCls,
+		"item_cls_parent": cfg.Source.TableItemClsParent,
+		"promotion":       cfg.Source.TablePromotion,
+		"item_barcode":    cfg.Source.TableItemBarcode,
+		"item_combo":      cfg.Source.TableItemCombo,
 		// 商品档案(2026-10-22 改成 live)。
 		"product": cfg.Source.TableProduct,
 		// ---- 2026-10-22 新增的五个 live model ----

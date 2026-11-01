@@ -1,0 +1,80 @@
+# settlement_ly mapping(hbposv7 / ysx 共用同一份)
+#
+# 源表 t_fm_recpay_ly_master —— 联营帐款单头(与购销结算单的 gx_master **不同表**)。
+#
+# ⚠️ 两个 family 共有列(2026-10-31 逐表核对):
+#   sup_no / start_date / end_date / sum_amount / dct_amount / confirm_man / oper_id /
+#   work_date / oper_date / sheet_no / trans_no / approve_flag / settle_date / other1 / get_amt
+# hbposv7 另有 ly_bala / pay_way / card_rate / apport_rate* 等,ysx 没有
+#   ⇒ 共享 schema 只映射两边都有的列(pay_way 因此不进 schema)。
+#
+# ⚠️ 金额:
+#   sum_amount(→ sales_amount) = 毛销售额
+#   get_amt  (→ paid_amount)  = 已付
+#   dct_amount 恒 0 ⇒ 不映射成扣点;扣点从明细 sup_ly_amount 汇总。
+version: 1
+model: settlement_ly
+
+mappings:
+  - source: sheet_no
+    target: id
+    type: string
+
+  - source: sup_no
+    target: supplier_id
+    type: string
+
+  - source: trans_no
+    target: document_type
+    type: string
+
+  - source: approve_flag
+    target: approve_status
+    type: string
+
+  - source: branch_no
+    target: branch_id
+    type: string
+
+  - source: start_date
+    target: period_start
+    type: datetime
+
+  - source: end_date
+    target: period_end
+    type: datetime
+
+  - source: settle_date
+    target: settled_at
+    type: datetime
+
+  - source: oper_date
+    target: created_at
+    type: datetime
+
+  - source: work_date
+    target: finished_at
+    type: datetime
+
+  - source: oper_id
+    target: operator_id
+    type: string
+
+  - source: confirm_man
+    target: confirmer
+    type: string
+
+  - source: other1
+    target: remark
+    type: string
+
+  # ---- 金额(不做 dimension,只做物理列 + measure)----
+  - source: sum_amount     # 毛销售额
+    target: sales_amount
+    type: decimal
+    unit: yuan
+
+  - source: get_amt        # 已付
+    target: paid_amount
+    type: decimal
+    unit: yuan
