@@ -1,0 +1,15 @@
+# operator mapping(ysx / hbposv7 列名相同,两份内容一致)
+#
+# 源表 t_sys_operator(操作员/收银员档案)。
+# 只取 id/name 两列 —— payflow 关联只需要姓名。
+version: 1
+model: operator
+
+mappings:
+  - source: oper_id
+    target: id
+    type: string
+
+  - source: oper_name
+    target: name
+    type: string

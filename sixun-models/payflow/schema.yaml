@@ -116,7 +116,10 @@ dimensions:
     sql: RTRIM(cashier_id)
     type: string
     title: 收银员编码
-    description: 源列 oper_id(char(4))
+    description: |
+      源列 oper_id(char(4))。
+      ⚠️ 不建 join：cube 的 ON 渲染会给表达式整体加别名前缀
+      （`t0.RTRIM(cashier_id)` 非法）；姓名由后端单独查 operator 模型后回填。
 
   - name: salesman_id
     sql: RTRIM(salesman_id)
@@ -130,6 +133,9 @@ dimensions:
     title: 柜台号
     description: 源列 counter_no(char(4))
 
+# 收银员姓名不在本 model 里：payflow 只有 oper_id，姓名在 operator 模型。
+# 刻意**不做 join** —— ON 渲染会给 RTRIM 表达式整体加别名前缀（T-SQL 非法）；
+# 下游按 cashier_id 单独查 operator 后回填姓名即可。
 measures:
   - name: count
     sql: "COUNT(*)"

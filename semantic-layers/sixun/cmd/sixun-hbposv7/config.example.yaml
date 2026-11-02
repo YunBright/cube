@@ -29,6 +29,7 @@ source:
   #   sale_detail 现在是 live model,源表名按 `table_<model>` 约定与 model 名对齐。
   table_sale_detail:   t_rm_saleflow       # 逐笔销售流水(实测 1743882 行)
   table_payflow:       t_rm_payflow        # 收银流水(实测 550213 行)
+  table_operator:      t_sys_operator      # 收银员档案(payflow 的姓名来源)
   table_promotion_plan: t_pub_plan_master  # 促销方案头(实测 0 行 —— 本库空表)
   table_supplier_item: t_bd_supcust_item   # 商品供货信息(实测 45275 行)
   table_branch_price:  t_pc_branch_price   # 商品档案价格(实测 44623 行)

@@ -1,0 +1,41 @@
+# operator model - 思迅家族**操作员/收银员档案**(t_sys_operator)
+#
+# # 为什么需要它
+#
+# payflow 只存 `oper_id`（收银员工号），姓名在 `t_sys_operator.oper_name`。
+# 资金对账按收银员展示卡片时必须显示姓名，因此单独建一个 live model，
+# 由 payflow 以 many_to_one 关联过来。
+#
+# # 两库都实测存在
+#
+#   ysx(hbposv10)     t_sys_operator 有 oper_id / oper_name
+#   hbposv7(hbposepro) t_sys_operator 有 oper_id / oper_name（列更多，不影响本 model）
+#
+# ⚠️ 两库都是 char 定长补空格 ⇒ 必须 RTRIM，才能和 payflow.cashier_id 关联。
+# ⚠️ 部分工号在档案里不存在（实测 10-31 有 1011/1012 查不到姓名）⇒ 下游
+#    必须允许姓名为空，回落显示工号，不能拿空姓名当"没有这笔流水"。
+name: operator
+sql_table: operator
+storage: live
+
+dimensions:
+  - name: id
+    sql: RTRIM(id)
+    type: string
+    title: 操作员编码
+    description: |
+      源列 oper_id。与 payflow.cashier_id 同一套编码。
+      ⚠️ char 定长补空格，必须 RTRIM。
+
+  - name: name
+    sql: RTRIM(name)
+    type: string
+    title: 操作员姓名
+    description: |
+      源列 oper_name。实测部分收银员工号在档案里不存在 ⇒ 关联后可能为 NULL。
+
+measures:
+  - name: count
+    sql: "COUNT(*)"
+    type: number
+    title: 操作员数

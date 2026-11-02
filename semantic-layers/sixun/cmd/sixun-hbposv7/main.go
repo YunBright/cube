@@ -103,6 +103,9 @@ type appConfig struct {
 		// 表名是 family 私有事实,所以只在这里配,不进共享的 sixun-models/
 		// (见 AGENTS.md §4「live 表名来源」)。
 		TablePayflow       string `yaml:"table_payflow"`
+		// TableOperator 是收银员档案表(t_sys_operator)。
+		// payflow 只存 oper_id，姓名在这一张表；资金对账按收银员展示时按工号回查。
+		TableOperator      string `yaml:"table_operator"`
 		TablePromotionPlan string `yaml:"table_promotion_plan"`
 		TableSupplierItem  string `yaml:"table_supplier_item"`
 		TableBranchPrice   string `yaml:"table_branch_price"`
@@ -618,6 +621,7 @@ func liveTables(cfg *appConfig) (map[string]string, error) {
 		// 而那一列是 family 私有事实(本库没有 ⇒ 不扣)。
 		"sale_detail":    saleDetailFragment,
 		"payflow":        cfg.Source.TablePayflow,
+		"operator":       cfg.Source.TableOperator,
 		"promotion_plan": cfg.Source.TablePromotionPlan,
 		"supplier_item":  cfg.Source.TableSupplierItem,
 		"branch_price":   cfg.Source.TableBranchPrice,
