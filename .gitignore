@@ -49,3 +49,9 @@ config.local.yaml
 # ⚠️ 这类文件是**一次性**的:它们既不是资产也不是文档,
 # 留在仓库里只会让下一个人的 `git status` 淹没在噪声里。
 .tmp-*
+
+# 仓库根目录漏了前导点的一次性探查 SQL(如 tmp-dx-probe.sql),与上面 `.tmp-*` 同类。
+# 用根锚定 `/tmp-*.sql`,只覆盖仓库根的临时 SQL,不波及子目录。
+# 误伤核查:cube 当前没有任何入库的 .sql(migrations 走 Go 模型),
+# 且 `tmp/` 目录已单独忽略,因此不存在被这条规则挡掉的正常 SQL 文件。
+/tmp-*.sql
